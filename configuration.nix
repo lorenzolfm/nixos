@@ -88,6 +88,7 @@
       kubectl
       pavucontrol
       pinentry-tty
+      postman
       protobuf
       rustup
       slack
