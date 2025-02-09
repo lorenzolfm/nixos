@@ -104,18 +104,18 @@
   nixpkgs.config.allowUnfree = true;
 
   environment.systemPackages = with pkgs; [
+    bitcoin
+    cargo-nextest
     ghostty
     neovim
+    pkg-config
     playerctl
+    postgresql
     rofi-wayland
     starship
     stow
     tree-sitter
     waybar
-
-    postgresql
-    pkg-config
-    cargo-nextest
   ];
 
   environment.variables = {
