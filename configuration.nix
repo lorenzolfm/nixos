@@ -84,6 +84,7 @@
       slack
       spotify
       telegram-desktop
+      zellij
     ];
   };
 
