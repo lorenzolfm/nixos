@@ -66,6 +66,7 @@
     alsa.enable = true;
     alsa.support32Bit = true;
     pulse.enable = true;
+    jack.enable = true;
     # If you want to use JACK applications, uncomment this
     #jack.enable = true;
 
@@ -85,7 +86,8 @@
     packages = with pkgs; [
       bitwarden-desktop
       google-chrome
-    #  thunderbird
+      spotify
+      slack
     ];
   };
 
@@ -95,9 +97,9 @@
   # List packages installed in system profile. To search, run:
   # $ nix search wget
   environment.systemPackages = with pkgs; [
+    ghostty
     neovim
-  #  vim # Do not forget to add an editor to edit configuration.nix! The Nano editor is also installed by default.
-  #  wget
+    rofi-wayland
   ];
 
   programs.git = {
@@ -110,7 +112,26 @@
     };
   };
 
+  programs.hyprland = {
+    enable = true;
+    xwayland.enable = true;
+  };
 
+  services.xserver.videoDrivers = ["nvidia"];
+   hardware = {
+    enableAllFirmware = true;
+
+    graphics.enable = true;
+
+    nvidia = {
+      modesetting.enable = true;
+      open = false;
+      nvidiaSettings = true;
+    };
+  };
+
+  xdg.portal.enable = true;
+  xdg.portal.extraPortals = [ pkgs.xdg-desktop-portal-gtk ];
   # Some programs need SUID wrappers, can be configured further or are
   # started in user sessions.
   # programs.mtr.enable = true;
