@@ -88,6 +88,8 @@
       google-chrome
       spotify
       slack
+      telegram-desktop
+      pavucontrol
     ];
   };
 
@@ -100,6 +102,7 @@
     ghostty
     neovim
     rofi-wayland
+    waybar
   ];
 
   programs.git = {
