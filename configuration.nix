@@ -67,18 +67,8 @@
     alsa.support32Bit = true;
     pulse.enable = true;
     jack.enable = true;
-    # If you want to use JACK applications, uncomment this
-    #jack.enable = true;
-
-    # use the example session manager (no others are packaged yet so this is enabled by default,
-    # no need to redefine it in your config for now)
-    #media-session.enable = true;
   };
 
-  # Enable touchpad support (enabled default in most desktopManager).
-  # services.xserver.libinput.enable = true;
-
-  # Define a user account. Don't forget to set a password with ‘passwd’.
   users.users.lorenzo = {
     isNormalUser = true;
     description = "Lorenzo";
@@ -86,24 +76,30 @@
     packages = with pkgs; [
       bitwarden-desktop
       google-chrome
-      spotify
-      slack
-      telegram-desktop
+      gnupg
       pavucontrol
+      pinentry-tty
+      slack
+      spotify
+      telegram-desktop
     ];
   };
 
-  # Allow unfree packages
   nixpkgs.config.allowUnfree = true;
 
-  # List packages installed in system profile. To search, run:
-  # $ nix search wget
   environment.systemPackages = with pkgs; [
+    fira-code-nerdfont
     ghostty
     neovim
+    playerctl
     rofi-wayland
+    starship
+    stow
     waybar
   ];
+
+  programs.fish.enable = true;
+  users.defaultUserShell = pkgs.fish;
 
   programs.git = {
     enable = true;
