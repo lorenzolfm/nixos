@@ -75,10 +75,12 @@
     extraGroups = [ "networkmanager" "wheel" ];
     packages = with pkgs; [
       bitwarden-desktop
-      google-chrome
+      gcc
       gnupg
+      google-chrome
       pavucontrol
       pinentry-tty
+      rustup
       slack
       spotify
       telegram-desktop
@@ -95,6 +97,7 @@
     rofi-wayland
     starship
     stow
+    tree-sitter
     waybar
   ];
 
