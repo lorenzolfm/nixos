@@ -20,7 +20,6 @@
     10.0.1.1 homelab.local
     10.0.1.9 homelab-1.local
   '';
-  # networking.wireless.enable = true;  # Enables wireless support via wpa_supplicant.
 
   # Configure network proxy if necessary
   # networking.proxy.default = "http://user:password@proxy:port/";
