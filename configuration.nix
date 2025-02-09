@@ -79,6 +79,7 @@
     extraGroups = [ "networkmanager" "wheel" "docker" ];
     packages = with pkgs; [
       bitwarden-desktop
+      cliphist
       diesel-cli
       docker
       gcc
@@ -93,6 +94,7 @@
       slack
       spotify
       telegram-desktop
+      wl-clipboard
       zellij
     ];
   };
