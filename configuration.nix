@@ -102,7 +102,16 @@
     stow
     tree-sitter
     waybar
+
+    postgresql
+    pkg-config
+    cargo-nextest
   ];
+
+  environment.variables = {
+    PKG_CONFIG_PATH = "${pkgs.postgresql}/lib/pkgconfig";
+    LIBRARY_PATH = "${pkgs.postgresql.lib}/lib";
+  };
 
   virtualisation.docker.enable = true;
   programs.fish.enable = true;
