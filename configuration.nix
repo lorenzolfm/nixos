@@ -123,6 +123,11 @@
     xwayland.enable = true;
   };
 
+  fonts.packages = with pkgs; [
+    (nerdfonts.override { fonts = [ "FiraCode" ]; })
+    fira-code
+  ];
+
   services.xserver.videoDrivers = ["nvidia"];
    hardware = {
     enableAllFirmware = true;
