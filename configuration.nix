@@ -78,6 +78,7 @@
     description = "Lorenzo";
     extraGroups = [ "networkmanager" "wheel" "docker" ];
     packages = with pkgs; [
+      atuin
       bitwarden-desktop
       cliphist
       diesel-cli
@@ -96,6 +97,7 @@
       telegram-desktop
       wl-clipboard
       zellij
+      zoxide
     ];
   };
 
