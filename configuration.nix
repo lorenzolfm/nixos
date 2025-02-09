@@ -94,7 +94,6 @@
   nixpkgs.config.allowUnfree = true;
 
   environment.systemPackages = with pkgs; [
-    fira-code-nerdfont
     ghostty
     neovim
     playerctl
