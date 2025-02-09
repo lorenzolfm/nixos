@@ -72,14 +72,17 @@
   users.users.lorenzo = {
     isNormalUser = true;
     description = "Lorenzo";
-    extraGroups = [ "networkmanager" "wheel" ];
+    extraGroups = [ "networkmanager" "wheel" "docker" ];
     packages = with pkgs; [
       bitwarden-desktop
+      diesel-cli
+      docker
       gcc
       gnupg
       google-chrome
       pavucontrol
       pinentry-tty
+      protobuf
       rustup
       slack
       spotify
@@ -102,6 +105,7 @@
     waybar
   ];
 
+  virtualisation.docker.enable = true;
   programs.fish.enable = true;
   users.defaultUserShell = pkgs.fish;
 
