@@ -81,6 +81,7 @@
       atuin
       bitwarden-desktop
       cliphist
+      cmatrix
       diesel-cli
       docker
       gcc
@@ -95,6 +96,7 @@
       slack
       spotify
       telegram-desktop
+      wbg
       wl-clipboard
       zellij
       zoxide
