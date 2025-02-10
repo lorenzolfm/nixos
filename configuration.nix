@@ -117,6 +117,7 @@
     pkg-config
     playerctl
     postgresql
+    ripgrep
     rofi-wayland
     starship
     stow
