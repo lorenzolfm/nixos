@@ -79,15 +79,18 @@
     extraGroups = [ "networkmanager" "wheel" "docker" ];
     packages = with pkgs; [
       atuin
+      bat
       bitwarden-desktop
       cliphist
       cmatrix
       diesel-cli
       docker
+      eza
       gcc
       gnupg
       google-chrome
       kubectl
+      nodejs_23
       pavucontrol
       pinentry-tty
       postman
@@ -109,6 +112,7 @@
     bitcoin
     cargo-nextest
     ghostty
+    lua-language-server
     neovim
     pkg-config
     playerctl
