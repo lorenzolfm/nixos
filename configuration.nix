@@ -89,6 +89,8 @@
       gcc
       gnupg
       google-chrome
+      grim
+      grpcurl
       kubectl
       nodejs_23
       pavucontrol
@@ -97,7 +99,9 @@
       protobuf
       rustup
       slack
+      slurp
       spotify
+      swappy
       telegram-desktop
       wbg
       wl-clipboard
@@ -110,10 +114,13 @@
 
   environment.systemPackages = with pkgs; [
     bitcoin
+    ngrok
     cargo-nextest
+    direnv
     ghostty
     lua-language-server
     neovim
+    openssl
     pkg-config
     playerctl
     postgresql
