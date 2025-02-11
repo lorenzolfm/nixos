@@ -136,6 +136,10 @@
   programs.fish.enable = true;
   users.defaultUserShell = pkgs.fish;
 
+  environment.variables = {
+    EDITOR = "nvim";
+  };
+
   programs.git = {
     enable = true;
     config = {
