@@ -114,22 +114,27 @@
 
   environment.systemPackages = with pkgs; [
     bitcoin
-    ngrok
     cargo-nextest
     direnv
     ghostty
+    jq
     lua-language-server
     neovim
+    ngrok
     openssl
     pkg-config
     playerctl
     postgresql
+    protols
     ripgrep
     rofi-wayland
+    sqls
     starship
     stow
+    svelte-language-server
     tree-sitter
     waybar
+    yaml-language-server
   ];
 
   environment.variables = {
