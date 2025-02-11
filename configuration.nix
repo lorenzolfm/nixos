@@ -87,11 +87,13 @@
       docker
       eza
       gcc
+      gh
       gnupg
       google-chrome
       grim
       grpcurl
       kubectl
+      nil
       nodejs_23
       pavucontrol
       pinentry-tty
