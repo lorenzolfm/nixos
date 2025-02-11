@@ -144,8 +144,18 @@
     enable = true;
     config = {
       user = {
-        name = "Lorenzo";
+        signingKey = "/home/lorenzo/.ssh/id_rsa.pub";
         email = "maturanolorenzo@gmail.com";
+        name = "Lorenzo";
+      };
+      gpg = {
+        format = "ssh";
+        ssh = {
+            allowedSignersFile = "/home/lorenzo/.ssh/allowed-signers";
+        };
+      };
+      commit = {
+        gpgSign = true;
       };
     };
   };
