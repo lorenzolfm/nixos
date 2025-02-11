@@ -83,20 +83,17 @@
       bitwarden-desktop
       cliphist
       cmatrix
-      diesel-cli
       docker
       eza
       gcc
       gnupg
       google-chrome
       grim
-      grpcurl
       kubectl
       nodejs_23
       pavucontrol
       pinentry-tty
       postman
-      protobuf
       rustup
       slack
       slurp
@@ -114,7 +111,6 @@
 
   environment.systemPackages = with pkgs; [
     bitcoin
-    cargo-nextest
     direnv
     ghostty
     jq
@@ -122,9 +118,7 @@
     neovim
     ngrok
     openssl
-    pkg-config
     playerctl
-    postgresql
     protols
     ripgrep
     rofi-wayland
@@ -136,12 +130,6 @@
     waybar
     yaml-language-server
   ];
-
-  environment.variables = {
-    EDITOR = "nvim";
-    PKG_CONFIG_PATH = "${pkgs.postgresql}/lib/pkgconfig";
-    LIBRARY_PATH = "${pkgs.postgresql.lib}/lib";
-  };
 
   virtualisation.docker.enable = true;
   programs.fish.enable = true;
