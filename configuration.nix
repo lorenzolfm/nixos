@@ -110,6 +110,7 @@
   nixpkgs.config.allowUnfree = true;
 
   environment.systemPackages = with pkgs; [
+    bash-language-server
     bitcoin
     direnv
     ghostty
