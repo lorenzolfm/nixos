@@ -123,7 +123,6 @@
     protols
     ripgrep
     rofi-wayland
-    sqls
     starship
     stow
     svelte-language-server
