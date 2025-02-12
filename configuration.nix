@@ -121,10 +121,12 @@
     direnv
     ghostty
     jq
+    libnotify
     lua-language-server
     neovim
     ngrok
     openssl
+    pamixer
     pkg-config
     playerctl
     postgresql
@@ -134,6 +136,7 @@
     starship
     stow
     svelte-language-server
+    swaynotificationcenter
     tree-sitter
     waybar
     yaml-language-server
