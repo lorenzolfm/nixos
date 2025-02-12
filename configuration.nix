@@ -100,8 +100,10 @@
       postman
       protobuf
       rustup
+      signal-desktop
       slack
       slurp
+      sparrow
       spotify
       swappy
       telegram-desktop
