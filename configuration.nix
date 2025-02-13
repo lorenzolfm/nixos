@@ -117,6 +117,7 @@
   nixpkgs.config.allowUnfree = true;
 
   environment.systemPackages = with pkgs; [
+    appimage-run
     bash-language-server
     bitcoin
     cargo-nextest
