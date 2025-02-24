@@ -84,6 +84,7 @@
       cliphist
       cmatrix
       diesel-cli
+      discord
       docker
       eza
       gcc
@@ -105,6 +106,7 @@
       slurp
       sparrow
       spotify
+      sql-formatter
       swappy
       telegram-desktop
       wbg
