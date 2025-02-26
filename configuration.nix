@@ -142,6 +142,7 @@
     stow
     svelte-language-server
     swaynotificationcenter
+    tailscale
     tree-sitter
     waybar
     yaml-language-server
@@ -213,10 +214,11 @@
   # List services that you want to enable:
 
   # Enable the OpenSSH daemon.
-  # services.openssh.enable = true;
+  services.openssh.enable = true;
+  services.tailscale.enable = true;
 
   # Open ports in the firewall.
-networking.firewall.allowedTCPPorts = [ 9000 ];
+  networking.firewall.allowedTCPPorts = [ 9000 ];
   # networking.firewall.allowedUDPPorts = [ ... ];
   # Or disable the firewall altogether.
   # networking.firewall.enable = false;
