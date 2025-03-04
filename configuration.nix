@@ -217,8 +217,25 @@
   services.openssh.enable = true;
   services.tailscale.enable = true;
 
+  networking.nftables.enable = true;
+  networking.firewall = {
+    enable = true;
+    logReversePathDrops = true;
+    logRefusedConnections = true;
+    interfaces = {
+      enp4s0 = {
+        allowedTCPPorts = [ 9000 ];
+      };
+      tailscale0 = {
+        allowedTCPPorts = [ 22 ];
+      };
+    };
+  };
+
+  services.fail2ban.enable = true;
+
   # Open ports in the firewall.
-  networking.firewall.allowedTCPPorts = [ 9000 ];
+  # networking.firewall.allowedTCPPorts = [ 9000 ];
   # networking.firewall.allowedUDPPorts = [ ... ];
   # Or disable the firewall altogether.
   # networking.firewall.enable = false;
