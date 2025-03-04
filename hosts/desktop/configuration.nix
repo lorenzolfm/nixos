@@ -11,24 +11,26 @@
 
   nix.settings.experimental-features = ["nix-command" "flakes"];
 
-  networking.hostName = "nixos";
-  networking.extraHosts =
-  ''
-    10.0.1.1 homelab.local
-    10.0.1.9 homelab-1.local
-  '';
-  networking.networkmanager.enable = true;
-  networking.nftables.enable = true;
-  networking.firewall = {
-    enable = true;
-    logReversePathDrops = true;
-    logRefusedConnections = true;
-    interfaces = {
-      enp4s0 = {
-        allowedTCPPorts = [ 9000 ];
-      };
-      tailscale0 = {
-        allowedTCPPorts = [ 22 ];
+  networking = {
+    hostName = "nixos";
+    extraHosts =
+    ''
+      10.0.1.1 homelab.local
+      10.0.1.9 homelab-1.local
+    '';
+    networkmanager.enable = true;
+    nftables.enable = true;
+    firewall = {
+      enable = true;
+      logReversePathDrops = true;
+      logRefusedConnections = true;
+      interfaces = {
+        enp4s0 = {
+          allowedTCPPorts = [ 9000 ];
+        };
+        tailscale0 = {
+          allowedTCPPorts = [ 22 ];
+        };
       };
     };
   };
