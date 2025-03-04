@@ -1,20 +1,22 @@
 { config, pkgs, ... }:
 
 {
-  imports =
-    [ # Include the results of the hardware scan.
-      ./hardware-configuration.nix
-    ];
+  imports = [
+    # Include the results of the hardware scan.
+    ./hardware-configuration.nix
+  ];
 
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
 
-  nix.settings.experimental-features = ["nix-command" "flakes"];
+  nix.settings.experimental-features = [
+    "nix-command"
+    "flakes"
+  ];
 
   networking = {
     hostName = "nixos";
-    extraHosts =
-    ''
+    extraHosts = ''
       10.0.1.1 homelab.local
       10.0.1.9 homelab-1.local
     '';
@@ -73,7 +75,11 @@
   users.users.lorenzo = {
     isNormalUser = true;
     description = "Lorenzo";
-    extraGroups = [ "networkmanager" "wheel" "docker" ];
+    extraGroups = [
+      "networkmanager"
+      "wheel"
+      "docker"
+    ];
     packages = with pkgs; [
       atuin
       bat
@@ -92,6 +98,7 @@
       grpcurl
       kubectl
       nil
+      nixfmt-rfc-style
       nodejs_23
       pavucontrol
       pinentry-tty
@@ -166,7 +173,7 @@
       gpg = {
         format = "ssh";
         ssh = {
-            allowedSignersFile = "/home/lorenzo/.ssh/allowed-signers";
+          allowedSignersFile = "/home/lorenzo/.ssh/allowed-signers";
         };
       };
       commit = {
@@ -184,8 +191,8 @@
     pkgs.nerd-fonts.fira-code
   ];
 
-  services.xserver.videoDrivers = ["nvidia"];
-   hardware = {
+  services.xserver.videoDrivers = [ "nvidia" ];
+  hardware = {
     enableAllFirmware = true;
 
     graphics.enable = true;
