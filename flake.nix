@@ -21,5 +21,12 @@
           ./hosts/desktop/configuration.nix
         ];
       };
+
+      darwinConfigurations.macbook = darwin.lib.darwinSystem {
+        system = "aarch64-darwin";
+        modules = [
+          ./hosts/macbook/configuration.nix
+        ];
+      };
     };
 }
