@@ -176,9 +176,8 @@
     xwayland.enable = true;
   };
 
-  fonts.packages = with pkgs; [
-    (nerdfonts.override { fonts = [ "FiraCode" ]; })
-    fira-code
+  fonts.packages = [
+    pkgs.nerd-fonts.fira-code
   ];
 
   services.xserver.videoDrivers = ["nvidia"];
