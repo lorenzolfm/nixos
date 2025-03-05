@@ -1,6 +1,11 @@
 { config, pkgs, ... }:
 
 {
+
+  imports = [
+    ../common/configuration.nix
+  ];
+
   nix.settings.experimental-features = "nix-command flakes";
   nixpkgs.config.allowUnfree = true;
 
@@ -12,6 +17,7 @@
     defaults = {
       dock.autohide = true;
       finder.FXPreferredViewStyle = "clmv";
+      screensaver.askForPasswordDelay = 10;
       NSGlobalDomain.AppleICUForce24HourTime = true;
       NSGlobalDomain.AppleInterfaceStyle = "Dark";
       NSGlobalDomain.KeyRepeat = 2;
