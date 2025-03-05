@@ -31,6 +31,7 @@
     casks = [
       "ghostty"
     ];
+    onActivation.cleanup = "zap";
   };
 
   fonts.packages = [
