@@ -26,6 +26,11 @@
     zoxide
   ];
 
+  programs.fish.enable = true;
+  users.knownUsers = [ "lorenzo" ];
+  users.users.lorenzo.uid = 501;
+  users.users.lorenzo.shell = pkgs.fish;
+
   environment.variables = {
     EDITOR = "nvim";
     PKG_CONFIG_PATH = "${pkgs.postgresql}/lib/pkgconfig";
@@ -47,13 +52,6 @@
     [commit]
     gpgSign = true
   '';
-
-  programs.fish.enable = true;
-
-  users.users.lorenzo = {
-    home = "/Users/lorenzo";
-    shell = pkgs.fish;
-  };
 
   services.openssh.enable = true;
   services.tailscale.enable = true;
