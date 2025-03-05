@@ -4,6 +4,14 @@
   nix.settings.experimental-features = "nix-command flakes";
   nixpkgs.config.allowUnfree = true;
 
+  system.defaults = {
+    dock.autohide = true;
+    finder.FXPreferredViewStyle = "clmv";
+    NSGlobalDomain.AppleICUForce24HourTime = true;
+    NSGlobalDomain.AppleInterfaceStyle = "Dark";
+    NSGlobalDomain.KeyRepeat = 2;
+  };
+
   environment.systemPackages = with pkgs; [
     atuin
     diesel-cli
