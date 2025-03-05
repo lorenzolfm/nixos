@@ -6,6 +6,7 @@
     darwin.url = "github:LnL7/nix-darwin/master";
     darwin.inputs.nixpkgs.follows = "nixpkgs";
     mac-app-util.url = "github:hraban/mac-app-util";
+    nix-homebrew.url = "github:zhaofengli-wip/nix-homebrew";
   };
 
   outputs =
@@ -14,6 +15,7 @@
       nixpkgs,
       darwin,
       mac-app-util,
+      nix-homebrew,
       ...
     }@inputs:
     {
@@ -28,6 +30,14 @@
         system = "aarch64-darwin";
         modules = [
           mac-app-util.darwinModules.default
+          nix-homebrew.darwinModules.nix-homebrew
+          {
+            nix-homebrew = {
+              enable = true;
+              enableRosetta = true;
+              user = "lorenzo";
+            };
+          }
           ./hosts/macbook/configuration.nix
         ];
       };
