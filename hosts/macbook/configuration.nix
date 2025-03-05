@@ -48,6 +48,7 @@
     enable = true;
     casks = [
       "ghostty"
+      "docker"
     ];
     onActivation.cleanup = "zap";
   };
