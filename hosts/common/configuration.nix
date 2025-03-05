@@ -1,7 +1,6 @@
 { config, pkgs, ... }:
 
 {
-
   nixpkgs.config.allowUnfree = true;
 
   nix.settings.experimental-features = [
@@ -19,7 +18,6 @@
     direnv
     docker
     eza
-    gcc
     gh
     gnupg
     google-chrome

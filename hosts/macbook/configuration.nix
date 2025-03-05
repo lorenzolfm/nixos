@@ -1,7 +1,6 @@
 { config, pkgs, ... }:
 
 {
-
   imports = [
     ../common/configuration.nix
   ];
@@ -24,6 +23,7 @@
 
   environment = {
     systemPackages = with pkgs; [
+      fish
       raycast
     ];
 

@@ -95,6 +95,7 @@
 
   environment.systemPackages = with pkgs; [
     appimage-run
+    gcc
     ghostty
     libnotify
     pamixer
