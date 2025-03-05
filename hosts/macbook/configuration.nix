@@ -19,6 +19,7 @@
     raycast
     rustup
     slack
+    spotify
     starship
     stow
     tailscale
