@@ -26,6 +26,10 @@
     zoxide
   ];
 
+  fonts.packages = [
+    pkgs.nerd-fonts.fira-code
+  ];
+
   programs.fish.enable = true;
   users.knownUsers = [ "lorenzo" ];
   users.users.lorenzo.uid = 501;
