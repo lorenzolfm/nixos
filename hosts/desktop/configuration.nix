@@ -9,11 +9,6 @@
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
 
-  nix.settings.experimental-features = [
-    "nix-command"
-    "flakes"
-  ];
-
   networking = {
     hostName = "nixos";
     extraHosts = ''
@@ -98,8 +93,6 @@
     ];
   };
 
-  nixpkgs.config.allowUnfree = true;
-
   environment.systemPackages = with pkgs; [
     appimage-run
     ghostty
@@ -107,7 +100,6 @@
     pamixer
     pkg-config
     playerctl
-    postgresql
     protols
     rofi-wayland
     swaynotificationcenter
@@ -115,14 +107,7 @@
   ];
 
   virtualisation.docker.enable = true;
-  programs.fish.enable = true;
   users.defaultUserShell = pkgs.fish;
-
-  environment.variables = {
-    EDITOR = "nvim";
-    PKG_CONFIG_PATH = "${pkgs.postgresql}/lib/pkgconfig";
-    LIBRARY_PATH = "${pkgs.postgresql.lib}/lib";
-  };
 
   programs.git = {
     enable = true;
@@ -149,9 +134,7 @@
     xwayland.enable = true;
   };
 
-  fonts.packages = [
-    pkgs.nerd-fonts.fira-code
-  ];
+  services.fail2ban.enable = true;
 
   services.xserver.videoDrivers = [ "nvidia" ];
   hardware = {
@@ -169,10 +152,5 @@
   xdg.portal.enable = true;
   xdg.portal.extraPortals = [ pkgs.xdg-desktop-portal-gtk ];
 
-  services.openssh.enable = true;
-  services.tailscale.enable = true;
-
-  services.fail2ban.enable = true;
-
-  system.stateVersion = "24.11"; # Did you read the comment?
+  system.stateVersion = "24.11";
 }

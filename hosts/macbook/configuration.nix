@@ -6,9 +6,6 @@
     ../common/configuration.nix
   ];
 
-  nix.settings.experimental-features = "nix-command flakes";
-  nixpkgs.config.allowUnfree = true;
-
   system = {
     keyboard = {
       enableKeyMapping = true;
@@ -25,9 +22,27 @@
     stateVersion = 6;
   };
 
-  environment.systemPackages = with pkgs; [
-    raycast
-  ];
+  environment = {
+    systemPackages = with pkgs; [
+      raycast
+    ];
+
+    etc."gitconfig".text = ''
+      [user]
+      name = Lorenzo
+      email = maturanolorenzo@gmail.com
+      signingKey = /Users/lorenzo/.ssh/id_rsa.pub
+
+      [gpg]
+      format = ssh
+
+      [gpg "ssh"]
+      allowedSignersFile = /Users/lorenzo/.ssh/allowed-signers
+
+      [commit]
+      gpgSign = true
+    '';
+  };
 
   homebrew = {
     enable = true;
@@ -37,39 +52,11 @@
     onActivation.cleanup = "zap";
   };
 
-  fonts.packages = [
-    pkgs.nerd-fonts.fira-code
-  ];
-
-  programs.fish.enable = true;
-  users.knownUsers = [ "lorenzo" ];
-  users.users.lorenzo.uid = 501;
-  users.users.lorenzo.shell = pkgs.fish;
-
-  environment.variables = {
-    EDITOR = "nvim";
-    PKG_CONFIG_PATH = "${pkgs.postgresql}/lib/pkgconfig";
-    LIBRARY_PATH = "${pkgs.postgresql.lib}/lib";
+  users = {
+    knownUsers = [ "lorenzo" ];
+    users.lorenzo.uid = 501;
+    users.lorenzo.shell = pkgs.fish;
   };
-
-  environment.etc."gitconfig".text = ''
-    [user]
-    name = Lorenzo
-    email = maturanolorenzo@gmail.com
-    signingKey = /Users/lorenzo/.ssh/id_rsa.pub
-
-    [gpg]
-    format = ssh
-
-    [gpg "ssh"]
-    allowedSignersFile = /Users/lorenzo/.ssh/allowed-signers
-
-    [commit]
-    gpgSign = true
-  '';
-
-  services.openssh.enable = true;
-  services.tailscale.enable = true;
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 }
