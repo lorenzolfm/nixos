@@ -31,6 +31,7 @@
     nil
     nixfmt-rfc-style
     openssl
+    pkg-config
     postman
     protobuf
     ripgrep

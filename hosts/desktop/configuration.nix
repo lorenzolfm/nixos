@@ -98,7 +98,6 @@
     ghostty
     libnotify
     pamixer
-    pkg-config
     playerctl
     protols
     rofi-wayland
