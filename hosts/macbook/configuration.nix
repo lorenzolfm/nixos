@@ -4,12 +4,19 @@
   nix.settings.experimental-features = "nix-command flakes";
   nixpkgs.config.allowUnfree = true;
 
-  system.defaults = {
-    dock.autohide = true;
-    finder.FXPreferredViewStyle = "clmv";
-    NSGlobalDomain.AppleICUForce24HourTime = true;
-    NSGlobalDomain.AppleInterfaceStyle = "Dark";
-    NSGlobalDomain.KeyRepeat = 2;
+  system = {
+    keyboard = {
+      enableKeyMapping = true;
+      remapCapsLockToEscape = true;
+    };
+    defaults = {
+      dock.autohide = true;
+      finder.FXPreferredViewStyle = "clmv";
+      NSGlobalDomain.AppleICUForce24HourTime = true;
+      NSGlobalDomain.AppleInterfaceStyle = "Dark";
+      NSGlobalDomain.KeyRepeat = 2;
+    };
+    stateVersion = 6;
   };
 
   environment.systemPackages = with pkgs; [
@@ -76,8 +83,6 @@
 
   services.openssh.enable = true;
   services.tailscale.enable = true;
-
-  system.stateVersion = 6;
 
   nixpkgs.hostPlatform = "aarch64-darwin";
 }
