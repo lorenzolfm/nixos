@@ -26,26 +26,7 @@
   };
 
   environment.systemPackages = with pkgs; [
-    atuin
-    diesel-cli
-    direnv
-    docker
-    fish
-    google-chrome
-    neovim
-    nil
-    nixfmt-rfc-style
-    postman
-    protobuf
     raycast
-    rustup
-    slack
-    spotify
-    starship
-    stow
-    tailscale
-    zellij
-    zoxide
   ];
 
   homebrew = {

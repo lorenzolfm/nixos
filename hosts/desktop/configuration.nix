@@ -81,42 +81,20 @@
       "docker"
     ];
     packages = with pkgs; [
-      atuin
-      bat
       bitwarden-desktop
       cliphist
       cmatrix
-      diesel-cli
       discord
-      docker
-      eza
-      gcc
-      gh
-      gnupg
-      google-chrome
       grim
-      grpcurl
       kubectl
-      nil
-      nixfmt-rfc-style
       nodejs_23
       pavucontrol
       pinentry-tty
-      postman
-      protobuf
-      rustup
-      signal-desktop
-      slack
       slurp
       sparrow
-      spotify
-      sql-formatter
       swappy
-      telegram-desktop
       wbg
       wl-clipboard
-      zellij
-      zoxide
     ];
   };
 
@@ -124,32 +102,16 @@
 
   environment.systemPackages = with pkgs; [
     appimage-run
-    bash-language-server
-    bitcoin
-    cargo-nextest
-    direnv
     ghostty
-    jq
     libnotify
-    lua-language-server
-    neovim
-    ngrok
-    openssl
     pamixer
     pkg-config
     playerctl
     postgresql
     protols
-    ripgrep
     rofi-wayland
-    starship
-    stow
-    svelte-language-server
     swaynotificationcenter
-    tailscale
-    tree-sitter
     waybar
-    yaml-language-server
   ];
 
   virtualisation.docker.enable = true;

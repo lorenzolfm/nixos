@@ -2,6 +2,43 @@
 
 {
   environment.systemPackages = with pkgs; [
-    neofetch
+    atuin
+    bash-language-server
+    bat
+    bitcoin
+    cargo-nextest
+    diesel-cli
+    direnv
+    docker
+    eza
+    gcc
+    gh
+    gnupg
+    google-chrome
+    grpcurl
+    jq
+    lua-language-server
+    neovim
+    ngrok
+    nil
+    nixfmt-rfc-style
+    openssl
+    postman
+    protobuf
+    ripgrep
+    rustup
+    signal-desktop
+    slack
+    spotify
+    sql-formatter
+    starship
+    stow
+    svelte-language-server
+    tailscale
+    telegram-desktop
+    tree-sitter
+    yaml-language-server
+    zellij
+    zoxide
   ];
 }
