@@ -80,6 +80,7 @@
       cliphist
       cmatrix
       discord
+      firefox
       grim
       kubectl
       nodejs_23
