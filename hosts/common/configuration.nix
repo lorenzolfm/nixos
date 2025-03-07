@@ -30,6 +30,7 @@
     nixfmt-rfc-style
     openssl
     pkg-config
+    postgresql
     postman
     protobuf
     ripgrep
