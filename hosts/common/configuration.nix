@@ -46,6 +46,7 @@
     telegram-desktop
     tree-sitter
     yaml-language-server
+    yamlfmt
     zellij
     zoxide
   ];
