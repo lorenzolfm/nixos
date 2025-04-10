@@ -28,6 +28,9 @@
         tailscale0 = {
           allowedTCPPorts = [ 22 ];
         };
+        "br-*" = {
+          allowedTCPPorts = [ 8000 ];
+        };
       };
     };
   };
