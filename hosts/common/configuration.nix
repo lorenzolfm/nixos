@@ -13,6 +13,7 @@
     bash-language-server
     bat
     bitcoin
+    bottom
     cargo-nextest
     diesel-cli
     direnv
