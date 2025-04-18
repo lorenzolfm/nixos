@@ -1,11 +1,28 @@
 { config, pkgs, ... }:
-
+let
+  unstable =
+    import
+      (fetchTarball {
+        url = "https://github.com/NixOS/nixpkgs/archive/nixpkgs-unstable.tar.gz";
+        sha256 = "0zrp7w41vqln7mmhvpb8ww6g6807bhic5c72mkqf9qh5336vc13b";
+      })
+      {
+        config = config.nixpkgs.config;
+        system = config.nixpkgs.system;
+      };
+in
 {
   nixpkgs.config.allowUnfree = true;
 
   nix.settings.experimental-features = [
     "nix-command"
     "flakes"
+  ];
+
+  nixpkgs.overlays = [
+    (final: prev: {
+      neovim = unstable.neovim;
+    })
   ];
 
   environment.systemPackages = with pkgs; [
