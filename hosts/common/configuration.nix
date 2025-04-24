@@ -34,6 +34,7 @@ in
     cargo-nextest
     diesel-cli
     direnv
+    discord
     docker
     eza
     gh

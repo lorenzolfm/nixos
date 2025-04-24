@@ -82,7 +82,6 @@
       bitwarden-desktop
       cliphist
       cmatrix
-      discord
       firefox
       grim
       kubectl
