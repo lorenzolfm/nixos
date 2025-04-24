@@ -4,7 +4,7 @@ let
     import
       (fetchTarball {
         url = "https://github.com/NixOS/nixpkgs/archive/nixpkgs-unstable.tar.gz";
-        sha256 = "0zrp7w41vqln7mmhvpb8ww6g6807bhic5c72mkqf9qh5336vc13b";
+        sha256 = "1h645aidj2cnbfmchl5rmvc1jhdwa19cr821939kwx2afmyl65lf";
       })
       {
         config = config.nixpkgs.config;
