@@ -82,6 +82,7 @@
       bitwarden-desktop
       cliphist
       cmatrix
+      ffmpeg
       firefox
       grim
       kubectl
