@@ -91,6 +91,7 @@
       slurp
       sparrow
       swappy
+      vlc
       wbg
       wl-clipboard
     ];
