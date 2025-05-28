@@ -4,7 +4,7 @@ let
     import
       (fetchTarball {
         url = "https://github.com/NixOS/nixpkgs/archive/nixpkgs-unstable.tar.gz";
-        sha256 = "1h645aidj2cnbfmchl5rmvc1jhdwa19cr821939kwx2afmyl65lf";
+        sha256 = "1vf26scmz0826g49mqclmm4pblk5gzw5d4bk9bwql0psz916ij0n";
       })
       {
         config = config.nixpkgs.config;
@@ -22,6 +22,7 @@ in
   nixpkgs.overlays = [
     (final: prev: {
       neovim = unstable.neovim;
+      discord = unstable.discord;
     })
   ];
 
