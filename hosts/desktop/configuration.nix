@@ -86,7 +86,8 @@
       firefox
       grim
       kubectl
-      nodejs_23
+      libsForQt5.kdenlive
+      nodejs_24
       pavucontrol
       pinentry-tty
       slurp
