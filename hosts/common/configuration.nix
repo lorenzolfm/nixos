@@ -1,29 +1,10 @@
 { config, pkgs, ... }:
-let
-  unstable =
-    import
-      (fetchTarball {
-        url = "https://github.com/NixOS/nixpkgs/archive/nixpkgs-unstable.tar.gz";
-        sha256 = "1vf26scmz0826g49mqclmm4pblk5gzw5d4bk9bwql0psz916ij0n";
-      })
-      {
-        config = config.nixpkgs.config;
-        system = config.nixpkgs.system;
-      };
-in
 {
   nixpkgs.config.allowUnfree = true;
 
   nix.settings.experimental-features = [
     "nix-command"
     "flakes"
-  ];
-
-  nixpkgs.overlays = [
-    (final: prev: {
-      neovim = unstable.neovim;
-      discord = unstable.discord;
-    })
   ];
 
   environment.systemPackages = with pkgs; [
@@ -38,6 +19,7 @@ in
     discord
     docker
     eza
+    firefox
     gh
     gnupg
     google-chrome
@@ -48,6 +30,7 @@ in
     ngrok
     nil
     nixfmt-rfc-style
+    nodejs_24
     openssl
     pkg-config
     postgresql
@@ -55,7 +38,6 @@ in
     protobuf
     ripgrep
     rustup
-    signal-desktop
     slack
     spotify
     sql-formatter
