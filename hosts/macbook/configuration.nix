@@ -6,6 +6,7 @@
   ];
 
   system = {
+    primaryUser = "lorenzo";
     keyboard = {
       enableKeyMapping = true;
       remapCapsLockToEscape = true;
