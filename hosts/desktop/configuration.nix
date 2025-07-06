@@ -82,20 +82,27 @@
       bitwarden-desktop
       cliphist
       cmatrix
+      fd
       ffmpeg
+      file
       firefox
+      fzf
       grim
       kubectl
       libsForQt5.kdenlive
       nodejs_24
       pavucontrol
       pinentry-tty
+      poppler
+      ripgrep
       slurp
       sparrow
       swappy
       vlc
       wbg
       wl-clipboard
+      yazi
+      zoxide
     ];
   };
 
