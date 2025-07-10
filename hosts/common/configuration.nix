@@ -47,6 +47,7 @@
     tailscale
     telegram-desktop
     tree-sitter
+    vscode-langservers-extracted
     yaml-language-server
     yamlfmt
     zellij
