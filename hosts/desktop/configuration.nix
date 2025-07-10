@@ -102,6 +102,7 @@
       wbg
       wl-clipboard
       yazi
+      zed-editor
       zoxide
     ];
   };
