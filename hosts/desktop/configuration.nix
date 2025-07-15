@@ -109,15 +109,25 @@
 
   environment.systemPackages = with pkgs; [
     appimage-run
+    boost
+    cmake
     gcc
     ghostty
+    gnumake
+    libevent
     libnotify
+    libsystemtap
     pamixer
+    pkgconf
     playerctl
     protols
+    python314
+    rocmPackages.llvm.clang-tools
     rofi-wayland
+    sqlite
     swaynotificationcenter
     waybar
+    zmqpp
   ];
 
   virtualisation.docker.enable = true;
