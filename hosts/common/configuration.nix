@@ -37,6 +37,7 @@
     postman
     protobuf
     ripgrep
+    rust-script
     rustup
     slack
     spotify

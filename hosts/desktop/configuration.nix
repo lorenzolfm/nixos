@@ -102,7 +102,6 @@
       wbg
       wl-clipboard
       yazi
-      zed-editor
       zoxide
     ];
   };
@@ -127,6 +126,7 @@
     sqlite
     swaynotificationcenter
     waybar
+    zed-editor
     zmqpp
   ];
 
