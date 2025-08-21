@@ -107,7 +107,9 @@
   };
 
   environment.systemPackages = with pkgs; [
-    appimage-run
+    (appimage-run.override {
+      extraPkgs = pkgs: [ pkgs.xorg.libxshmfence ];
+    })
     boost
     cmake
     gcc
