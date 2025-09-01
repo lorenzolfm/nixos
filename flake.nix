@@ -26,7 +26,7 @@
         ];
       };
 
-      darwinConfigurations.macbook = darwin.lib.darwinSystem {
+      darwinConfigurations.macbook-2 = darwin.lib.darwinSystem {
         system = "aarch64-darwin";
         modules = [
           mac-app-util.darwinModules.default

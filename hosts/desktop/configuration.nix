@@ -111,6 +111,7 @@
     appimage-run
     boost
     cmake
+    discord
     gcc
     ghostty
     gnumake
