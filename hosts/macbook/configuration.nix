@@ -12,7 +12,15 @@
       remapCapsLockToEscape = true;
     };
     defaults = {
-      dock.autohide = true;
+      dock = {
+        persistent-apps = [
+          "/Applications/Ghostty.app"
+          "/Applications/Slack.app"
+        ];
+        autohide = true;
+        show-recents = false;
+        show-process-indicators = false;
+      };
       finder.FXPreferredViewStyle = "clmv";
       screensaver.askForPasswordDelay = 10;
       NSGlobalDomain.AppleICUForce24HourTime = true;

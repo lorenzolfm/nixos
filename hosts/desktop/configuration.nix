@@ -112,6 +112,7 @@
     })
     boost
     cmake
+    discord
     gcc
     ghostty
     gnumake

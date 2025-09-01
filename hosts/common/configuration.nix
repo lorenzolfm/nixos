@@ -16,7 +16,6 @@
     cargo-nextest
     diesel-cli
     direnv
-    discord
     docker
     eza
     firefox
@@ -48,6 +47,7 @@
     tailscale
     telegram-desktop
     tree-sitter
+    typescript-language-server
     vscode-langservers-extracted
     yaml-language-server
     yamlfmt
