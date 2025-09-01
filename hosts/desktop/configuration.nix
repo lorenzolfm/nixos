@@ -113,6 +113,7 @@
     boost
     cmake
     discord
+    docker
     gcc
     ghostty
     gnumake

@@ -16,7 +16,6 @@
     cargo-nextest
     diesel-cli
     direnv
-    docker
     eza
     firefox
     gh
