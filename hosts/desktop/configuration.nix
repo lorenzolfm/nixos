@@ -161,6 +161,7 @@
   };
 
   services.fail2ban.enable = true;
+  services.blueman.enable = true;
 
   services.xserver.videoDrivers = [ "nvidia" ];
   hardware = {
@@ -172,6 +173,11 @@
       modesetting.enable = true;
       open = false;
       nvidiaSettings = true;
+    };
+
+    bluetooth = {
+      enable = true;
+      powerOnBoot = true;
     };
   };
 
