@@ -89,7 +89,6 @@
       fzf
       grim
       kubectl
-      libsForQt5.kdenlive
       nodejs_24
       pavucontrol
       pinentry-tty
@@ -125,8 +124,7 @@
     playerctl
     protols
     python314
-    rocmPackages.llvm.clang-tools
-    rofi-wayland
+    rofi
     sqlite
     swaynotificationcenter
     waybar
