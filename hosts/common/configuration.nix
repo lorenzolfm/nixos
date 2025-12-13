@@ -37,7 +37,6 @@
     ripgrep
     rust-script
     rustup
-    slack
     spotify
     sql-formatter
     starship

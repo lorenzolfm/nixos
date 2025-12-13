@@ -69,6 +69,7 @@
     casks = [
       "ghostty"
       "docker"
+      "slack"
     ];
     onActivation.cleanup = "zap";
   };

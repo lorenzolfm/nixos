@@ -87,6 +87,7 @@
       file
       firefox
       fzf
+      slack
       grim
       kubectl
       nodejs_24
