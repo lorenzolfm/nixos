@@ -13,9 +13,7 @@
     bat
     bitcoin
     bottom
-    cargo
     cargo-nextest
-    clippy
     diesel-cli
     direnv
     eza
@@ -37,10 +35,8 @@
     postman
     protobuf
     ripgrep
-    rust-analyzer
     rust-script
-    rustc
-    rustfmt
+    rustup
     slack
     spotify
     sql-formatter
