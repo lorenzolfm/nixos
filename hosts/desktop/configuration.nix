@@ -128,6 +128,7 @@
     rofi
     sqlite
     swaynotificationcenter
+    vicinae
     waybar
     zed-editor
     zmqpp
