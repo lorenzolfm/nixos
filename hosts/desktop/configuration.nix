@@ -184,8 +184,13 @@
     };
   };
 
-  xdg.portal.enable = true;
-  xdg.portal.extraPortals = [ pkgs.xdg-desktop-portal-gtk ];
+  xdg.portal = {
+    enable = true;
+    extraPortals = [ pkgs.xdg-desktop-portal-gtk ];
+    xdgOpenUsePortal = true;
+  };
+
+  programs.hyprland.portalPackage = pkgs.xdg-desktop-portal-hyprland;
 
   system.stateVersion = "24.11";
 }
