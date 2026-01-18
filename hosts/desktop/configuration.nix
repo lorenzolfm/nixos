@@ -111,6 +111,7 @@
       extraPkgs = pkgs: [ pkgs.xorg.libxshmfence ];
     })
     boost
+    claude-code
     cmake
     discord
     docker
