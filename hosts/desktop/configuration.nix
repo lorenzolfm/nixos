@@ -127,7 +127,9 @@
     protols
     python314
     rofi
+    signal-desktop
     sqlite
+    sqlx-cli
     swaynotificationcenter
     vicinae
     waybar
