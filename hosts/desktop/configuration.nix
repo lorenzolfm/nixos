@@ -124,6 +124,7 @@
     libnotify
     libsystemtap
     linuxPackages.perf
+    obs-studio
     pamixer
     pkgconf
     playerctl
