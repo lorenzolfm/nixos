@@ -110,7 +110,9 @@
     (appimage-run.override {
       extraPkgs = pkgs: [ pkgs.xorg.libxshmfence ];
     })
+    bitcoin
     boost
+    google-chrome
     claude-code
     cmake
     discord

@@ -11,7 +11,6 @@
     atuin
     bash-language-server
     bat
-    bitcoin
     bottom
     cargo
     cargo-nextest
@@ -22,7 +21,6 @@
     firefox
     gh
     gnupg
-    google-chrome
     grpcurl
     jq
     lua-language-server

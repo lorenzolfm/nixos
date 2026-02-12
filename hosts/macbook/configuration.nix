@@ -67,8 +67,9 @@
   homebrew = {
     enable = true;
     casks = [
-      "ghostty"
       "docker"
+      "ghostty"
+      "google-chrome"
       "slack"
     ];
     onActivation.cleanup = "zap";
