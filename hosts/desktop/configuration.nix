@@ -189,6 +189,19 @@
     bluetooth = {
       enable = true;
       powerOnBoot = true;
+      settings = {
+        General = {
+          Experimental = true;
+          FastConnectable = true;
+          Class = "0x000100";
+          DiscoverableTimeout = 0;
+          PairableTimeout = 0;
+        };
+        Policy = {
+          AutoEnable = true;
+          ReconnectAttempts = 0;
+        };
+      };
     };
   };
 
