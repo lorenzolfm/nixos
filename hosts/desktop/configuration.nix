@@ -137,7 +137,6 @@
     swaynotificationcenter
     vicinae
     waybar
-    zed-editor
     zmqpp
   ];
 
