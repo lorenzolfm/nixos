@@ -118,9 +118,12 @@
     gcc
     ghostty
     gnumake
+    heaptrack
+    hyperfine
     libevent
     libnotify
     libsystemtap
+    linuxPackages.perf
     pamixer
     pkgconf
     playerctl
@@ -136,6 +139,9 @@
     zed-editor
     zmqpp
   ];
+
+  boot.kernel.sysctl."kernel.perf_event_paranoid" = 1;
+  boot.kernel.sysctl."kernel.kptr_restrict" = 0;
 
   virtualisation.docker.enable = true;
   users.defaultUserShell = pkgs.fish;
