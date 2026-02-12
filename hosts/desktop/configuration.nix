@@ -113,7 +113,6 @@
     bitcoin
     boost
     google-chrome
-    claude-code
     cmake
     discord
     docker
@@ -135,7 +134,6 @@
     rofi
     signal-desktop
     sqlite
-    sqlx-cli
     swaynotificationcenter
     vicinae
     waybar

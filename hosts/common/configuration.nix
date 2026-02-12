@@ -14,6 +14,7 @@
     bottom
     cargo
     cargo-nextest
+    claude-code
     clippy
     diesel-cli
     direnv
@@ -41,6 +42,7 @@
     rustfmt
     spotify
     sql-formatter
+    sqlx-cli
     starship
     stow
     svelte-language-server
