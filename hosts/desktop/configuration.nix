@@ -119,7 +119,7 @@
     gcc
     ghostty
     gnumake
-    heaptrack
+    #heaptrack
     hyperfine
     libevent
     libnotify
