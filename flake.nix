@@ -7,6 +7,7 @@
     darwin.inputs.nixpkgs.follows = "nixpkgs";
     mac-app-util.url = "github:hraban/mac-app-util";
     nix-homebrew.url = "github:zhaofengli-wip/nix-homebrew/main";
+    claude-code.url = "github:sadjow/claude-code-nix";
   };
 
   outputs =
@@ -16,11 +17,13 @@
       darwin,
       mac-app-util,
       nix-homebrew,
+      claude-code,
       ...
     }@inputs:
     {
       nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
+        specialArgs = { inherit claude-code; };
         modules = [
           ./hosts/desktop/configuration.nix
         ];
@@ -28,6 +31,7 @@
 
       darwinConfigurations.macbook = darwin.lib.darwinSystem {
         system = "aarch64-darwin";
+        specialArgs = { inherit claude-code; };
         modules = [
           mac-app-util.darwinModules.default
           nix-homebrew.darwinModules.nix-homebrew

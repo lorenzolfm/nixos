@@ -1,4 +1,4 @@
-{ config, pkgs, ... }:
+{ config, pkgs, claude-code, ... }:
 {
   nixpkgs.config.allowUnfree = true;
 
@@ -14,7 +14,7 @@
     bottom
     cargo
     cargo-nextest
-    claude-code
+    claude-code.packages.${pkgs.system}.claude-code
     clippy
     diesel-cli
     direnv
