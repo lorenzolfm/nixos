@@ -5,17 +5,6 @@
     ../common/configuration.nix
   ];
 
-  nixpkgs.overlays = [
-    (final: prev: {
-      spotify = prev.spotify.overrideAttrs (oldAttrs: {
-        src = prev.fetchurl {
-          url = "https://download.scdn.co/SpotifyARM64.dmg";
-          sha256 = "sha256-cslyAkpAXsVvIfx7tsDpDxnSjidH2uHCeFBq3pXFaMo=";
-        };
-      });
-    })
-  ];
-
   system = {
     primaryUser = "lorenzo";
     keyboard = {
@@ -66,11 +55,16 @@
 
   homebrew = {
     enable = true;
+    taps = [
+      "nikitabobko/tap"
+    ];
     casks = [
       "docker"
       "ghostty"
       "google-chrome"
+      "nikitabobko/tap/aerospace"
       "slack"
+      "spotify"
     ];
     onActivation.cleanup = "zap";
   };

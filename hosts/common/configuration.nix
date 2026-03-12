@@ -40,7 +40,6 @@
     rust-script
     rustc
     rustfmt
-    spotify
     sql-formatter
     sqlx-cli
     starship

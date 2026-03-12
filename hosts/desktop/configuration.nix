@@ -133,6 +133,7 @@
     python314
     rofi
     signal-desktop
+    spotify
     sqlite
     swaynotificationcenter
     vicinae
