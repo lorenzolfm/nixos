@@ -63,6 +63,7 @@
       "ghostty"
       "google-chrome"
       "nikitabobko/tap/aerospace"
+      "signal"
       "slack"
       "spotify"
     ];
