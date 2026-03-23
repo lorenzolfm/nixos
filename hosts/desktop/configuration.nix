@@ -119,7 +119,9 @@
     gcc
     ghostty
     gnumake
-    #heaptrack
+    google-cloud-sdk
+    gws
+    heaptrack
     hyperfine
     libevent
     libnotify
