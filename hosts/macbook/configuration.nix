@@ -67,6 +67,9 @@
       "slack"
       "spotify"
     ];
+    brews = [
+      "terminal-notifier"
+    ];
     onActivation.cleanup = "zap";
   };
 
