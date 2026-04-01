@@ -63,7 +63,7 @@
 
   environment.variables = {
     EDITOR = "nvim";
-    PKG_CONFIG_PATH = "${pkgs.postgresql}/lib/pkgconfig";
+    PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.postgresql}/lib/pkgconfig";
     LIBRARY_PATH = "${pkgs.postgresql.lib}/lib";
   };
 
