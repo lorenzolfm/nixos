@@ -14,6 +14,7 @@
     extraHosts = ''
       10.0.1.1 homelab.local
       10.0.1.9 homelab-1.local
+      10.0.1.4 homelab-2.local
     '';
     networkmanager.enable = true;
     nftables.enable = true;
