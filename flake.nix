@@ -33,6 +33,13 @@
         system = "aarch64-darwin";
         specialArgs = { inherit claude-code; };
         modules = [
+          {
+            nixpkgs.overlays = [
+              (_final: prev: {
+                direnv = prev.direnv.overrideAttrs { doCheck = false; };
+              })
+            ];
+          }
           mac-app-util.darwinModules.default
           nix-homebrew.darwinModules.nix-homebrew
           {
