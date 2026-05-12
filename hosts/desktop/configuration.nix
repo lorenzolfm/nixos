@@ -126,17 +126,18 @@
     })
     bitcoin
     boost
-    google-chrome
     cmake
     discord
     docker
     gcc
     ghostty
     gnumake
+    google-chrome
     google-cloud-sdk
     gws
     heaptrack
     hyperfine
+    jellyfin-desktop
     libevent
     libnotify
     libsystemtap
