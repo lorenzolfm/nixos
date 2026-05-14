@@ -99,7 +99,6 @@
       fd
       ffmpeg
       file
-      firefox
       fzf
       slack
       grim

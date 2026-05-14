@@ -1,4 +1,9 @@
-{ config, pkgs, claude-code, ... }:
+{
+  config,
+  pkgs,
+  claude-code,
+  ...
+}:
 {
   nixpkgs.config.allowUnfree = true;
 
@@ -19,7 +24,6 @@
     diesel-cli
     direnv
     eza
-    firefox
     gh
     gnupg
     grpcurl
