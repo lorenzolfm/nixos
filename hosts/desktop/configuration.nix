@@ -14,19 +14,6 @@
     enableUserSlices = true;
   };
 
-  # Workaround for nixpkgs PR #474827 + sqlite 3.51.2: bitcoin overrides sqlite
-  # with `zlib = null`, but sqlite 3.51.2's checkPhase compiles sessionfuzz.c
-  # which #include <zlib.h>. Skip the check on the bitcoin-only sqlite.
-  nixpkgs.overlays = [
-    (final: prev: {
-      bitcoin = prev.bitcoin.override {
-        sqlite = (prev.sqlite.override { zlib = null; }).overrideAttrs (_: {
-          doCheck = false;
-        });
-      };
-    })
-  ];
-
   networking = {
     hostName = "nixos";
     extraHosts = ''
