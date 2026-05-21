@@ -66,6 +66,7 @@
       "signal"
       "slack"
       "spotify"
+      "whatsapp"
     ];
     brews = [
       "terminal-notifier"
