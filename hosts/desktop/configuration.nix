@@ -14,6 +14,8 @@
     enableUserSlices = true;
   };
 
+  zramSwap.enable = true;
+
   networking = {
     hostName = "nixos";
     extraHosts = ''
