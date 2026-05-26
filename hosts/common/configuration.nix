@@ -21,6 +21,7 @@
     cargo-nextest
     claude-code.packages.${pkgs.system}.claude-code
     clippy
+    codex
     diesel-cli
     direnv
     eza
