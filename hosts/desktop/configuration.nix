@@ -9,9 +9,17 @@
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
 
-  systemd.oomd = {
+  services.earlyoom = {
     enable = true;
-    enableUserSlices = true;
+    freeMemThreshold = 5;
+    freeSwapThreshold = 10;
+    extraArgs = [
+      "--sort-by-rss"
+      "--avoid"
+      "(^systemd|Hyprland|gnome-shell|gnome-keyring|^gdm|pipewire|wireplumber|dbus-broker|dconf|xdg-|at-spi|gvfsd|swaync|waybar|portal)"
+      "--prefer"
+      "(chrome|rust-analyzer)"
+    ];
   };
 
   zramSwap.enable = true;
