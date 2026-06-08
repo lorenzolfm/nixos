@@ -9,6 +9,8 @@
     nix-homebrew.url = "github:zhaofengli-wip/nix-homebrew/main";
     claude-code.url = "github:sadjow/claude-code-nix";
     claude-code.inputs.nixpkgs.follows = "nixpkgs";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -19,12 +21,13 @@
       mac-app-util,
       nix-homebrew,
       claude-code,
+      rust-overlay,
       ...
     }@inputs:
     {
       nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
-        specialArgs = { inherit claude-code; };
+        specialArgs = { inherit claude-code rust-overlay; };
         modules = [
           ./hosts/desktop/configuration.nix
         ];
@@ -32,7 +35,7 @@
 
       darwinConfigurations.macbook = darwin.lib.darwinSystem {
         system = "aarch64-darwin";
-        specialArgs = { inherit claude-code; };
+        specialArgs = { inherit claude-code rust-overlay; };
         modules = [
           {
             nixpkgs.overlays = [

@@ -2,10 +2,12 @@
   config,
   pkgs,
   claude-code,
+  rust-overlay,
   ...
 }:
 {
   nixpkgs.config.allowUnfree = true;
+  nixpkgs.overlays = [ rust-overlay.overlays.default ];
 
   nix.settings.experimental-features = [
     "nix-command"
@@ -17,10 +19,14 @@
     bash-language-server
     bat
     bottom
-    cargo
+    (rust-bin.stable.latest.default.override {
+      extensions = [
+        "rust-src"
+        "rust-analyzer"
+      ];
+    })
     cargo-nextest
     claude-code.packages.${pkgs.system}.claude-code
-    clippy
     codex
     diesel-cli
     direnv
@@ -41,10 +47,7 @@
     postman
     protobuf
     ripgrep
-    rust-analyzer
     rust-script
-    rustc
-    rustfmt
     sql-formatter
     sqlx-cli
     starship
