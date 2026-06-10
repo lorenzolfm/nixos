@@ -155,6 +155,7 @@
     signal-desktop
     spotify
     sqlite
+    terraform
     swaynotificationcenter
     vicinae
     waybar
