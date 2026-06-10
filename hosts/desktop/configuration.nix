@@ -95,7 +95,6 @@
       "docker"
     ];
     packages = with pkgs; [
-      bitwarden-desktop
       cliphist
       cmatrix
       fd
