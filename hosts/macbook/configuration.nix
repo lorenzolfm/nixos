@@ -59,7 +59,7 @@
       "nikitabobko/tap"
     ];
     casks = [
-      "docker"
+      "docker-desktop"
       "ghostty"
       "google-chrome"
       "nikitabobko/tap/aerospace"
