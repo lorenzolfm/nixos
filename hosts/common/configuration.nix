@@ -35,6 +35,7 @@
     gnupg
     grpcurl
     jq
+    k9s
     lua-language-server
     neovim
     ngrok
