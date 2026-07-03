@@ -192,7 +192,16 @@
     xwayland.enable = true;
   };
 
-  services.fail2ban.enable = true;
+  services.fail2ban = {
+    enable = true;
+    # Never ban trusted networks: loopback, LAN, and the Tailscale
+    # CGNAT range (100.64.0.0/10) so my notebook over Tailscale is exempt.
+    ignoreIP = [
+      "127.0.0.1/8"
+      "10.0.0.0/8"
+      "100.64.0.0/10"
+    ];
+  };
   services.blueman.enable = true;
 
   services.xserver.videoDrivers = [ "nvidia" ];
