@@ -33,9 +33,13 @@
     eza
     gh
     gnupg
+    (google-cloud-sdk.withExtraComponents [
+      google-cloud-sdk.components.gke-gcloud-auth-plugin
+    ])
     grpcurl
     jq
     k9s
+    kubectl
     lua-language-server
     neovim
     ngrok

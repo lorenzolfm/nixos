@@ -32,7 +32,6 @@
 
   environment = {
     systemPackages = with pkgs; [
-      fish
       raycast
     ];
 

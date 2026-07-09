@@ -103,12 +103,9 @@
       fzf
       slack
       grim
-      kubectl
-      nodejs_24
       pavucontrol
       pinentry-tty
       poppler
-      ripgrep
       slurp
       sparrow
       swappy
@@ -116,7 +113,6 @@
       wbg
       wl-clipboard
       yazi
-      zoxide
     ];
   };
 
@@ -133,9 +129,6 @@
     ghostty
     gnumake
     google-chrome
-    (google-cloud-sdk.withExtraComponents [
-      google-cloud-sdk.components.gke-gcloud-auth-plugin
-    ])
     gws
     heaptrack
     hyperfine
