@@ -61,10 +61,12 @@
       "docker-desktop"
       "ghostty"
       "google-chrome"
+      "mullvad-vpn"
       "nikitabobko/tap/aerospace"
       "signal"
       "slack"
       "spotify"
+      "telegram"
       "whatsapp"
     ];
     brews = [

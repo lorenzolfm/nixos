@@ -150,6 +150,7 @@
     sqlite
     terraform
     swaynotificationcenter
+    telegram-desktop
     vicinae
     waybar
     zmqpp

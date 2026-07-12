@@ -59,7 +59,6 @@
     stow
     svelte-language-server
     tailscale
-    telegram-desktop
     tree-sitter
     typescript-language-server
     vscode-langservers-extracted
