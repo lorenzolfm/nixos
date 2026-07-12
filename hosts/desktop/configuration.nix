@@ -166,7 +166,7 @@
     enable = true;
     config = {
       user = {
-        signingKey = "/home/lorenzo/.ssh/id_rsa.pub";
+        signingKey = "/home/lorenzo/.ssh/id_ed25519.pub";
         email = "maturanolorenzo@gmail.com";
         name = "Lorenzo";
       };
