@@ -40,6 +40,7 @@
     jq
     k9s
     kubectl
+    kubeseal
     lua-language-server
     neovim
     ngrok
