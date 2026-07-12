@@ -39,7 +39,7 @@
       [user]
       name = Lorenzo
       email = maturanolorenzo@gmail.com
-      signingKey = /Users/lorenzo/.ssh/id_rsa.pub
+      signingKey = /Users/lorenzo/.ssh/id_ed25519.pub
 
       [gpg]
       format = ssh
