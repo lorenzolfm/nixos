@@ -90,6 +90,9 @@
   users.users.lorenzo = {
     isNormalUser = true;
     description = "Lorenzo";
+    openssh.authorizedKeys.keys = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID/67UYdIgV7PwpayA/4Ogc7u84q8FQ5AKrLLRX7q3zT lorenzo@lorenzo-mac"
+    ];
     extraGroups = [
       "networkmanager"
       "wheel"
