@@ -52,6 +52,13 @@
     '';
   };
 
+  programs.ssh.extraConfig = ''
+    Host nixos
+      HostName nixos.tail174781.ts.net
+      User lorenzo
+      IdentityFile ~/.ssh/id_ed25519
+  '';
+
   homebrew = {
     enable = true;
     taps = [
