@@ -70,6 +70,7 @@
       "google-chrome"
       "mullvad-vpn"
       "nikitabobko/tap/aerospace"
+      "obsidian"
       "signal"
       "slack"
       "spotify"

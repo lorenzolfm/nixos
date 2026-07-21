@@ -142,6 +142,7 @@
     libsystemtap
     linuxPackages.perf
     obs-studio
+    obsidian
     pamixer
     pkgconf
     playerctl
