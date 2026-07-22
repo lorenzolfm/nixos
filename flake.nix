@@ -11,6 +11,8 @@
     claude-code.inputs.nixpkgs.follows = "nixpkgs";
     rust-overlay.url = "github:oxalica/rust-overlay";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+    sops-nix.url = "github:Mic92/sops-nix";
+    sops-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -22,6 +24,7 @@
       nix-homebrew,
       claude-code,
       rust-overlay,
+      sops-nix,
       ...
     }@inputs:
     {
@@ -30,6 +33,7 @@
         specialArgs = { inherit claude-code rust-overlay; };
         modules = [
           ./hosts/desktop/configuration.nix
+          sops-nix.nixosModules.sops
         ];
       };
 
