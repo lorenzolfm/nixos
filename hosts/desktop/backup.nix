@@ -1,11 +1,15 @@
 { config, pkgs, ... }:
 
 let
-  homelab2Host = "10.0.1.4";
+  homelab2Host = "10.0.1.2";
+  homelab2Port = 2222;
+  hotRepoPathHomelab2 = "/data/repo/hot";
+
   contaboHost = builtins.replaceStrings [ "\n" ] [ "" ] (
     builtins.readFile "/home/lorenzo/.config/nixos/local-secrets/contabo-host"
   );
-  hotRepoPath = "/srv/borg/lorenzo-desktop/hot";
+  contaboPort = 22;
+  hotRepoPathContabo = "/srv/borg/lorenzo-desktop/hot";
 
   hotSourceDirectories = [
     "/home/lorenzo/.ssh"
@@ -18,13 +22,18 @@ let
   ];
 
   passphraseCommand = "cat ${config.sops.secrets."borg-passphrase".path}";
-  sshCommandFor = destination: "ssh -i ${config.sops.secrets."borg-ssh-key-${destination}".path}";
+  sshCommandFor =
+    destination:
+    "ssh -o StrictHostKeyChecking=accept-new -i ${
+      config.sops.secrets."borg-ssh-key-${destination}".path
+    }";
 
   mkConfig =
     {
       sourceDirectories,
       repoPath,
       host,
+      port ? 22,
       destination,
       retention ? {
         keep_daily = 7;
@@ -37,7 +46,7 @@ let
       source_directories = sourceDirectories;
       repositories = [
         {
-          path = "ssh://borg@${host}${repoPath}";
+          path = "ssh://borg@${host}:${toString port}${repoPath}";
           label = "${baseNameOf repoPath}-${destination}";
         }
       ];
@@ -66,14 +75,16 @@ in
     configurations = {
       hot-homelab2 = mkConfig {
         sourceDirectories = hotSourceDirectories;
-        repoPath = hotRepoPath;
+        repoPath = hotRepoPathHomelab2;
         host = homelab2Host;
+        port = homelab2Port;
         destination = "homelab2";
       };
       hot-contabo = mkConfig {
         sourceDirectories = hotSourceDirectories;
-        repoPath = hotRepoPath;
+        repoPath = hotRepoPathContabo;
         host = contaboHost;
+        port = contaboPort;
         destination = "contabo";
       };
     };
