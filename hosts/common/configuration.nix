@@ -18,6 +18,7 @@
     atuin
     bash-language-server
     bat
+    bitwarden-cli
     bottom
     (rust-bin.stable.latest.default.override {
       extensions = [
