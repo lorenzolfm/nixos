@@ -28,6 +28,18 @@ let
       config.sops.secrets."borg-ssh-key-${destination}".path
     }";
 
+  uptimeKumaHookFor =
+    destination:
+    let
+      pushUrlFile = "/home/lorenzo/.config/nixos/local-secrets/uptime-kuma-push-${destination}";
+    in
+    if builtins.pathExists pushUrlFile then
+      {
+        uptime_kuma.push_url = builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile pushUrlFile);
+      }
+    else
+      { };
+
   mkConfig =
     {
       sourceDirectories,
@@ -41,6 +53,17 @@ let
         keep_monthly = 6;
       },
       compression ? "auto,zstd",
+      skipActions ? [ ],
+      checks ? [
+        {
+          name = "repository";
+          frequency = "2 weeks";
+        }
+        {
+          name = "archives";
+          frequency = "1 month";
+        }
+      ],
     }:
     {
       source_directories = sourceDirectories;
@@ -53,8 +76,11 @@ let
       encryption_passcommand = passphraseCommand;
       ssh_command = sshCommandFor destination;
       compression = compression;
+      inherit checks;
     }
-    // retention;
+    // retention
+    // uptimeKumaHookFor destination
+    // (if skipActions == [ ] then { } else { skip_actions = skipActions; });
 in
 {
   sops.age.keyFile = "/var/lib/sops-nix/key.txt";
@@ -86,9 +112,13 @@ in
         host = contaboHost;
         port = contaboPort;
         destination = "contabo";
+        skipActions = [
+          "compact"
+          "check"
+        ];
       };
     };
   };
 
-  systemd.timers.borgmatic.enable = false;
+  systemd.timers.borgmatic.enable = true;
 }
