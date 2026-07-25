@@ -5,6 +5,7 @@
     ../common/configuration.nix
     ./hardware-configuration.nix
     ./backup.nix
+    ./scb-repo.nix
   ];
 
   boot.loader.systemd-boot.enable = true;
@@ -40,9 +41,6 @@
       logReversePathDrops = true;
       logRefusedConnections = true;
       interfaces = {
-        enp4s0 = {
-          allowedTCPPorts = [ 9000 ];
-        };
         tailscale0 = {
           allowedTCPPorts = [ 22 ];
         };
