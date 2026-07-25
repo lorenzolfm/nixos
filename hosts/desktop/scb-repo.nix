@@ -1,4 +1,4 @@
-{ ... }:
+{ pkgs, ... }:
 
 {
   services.borgbackup.repos.lnd-scb = {
@@ -9,6 +9,7 @@
     quota = "1G";
     allowSubRepos = false;
   };
+  users.users.borg.shell = pkgs.bashInteractive;
   networking.firewall.extraInputRules = ''
     iifname "enp7s0" ip saddr 10.0.1.4 tcp dport 22 accept comment "borg-lnd-scb: homelab-2 -> onsite SCB repo"
   '';
