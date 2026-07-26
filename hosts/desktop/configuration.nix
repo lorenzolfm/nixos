@@ -147,10 +147,12 @@
     playerctl
     protols
     python314
+    qrencode
     rofi
     signal-desktop
     spotify
     sqlite
+    ssss
     terraform
     swaynotificationcenter
     telegram-desktop
