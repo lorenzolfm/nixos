@@ -153,11 +153,13 @@
     spotify
     sqlite
     ssss
-    terraform
     swaynotificationcenter
     telegram-desktop
+    terraform
+    trezor-suite
     vicinae
     waybar
+    zbar
     zmqpp
   ];
 
