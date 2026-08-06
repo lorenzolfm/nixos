@@ -8,6 +8,10 @@
     ./scb-repo.nix
   ];
 
+  nixpkgs.overlays = [
+    (final: _prev: { sparrow = final.callPackage ../../pkgs/sparrow/package.nix { }; })
+  ];
+
   boot.loader.systemd-boot.enable = true;
   boot.loader.systemd-boot.configurationLimit = 5;
   boot.loader.efi.canTouchEfiVariables = true;
