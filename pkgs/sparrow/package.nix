@@ -244,6 +244,7 @@ let
       cp lib/runtime/lib/libargon2.so \
          lib/runtime/lib/libbwt_jni.so \
          lib/runtime/lib/libopenpnp-capture.so \
+         lib/runtime/lib/libzbar.so \
          native-libs/
       chmod ugo+x native-libs/*.so
 
