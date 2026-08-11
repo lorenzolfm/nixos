@@ -196,6 +196,10 @@
   programs.hyprland = {
     enable = true;
     xwayland.enable = true;
+    # Without UWSM nothing activates graphical-session.target, so
+    # xdg-desktop-portal (Requisite=graphical-session.target) can never
+    # start: no portals, and GTK apps ignore the dark color-scheme.
+    withUWSM = true;
   };
 
   services.fail2ban = {
