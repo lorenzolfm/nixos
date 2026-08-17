@@ -65,6 +65,7 @@
       "nikitabobko/tap"
     ];
     casks = [
+      "block-buzz"
       "docker-desktop"
       "ghostty"
       "google-chrome"
