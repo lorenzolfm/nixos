@@ -13,6 +13,9 @@
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
     sops-nix.url = "github:Mic92/sops-nix";
     sops-nix.inputs.nixpkgs.follows = "nixpkgs";
+    wt.url = "github:lorenzolfm/wt";
+    wt.inputs.nixpkgs.follows = "nixpkgs";
+    wt.inputs.rust-overlay.follows = "rust-overlay";
   };
 
   outputs =
@@ -25,12 +28,13 @@
       claude-code,
       rust-overlay,
       sops-nix,
+      wt,
       ...
     }@inputs:
     {
       nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
-        specialArgs = { inherit claude-code rust-overlay; };
+        specialArgs = { inherit claude-code rust-overlay wt; };
         modules = [
           ./hosts/desktop/configuration.nix
           sops-nix.nixosModules.sops
@@ -39,7 +43,7 @@
 
       darwinConfigurations.macbook = darwin.lib.darwinSystem {
         system = "aarch64-darwin";
-        specialArgs = { inherit claude-code rust-overlay; };
+        specialArgs = { inherit claude-code rust-overlay wt; };
         modules = [
           {
             nixpkgs.overlays = [

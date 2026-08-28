@@ -3,6 +3,7 @@
   pkgs,
   claude-code,
   rust-overlay,
+  wt,
   ...
 }:
 {
@@ -64,6 +65,7 @@
     tree-sitter
     typescript-language-server
     vscode-langservers-extracted
+    wt.packages.${pkgs.system}.default
     yaml-language-server
     yamlfmt
     zellij
