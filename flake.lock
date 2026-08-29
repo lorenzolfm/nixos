@@ -71,11 +71,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1788038545,
-        "narHash": "sha256-zLYo8+7ltmIQ+Py9dIXmMia2w4iIlkyQrCXS7UZdL2k=",
+        "lastModified": 1788041280,
+        "narHash": "sha256-6d2Dre9CH2vppqPKfSSXEXtsJqj1urrYvv2Qde5Pslo=",
         "owner": "lorenzolfm",
         "repo": "claude-tray",
-        "rev": "14084cbfba12e9f76b66761d8ce6d77db1b4d7ea",
+        "rev": "e2b87e31d3aeae617d06b1575ddf7fd403f4399d",
         "type": "github"
       },
       "original": {
