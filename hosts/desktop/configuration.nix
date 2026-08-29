@@ -155,6 +155,11 @@
     ];
   };
 
+  # Qt defaults to the xcb platform plugin and aborts under Hyprland, where
+  # there is no X display. Prefer wayland, keeping xcb as fallback for Qt
+  # apps built without the wayland plugin.
+  environment.sessionVariables.QT_QPA_PLATFORM = "wayland;xcb";
+
   environment.systemPackages = with pkgs; [
     (appimage-run.override {
       extraPkgs = pkgs: [ pkgs.xorg.libxshmfence ];
