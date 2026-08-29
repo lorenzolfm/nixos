@@ -90,6 +90,11 @@
 
   services.xserver.enable = true;
   services.xserver.displayManager.gdm.enable = true;
+  # Hyprland installs two sessions; the plain one bypasses UWSM, so
+  # graphical-session.target never activates and the portals stay dead
+  # (GTK apps then ignore color-scheme and render light). Pre-select the
+  # uwsm-managed session so a login can't silently land on the broken one.
+  services.displayManager.defaultSession = "hyprland-uwsm";
   services.xserver.desktopManager.gnome.enable = true;
   services.xserver.xkb = {
     layout = "us";
