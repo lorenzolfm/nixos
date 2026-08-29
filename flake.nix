@@ -16,6 +16,9 @@
     wt.url = "github:lorenzolfm/wt";
     wt.inputs.nixpkgs.follows = "nixpkgs";
     wt.inputs.rust-overlay.follows = "rust-overlay";
+    claude-tray.url = "github:lorenzolfm/claude-tray";
+    claude-tray.inputs.nixpkgs.follows = "nixpkgs";
+    claude-tray.inputs.rust-overlay.follows = "rust-overlay";
   };
 
   outputs =
@@ -29,12 +32,20 @@
       rust-overlay,
       sops-nix,
       wt,
+      claude-tray,
       ...
     }@inputs:
     {
       nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
-        specialArgs = { inherit claude-code rust-overlay wt; };
+        specialArgs = {
+          inherit
+            claude-code
+            rust-overlay
+            wt
+            claude-tray
+            ;
+        };
         modules = [
           ./hosts/desktop/configuration.nix
           sops-nix.nixosModules.sops
