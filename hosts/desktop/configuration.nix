@@ -11,6 +11,23 @@
 
   nixpkgs.overlays = [
     (final: _prev: { sparrow = final.callPackage ../../pkgs/sparrow/package.nix { }; })
+    # librepods decides whether the AirPods are the active output by substring
+    # matching the default sink's name. WirePlumber 0.5.13 changed how it formats
+    # those names, so the match silently fails and ear detection stops pausing
+    # media -- the events still fire, the pause is just never reached.
+    # 0001 is upstream PR #417 (open, unmerged), comparing the bluez
+    # `device.string` MAC exactly instead. 0002 guards a NULL deref that PR
+    # leaves in its new callback. Drop both once #417 reaches nixpkgs.
+    (_final: prev: {
+      librepods = prev.librepods.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ [
+          ../../pkgs/librepods/0001-match-sinks-by-mac-not-name.patch
+          ../../pkgs/librepods/0002-guard-null-sink-info.patch
+        ];
+        # The patches are rooted at the repo, but sourceRoot is source/linux.
+        patchFlags = [ "-p2" ];
+      });
+    })
   ];
 
   boot.loader.systemd-boot.enable = true;
@@ -143,6 +160,7 @@
     jellyfin-desktop
     libevent
     libnotify
+    librepods
     libsystemtap
     linuxPackages.perf
     obs-studio

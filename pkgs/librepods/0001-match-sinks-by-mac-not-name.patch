@@ -1,0 +1,158 @@
+diff --git a/linux/main.cpp b/linux/main.cpp
+index 94d341ea3..64317d2c4 100644
+--- a/linux/main.cpp
++++ b/linux/main.cpp
+@@ -105,8 +105,7 @@ class AirPodsTrayApp : public QObject {
+                 // On startup after reboot, activate A2DP profile for already connected AirPods
+                 QTimer::singleShot(2000, this, [this, address]()
+                 {
+-                    QString formattedAddress = address.toString().replace(":", "_");
+-                    mediaController->setConnectedDeviceMacAddress(formattedAddress);
++                    mediaController->setConnectedDeviceMacAddress(address.toString());
+                     mediaController->activateA2dpProfile();
+                     LOG_INFO("A2DP profile activation attempted for AirPods found on startup");
+                 });
+@@ -427,7 +426,7 @@ public slots:
+         if (areAirpodsConnected() && m_deviceInfo && !m_deviceInfo->bluetoothAddress().isEmpty())
+         {
+             LOG_INFO("AirPods already connected after wake-up, re-activating A2DP profile");
+-            mediaController->setConnectedDeviceMacAddress(m_deviceInfo->bluetoothAddress().replace(":", "_"));
++            mediaController->setConnectedDeviceMacAddress(m_deviceInfo->bluetoothAddress());
+ 
+             // Always activate A2DP profile after system wake since the profile might have been lost
+             QTimer::singleShot(1000, this, [this]()
+@@ -494,9 +493,7 @@ private slots:
+         {
+             if (!address.isEmpty())
+             {
+-                QString formattedAddress = address;
+-                formattedAddress = formattedAddress.replace(":", "_");
+-                mediaController->setConnectedDeviceMacAddress(formattedAddress);
++                mediaController->setConnectedDeviceMacAddress(address);
+                 mediaController->activateA2dpProfile();
+                 LOG_INFO("A2DP profile activation attempted for newly connected device");
+             }
+@@ -738,7 +735,7 @@ private slots:
+         {
+             parseMetadata(data);
+             initiateMagicPairing();
+-            mediaController->setConnectedDeviceMacAddress(m_deviceInfo->bluetoothAddress().replace(":", "_"));
++            mediaController->setConnectedDeviceMacAddress(m_deviceInfo->bluetoothAddress());
+             if (m_deviceInfo->getEarDetection()->oneOrMorePodsInEar()) // AirPods get added as output device only after this
+             {
+                 mediaController->activateA2dpProfile();
+diff --git a/linux/media/mediacontroller.cpp b/linux/media/mediacontroller.cpp
+index 078129c5a..06091bd55 100644
+--- a/linux/media/mediacontroller.cpp
++++ b/linux/media/mediacontroller.cpp
+@@ -95,9 +95,9 @@ void MediaController::followMediaChanges() {
+ }
+ 
+ bool MediaController::isActiveOutputDeviceAirPods() {
+-  QString defaultSink = m_pulseAudio->getDefaultSink();
+-  LOG_DEBUG("Default sink: " << defaultSink);
+-  return defaultSink.contains(connectedDeviceMacAddress);
++  QString defaultSinkMacAddress = m_pulseAudio->getDefaultSinkMacAddress();
++  LOG_DEBUG("Default sink MAC address: " << defaultSinkMacAddress);
++  return defaultSinkMacAddress == connectedDeviceMacAddress;
+ }
+ 
+ void MediaController::handleConversationalAwareness(const QByteArray &data) {
+diff --git a/linux/media/pulseaudiocontroller.cpp b/linux/media/pulseaudiocontroller.cpp
+index d1535d0ee..299626162 100644
+--- a/linux/media/pulseaudiocontroller.cpp
++++ b/linux/media/pulseaudiocontroller.cpp
+@@ -105,11 +105,60 @@ QString PulseAudioController::getDefaultSink()
+         waitForOperation(op);
+         pa_operation_unref(op);
+     }
++
+     pa_threaded_mainloop_unlock(m_mainloop);
+ 
+     return data.sinkName;
+ }
+ 
++QString PulseAudioController::getDefaultSinkMacAddress() {
++    return this->getMacAddressBySinkName(this->getDefaultSink());
++}
++
++QString PulseAudioController::getMacAddressBySinkName(const QString &sinkName)
++{
++    if (!m_initialized) return QString();
++
++    struct CallbackData {
++        QString sinkMacAddress;
++        pa_threaded_mainloop *mainloop;
++    } data;
++    data.mainloop = m_mainloop;
++
++    auto callback = [](pa_context *c, const pa_sink_info *info, int eol, void *userdata)
++    {
++        CallbackData *d = static_cast<CallbackData*>(userdata);
++        if (eol > 0)
++        {
++            pa_threaded_mainloop_signal(d->mainloop, 0);
++            return;
++        }
++
++        const char *addr = pa_proplist_gets(
++        info->proplist,
++        "device.string"
++        );
++
++        if (addr)
++        {
++            d->sinkMacAddress = QString::fromUtf8(addr);
++            pa_threaded_mainloop_signal(d->mainloop, 0);
++        }
++    };
++
++    pa_threaded_mainloop_lock(m_mainloop);
++    pa_operation *op = pa_context_get_sink_info_by_name(m_context, sinkName.toUtf8().constData(), callback, &data);
++    if (op)
++    {
++        waitForOperation(op);
++        pa_operation_unref(op);
++    }
++
++    pa_threaded_mainloop_unlock(m_mainloop);
++
++    return data.sinkMacAddress;
++}
++
+ int PulseAudioController::getSinkVolume(const QString &sinkName)
+ {
+     if (!m_initialized) return -1;
+@@ -215,8 +264,10 @@ QString PulseAudioController::getCardNameForDevice(const QString &macAddress)
+         }
+         if (info)
+         {
+-            QString name = QString::fromUtf8(info->name);
+-            if (name.startsWith("bluez") && name.contains(d->targetMac))
++            const QString name = QString::fromUtf8(info->name);
++            const QString macAddress = pa_proplist_gets(info->proplist, "device.string");
++
++            if (d->targetMac == macAddress)
+             {
+                 d->cardName = name;
+                 pa_threaded_mainloop_signal(d->mainloop, 0);
+diff --git a/linux/media/pulseaudiocontroller.h b/linux/media/pulseaudiocontroller.h
+index 9ee1b2793..807e07467 100644
+--- a/linux/media/pulseaudiocontroller.h
++++ b/linux/media/pulseaudiocontroller.h
+@@ -15,6 +15,7 @@ class PulseAudioController : public QObject
+ 
+     bool initialize();
+     QString getDefaultSink();
++    QString getDefaultSinkMacAddress();
+     int getSinkVolume(const QString &sinkName);
+     bool setSinkVolume(const QString &sinkName, int volumePercent);
+     bool setCardProfile(const QString &cardName, const QString &profileName);
+@@ -32,6 +33,7 @@ class PulseAudioController : public QObject
+     static void serverInfoCallback(pa_context *c, const pa_server_info *info, void *userdata);
+ 
+     bool waitForOperation(pa_operation *op);
++    QString getMacAddressBySinkName(const QString &sinkName);
+ };
+ 
+ #endif // PULSEAUDIOCONTROLLER_H
