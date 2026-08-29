@@ -1,0 +1,16 @@
+--- a/linux/media/pulseaudiocontroller.cpp
++++ b/linux/media/pulseaudiocontroller.cpp
+@@ -128,7 +128,12 @@
+     auto callback = [](pa_context *c, const pa_sink_info *info, int eol, void *userdata)
+     {
+         CallbackData *d = static_cast<CallbackData*>(userdata);
+-        if (eol > 0)
++        // eol > 0 ends the list; eol < 0 signals an error and PulseAudio
++        // passes info == NULL with it, so both must signal and bail before
++        // touching info. Without this a failed lookup dereferences NULL --
++        // which is exactly what happens when the default sink disappears
++        // mid-reconnect.
++        if (eol != 0 || !info)
+         {
+             pa_threaded_mainloop_signal(d->mainloop, 0);
+             return;

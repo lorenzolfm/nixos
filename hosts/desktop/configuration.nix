@@ -6,10 +6,28 @@
     ./hardware-configuration.nix
     ./backup.nix
     ./scb-repo.nix
+    ./claude-tray.nix
   ];
 
   nixpkgs.overlays = [
     (final: _prev: { sparrow = final.callPackage ../../pkgs/sparrow/package.nix { }; })
+    # librepods decides whether the AirPods are the active output by substring
+    # matching the default sink's name. WirePlumber 0.5.13 changed how it formats
+    # those names, so the match silently fails and ear detection stops pausing
+    # media -- the events still fire, the pause is just never reached.
+    # 0001 is upstream PR #417 (open, unmerged), comparing the bluez
+    # `device.string` MAC exactly instead. 0002 guards a NULL deref that PR
+    # leaves in its new callback. Drop both once #417 reaches nixpkgs.
+    (_final: prev: {
+      librepods = prev.librepods.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ [
+          ../../pkgs/librepods/0001-match-sinks-by-mac-not-name.patch
+          ../../pkgs/librepods/0002-guard-null-sink-info.patch
+        ];
+        # The patches are rooted at the repo, but sourceRoot is source/linux.
+        patchFlags = [ "-p2" ];
+      });
+    })
   ];
 
   boot.loader.systemd-boot.enable = true;
@@ -72,6 +90,11 @@
 
   services.xserver.enable = true;
   services.xserver.displayManager.gdm.enable = true;
+  # Hyprland installs two sessions; the plain one bypasses UWSM, so
+  # graphical-session.target never activates and the portals stay dead
+  # (GTK apps then ignore color-scheme and render light). Pre-select the
+  # uwsm-managed session so a login can't silently land on the broken one.
+  services.displayManager.defaultSession = "hyprland-uwsm";
   services.xserver.desktopManager.gnome.enable = true;
   services.xserver.xkb = {
     layout = "us";
@@ -88,6 +111,15 @@
     alsa.support32Bit = true;
     pulse.enable = true;
     jack.enable = true;
+    # LibrePods (and any AVRCP peer) needs a registered player to accept
+    # play/pause/skip. WirePlumber supplies one itself; bluez's mpris-proxy
+    # is the PulseAudio-era equivalent and the two conflict, so use this
+    # and keep mpris-proxy off.
+    wireplumber.extraConfig."51-bluez-avrcp" = {
+      "monitor.bluez.properties" = {
+        "bluez5.dummy-avrcp-player" = true;
+      };
+    };
   };
 
   users.users.lorenzo = {
@@ -123,6 +155,11 @@
     ];
   };
 
+  # Qt defaults to the xcb platform plugin and aborts under Hyprland, where
+  # there is no X display. Prefer wayland, keeping xcb as fallback for Qt
+  # apps built without the wayland plugin.
+  environment.sessionVariables.QT_QPA_PLATFORM = "wayland;xcb";
+
   environment.systemPackages = with pkgs; [
     (appimage-run.override {
       extraPkgs = pkgs: [ pkgs.xorg.libxshmfence ];
@@ -142,6 +179,7 @@
     jellyfin-desktop
     libevent
     libnotify
+    librepods
     libsystemtap
     linuxPackages.perf
     obs-studio
