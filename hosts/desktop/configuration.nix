@@ -106,6 +106,15 @@
     alsa.support32Bit = true;
     pulse.enable = true;
     jack.enable = true;
+    # LibrePods (and any AVRCP peer) needs a registered player to accept
+    # play/pause/skip. WirePlumber supplies one itself; bluez's mpris-proxy
+    # is the PulseAudio-era equivalent and the two conflict, so use this
+    # and keep mpris-proxy off.
+    wireplumber.extraConfig."51-bluez-avrcp" = {
+      "monitor.bluez.properties" = {
+        "bluez5.dummy-avrcp-player" = true;
+      };
+    };
   };
 
   users.users.lorenzo = {
