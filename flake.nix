@@ -19,6 +19,9 @@
     claude-tray.url = "github:lorenzolfm/claude-tray";
     claude-tray.inputs.nixpkgs.follows = "nixpkgs";
     claude-tray.inputs.rust-overlay.follows = "rust-overlay";
+    claude-ps.url = "github:lorenzolfm/claude-ps";
+    claude-ps.inputs.nixpkgs.follows = "nixpkgs";
+    claude-ps.inputs.rust-overlay.follows = "rust-overlay";
   };
 
   outputs =
@@ -33,6 +36,7 @@
       sops-nix,
       wt,
       claude-tray,
+      claude-ps,
       ...
     }@inputs:
     {
@@ -44,6 +48,7 @@
             rust-overlay
             wt
             claude-tray
+            claude-ps
             ;
         };
         modules = [

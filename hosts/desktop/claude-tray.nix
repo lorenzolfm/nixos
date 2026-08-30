@@ -41,15 +41,19 @@ in
 
     # 🔴 NixOS gives user units a sanitized PATH (coreutils, findutils, grep, sed, systemd), so
     # the manager's own PATH from /etc/environment.d does NOT reach the service, and both
-    # binaries the applet shells out to would be missing. Neither is looked up by store path on
-    # purpose:
-    #   - claude-agents, so the producer can be upgraded underneath the applet. ⚠️ It is still
-    #     an imperative `nix profile` install, which is why ~/.nix-profile/bin is on this list.
-    #   - zellij, because click-to-jump speaks to a running server and a pinned build of a
-    #     different version would talk to it wrongly. It must be the same zellij he runs.
+    # binaries the applet shells out to would be missing.
+    #
+    # `claude-ps` is a system package now (`./claude-ps.nix`), so it arrives on
+    # /run/current-system/sw/bin with everything else and moves in the same generation as the
+    # applet — which is what its contract wants, the two agreeing on key names. It used to be an
+    # imperative `nix profile` install, which is why ~/.nix-profile/bin was on this list; that
+    # entry is gone, and nothing the applet calls lives there any more.
+    #
+    # `zellij` is still looked up by name rather than by store path, because click-to-jump speaks
+    # to a **running** server and a pinned build of a different version would talk to it wrongly.
+    # It must be the same zellij he runs.
     environment.PATH = lib.mkForce (
       lib.concatStringsSep ":" [
-        "/home/lorenzo/.nix-profile/bin"
         "/etc/profiles/per-user/lorenzo/bin"
         "/run/current-system/sw/bin"
       ]
