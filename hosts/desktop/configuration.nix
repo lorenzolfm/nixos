@@ -7,6 +7,8 @@
     ./backup.nix
     ./scb-repo.nix
     ./claude-tray.nix
+    ./claude-ps.nix
+    ./rgb.nix
   ];
 
   nixpkgs.overlays = [
@@ -18,14 +20,46 @@
     # 0001 is upstream PR #417 (open, unmerged), comparing the bluez
     # `device.string` MAC exactly instead. 0002 guards a NULL deref that PR
     # leaves in its new callback. Drop both once #417 reaches nixpkgs.
+    #
+    # 0003 is local. On both pods out librepods set the card profile to "off",
+    # destroying the sink, so the default sink fell back to another device and
+    # on re-insertion the MAC read back as garbage -- resume was unreachable
+    # and taking the AirPods off killed playback rather than pausing it. It
+    # also gated the pause on a flaky blocking D-Bus read that left the resume
+    # list empty. Not filed upstream yet.
+    #
+    # 0004 is local. Chromium exports the MPRIS Player interface with no
+    # introspection XML, and QDBusInterface resolves properties through that
+    # metadata, so every PlaybackStatus read came back empty and librepods
+    # concluded nothing was playing -- ear detection paused nothing at all.
+    # Reads org.freedesktop.DBus.Properties directly instead, as playerctl
+    # does. Not filed upstream yet.
     (_final: prev: {
       librepods = prev.librepods.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [
           ../../pkgs/librepods/0001-match-sinks-by-mac-not-name.patch
           ../../pkgs/librepods/0002-guard-null-sink-info.patch
+          ../../pkgs/librepods/0003-pause-on-ear-removal-without-tearing-down-sink.patch
+          ../../pkgs/librepods/0004-read-mpris-properties-without-introspection.patch
         ];
         # The patches are rooted at the repo, but sourceRoot is source/linux.
         patchFlags = [ "-p2" ];
+      });
+    })
+    # Ghostty's GTK frontend pulses the OSC 9;4 indeterminate progress bar once
+    # per progress report, and GtkProgressBar paces its animation by the gap
+    # between pulse() calls -- so the bar's speed is whatever rate the program
+    # in the terminal happens to emit at. Claude Code reports about once a
+    # second, which moves the block 10% per second: ten seconds to cross, and a
+    # stall whenever reports pause. The macOS frontend animates its own 1.2s
+    # bounce and ignores the report rate, which is why this only looks wrong on
+    # Linux. 0001 drives the pulse from a 120ms timer instead. Not filed
+    # upstream yet.
+    (_final: prev: {
+      ghostty = prev.ghostty.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ [
+          ../../pkgs/ghostty/0001-pulse-progress-bar-on-a-steady-timer.patch
+        ];
       });
     })
   ];
@@ -111,15 +145,28 @@
     alsa.support32Bit = true;
     pulse.enable = true;
     jack.enable = true;
-    # LibrePods (and any AVRCP peer) needs a registered player to accept
-    # play/pause/skip. WirePlumber supplies one itself; bluez's mpris-proxy
-    # is the PulseAudio-era equivalent and the two conflict, so use this
-    # and keep mpris-proxy off.
+    # The AirPods' own play/pause button sends an AVRCP passthrough command,
+    # which only reaches the desktop if something registers a player with
+    # bluez and forwards to MPRIS. Two things can register one and only one
+    # may, or the registration is refused and the button does nothing.
+    #
+    # WirePlumber's dummy player registers but forwards nothing, so it is
+    # explicitly off; mpris-proxy below does the forwarding and is what
+    # actually makes the button work. Verified by testing both in isolation.
     wireplumber.extraConfig."51-bluez-avrcp" = {
       "monitor.bluez.properties" = {
-        "bluez5.dummy-avrcp-player" = true;
+        "bluez5.dummy-avrcp-player" = false;
       };
     };
+  };
+
+  # Bridges AVRCP passthrough from the AirPods to MPRIS, so the button on the
+  # headphones pauses whatever is playing. bluez ships the unit; asDropin
+  # enables it without redefining it (a full definition would collide with
+  # the unit bluez already installs at the same path).
+  systemd.user.services.mpris-proxy = {
+    overrideStrategy = "asDropin";
+    wantedBy = [ "default.target" ];
   };
 
   users.users.lorenzo = {
