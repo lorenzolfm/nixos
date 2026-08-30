@@ -145,15 +145,28 @@
     alsa.support32Bit = true;
     pulse.enable = true;
     jack.enable = true;
-    # LibrePods (and any AVRCP peer) needs a registered player to accept
-    # play/pause/skip. WirePlumber supplies one itself; bluez's mpris-proxy
-    # is the PulseAudio-era equivalent and the two conflict, so use this
-    # and keep mpris-proxy off.
+    # The AirPods' own play/pause button sends an AVRCP passthrough command,
+    # which only reaches the desktop if something registers a player with
+    # bluez and forwards to MPRIS. Two things can register one and only one
+    # may, or the registration is refused and the button does nothing.
+    #
+    # WirePlumber's dummy player registers but forwards nothing, so it is
+    # explicitly off; mpris-proxy below does the forwarding and is what
+    # actually makes the button work. Verified by testing both in isolation.
     wireplumber.extraConfig."51-bluez-avrcp" = {
       "monitor.bluez.properties" = {
-        "bluez5.dummy-avrcp-player" = true;
+        "bluez5.dummy-avrcp-player" = false;
       };
     };
+  };
+
+  # Bridges AVRCP passthrough from the AirPods to MPRIS, so the button on the
+  # headphones pauses whatever is playing. bluez ships the unit; asDropin
+  # enables it without redefining it (a full definition would collide with
+  # the unit bluez already installs at the same path).
+  systemd.user.services.mpris-proxy = {
+    overrideStrategy = "asDropin";
+    wantedBy = [ "default.target" ];
   };
 
   users.users.lorenzo = {
