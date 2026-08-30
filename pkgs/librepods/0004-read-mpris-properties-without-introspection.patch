@@ -1,0 +1,214 @@
+diff --git a/linux/media/mediacontroller.cpp b/linux/media/mediacontroller.cpp
+--- a/linux/media/mediacontroller.cpp
++++ b/linux/media/mediacontroller.cpp
+@@ -10,6 +10,42 @@
+ #include <QRegularExpression>
+ #include <QDBusConnection>
+ #include <QDBusConnectionInterface>
++#include <QDBusMessage>
++#include <QDBusVariant>
++
++namespace {
++
++// Chromium exports org.mpris.MediaPlayer2.Player without any introspection
++// XML. QDBusInterface resolves properties and methods through that metadata,
++// so property("PlaybackStatus") returns an empty variant and every playing
++// player looks stopped -- ear detection then pauses nothing. Calling
++// org.freedesktop.DBus.Properties directly is what playerctl does, and it
++// works whether or not the peer is introspectable.
++QString mprisPlaybackStatus(const QDBusConnection &bus, const QString &service)
++{
++  QDBusMessage msg = QDBusMessage::createMethodCall(
++      service, "/org/mpris/MediaPlayer2",
++      "org.freedesktop.DBus.Properties", "Get");
++  msg << QString("org.mpris.MediaPlayer2.Player") << QString("PlaybackStatus");
++
++  QDBusMessage reply = bus.call(msg, QDBus::Block, 2000);
++  if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty())
++  {
++    return QString();
++  }
++  return reply.arguments().constFirst().value<QDBusVariant>().variant().toString();
++}
++
++bool mprisCall(const QDBusConnection &bus, const QString &service, const QString &method)
++{
++  QDBusMessage msg = QDBusMessage::createMethodCall(
++      service, "/org/mpris/MediaPlayer2",
++      "org.mpris.MediaPlayer2.Player", method);
++  QDBusMessage reply = bus.call(msg, QDBus::Block, 2000);
++  return reply.type() == QDBusMessage::ReplyMessage;
++}
++
++} // namespace
+ 
+ MediaController::MediaController(QObject *parent) : QObject(parent) {
+   m_pulseAudio = new PulseAudioController(this);
+@@ -284,19 +320,7 @@
+       continue;
+     }
+ 
+-    QDBusInterface playerInterface(
+-        service,
+-        "/org/mpris/MediaPlayer2",
+-        "org.mpris.MediaPlayer2.Player",
+-        bus);
+-
+-    if (!playerInterface.isValid())
+-    {
+-      continue;
+-    }
+-
+-    QVariant playbackStatus = playerInterface.property("PlaybackStatus");
+-    if (playbackStatus.isValid() && playbackStatus.toString() == "Playing")
++    if (mprisPlaybackStatus(bus, service) == "Playing")
+     {
+       playingServices << service;
+       LOG_DEBUG("Found playing service: " << service);
+@@ -319,27 +343,14 @@
+ 
+   for (const QString &service : pausedByAppServices)
+   {
+-    QDBusInterface playerInterface(
+-        service,
+-        "/org/mpris/MediaPlayer2",
+-        "org.mpris.MediaPlayer2.Player",
+-        bus);
+-
+-    if (!playerInterface.isValid())
+-    {
+-      LOG_WARN("Service no longer available: " << service);
+-      continue;
+-    }
+-
+-    QDBusReply<void> reply = playerInterface.call("Play");
+-    if (reply.isValid())
++    if (mprisCall(bus, service, "Play"))
+     {
+       LOG_INFO("Resumed playback for: " << service);
+       resumedCount++;
+     }
+     else
+     {
+-      LOG_ERROR("Failed to resume " << service << ": " << reply.error().message());
++      LOG_ERROR("Failed to resume " << service);
+     }
+   }
+ 
+@@ -369,27 +380,15 @@
+       continue;
+     }
+ 
+-    QDBusInterface playerInterface(
+-        service,
+-        "/org/mpris/MediaPlayer2",
+-        "org.mpris.MediaPlayer2.Player",
+-        bus);
+-
+-    if (!playerInterface.isValid())
+-    {
+-      continue;
+-    }
+-
+-    QVariant playbackStatus = playerInterface.property("PlaybackStatus");
+-    LOG_DEBUG("PlaybackStatus for " << service << ": " << playbackStatus.toString());
+-    if (!playbackStatus.isValid() || playbackStatus.toString() != "Playing")
++    const QString playbackStatus = mprisPlaybackStatus(bus, service);
++    LOG_DEBUG("PlaybackStatus for " << service << ": " << playbackStatus);
++    if (playbackStatus != "Playing")
+     {
+       continue;
+     }
+ 
+-    QDBusReply<void> reply = playerInterface.call("Pause");
+     LOG_DEBUG("Pausing service: " << service);
+-    if (reply.isValid())
++    if (mprisCall(bus, service, "Pause"))
+     {
+       LOG_INFO("Paused playback for: " << service);
+       pausedByAppServices << service;
+@@ -397,7 +396,7 @@
+     }
+     else
+     {
+-      LOG_ERROR("Failed to pause " << service << ": " << reply.error().message());
++      LOG_ERROR("Failed to pause " << service);
+     }
+   }
+ 
+diff --git a/linux/media/playerstatuswatcher.cpp b/linux/media/playerstatuswatcher.cpp
+--- a/linux/media/playerstatuswatcher.cpp
++++ b/linux/media/playerstatuswatcher.cpp
+@@ -4,6 +4,42 @@
+ #include <QVariantMap>
+ #include <QDBusReply>
+ #include <QDBusConnectionInterface>
++#include <QDBusMessage>
++#include <QDBusVariant>
++
++namespace {
++
++// Chromium exports org.mpris.MediaPlayer2.Player without any introspection
++// XML. QDBusInterface resolves properties and methods through that metadata,
++// so property("PlaybackStatus") returns an empty variant and every playing
++// player looks stopped -- ear detection then pauses nothing. Calling
++// org.freedesktop.DBus.Properties directly is what playerctl does, and it
++// works whether or not the peer is introspectable.
++QString mprisPlaybackStatus(const QDBusConnection &bus, const QString &service)
++{
++  QDBusMessage msg = QDBusMessage::createMethodCall(
++      service, "/org/mpris/MediaPlayer2",
++      "org.freedesktop.DBus.Properties", "Get");
++  msg << QString("org.mpris.MediaPlayer2.Player") << QString("PlaybackStatus");
++
++  QDBusMessage reply = bus.call(msg, QDBus::Block, 2000);
++  if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty())
++  {
++    return QString();
++  }
++  return reply.arguments().constFirst().value<QDBusVariant>().variant().toString();
++}
++
++bool mprisCall(const QDBusConnection &bus, const QString &service, const QString &method)
++{
++  QDBusMessage msg = QDBusMessage::createMethodCall(
++      service, "/org/mpris/MediaPlayer2",
++      "org.mpris.MediaPlayer2.Player", method);
++  QDBusMessage reply = bus.call(msg, QDBus::Block, 2000);
++  return reply.type() == QDBusMessage::ReplyMessage;
++}
++
++} // namespace
+ 
+ PlayerStatusWatcher::PlayerStatusWatcher(const QString &playerService, QObject *parent)
+     : QObject(parent),
+@@ -32,9 +68,9 @@
+ }
+ 
+ void PlayerStatusWatcher::updateStatus() {
+-    QVariant reply = m_iface->property("PlaybackStatus");
+-    if (reply.isValid()) {
+-        emit playbackStatusChanged(reply.toString());
++    const QString status = mprisPlaybackStatus(QDBusConnection::sessionBus(), m_playerService);
++    if (!status.isEmpty()) {
++        emit playbackStatusChanged(status);
+     }
+ }
+ 
+@@ -54,14 +90,8 @@
+ 
+     for (const QString &service : services) {
+         if (service.startsWith("org.mpris.MediaPlayer2.")) {
+-            QDBusInterface iface(service, "/org/mpris/MediaPlayer2",
+-                               "org.mpris.MediaPlayer2.Player", bus);
+-            
+-            if (iface.isValid()) {
+-                QVariant status = iface.property("PlaybackStatus");
+-                if (status.isValid() && status.toString() == "Playing") {
+-                    return status.toString();
+-                }
++            if (mprisPlaybackStatus(bus, service) == "Playing") {
++                return QStringLiteral("Playing");
+             }
+         }
+     }

@@ -1,0 +1,36 @@
+diff --git a/linux/media/mediacontroller.cpp b/linux/media/mediacontroller.cpp
+--- a/linux/media/mediacontroller.cpp
++++ b/linux/media/mediacontroller.cpp
+@@ -51,11 +51,13 @@
+ 
+   if (shouldPause && isActiveOutputDeviceAirPods())
+   {
+-    if (getCurrentMediaState() == Playing)
+-    {
+-      LOG_DEBUG("Pausing playback for ear detection");
+-      pause();
+-    }
++    // Do not gate on getCurrentMediaState(): it is a blocking D-Bus property
++    // read that intermittently reports "not playing" for a player that is in
++    // fact playing, which leaves pausedByAppServices empty and makes the
++    // resume below unreachable. pause() already skips any service whose
++    // PlaybackStatus is not "Playing", so the outer check is redundant.
++    LOG_DEBUG("Pausing playback for ear detection");
++    pause();
+   }
+ 
+   // Then handle device profile switching
+@@ -73,7 +75,12 @@
+   else
+   {
+     LOG_INFO("Both AirPods are out of ear");
+-    removeAudioOutputDevice();
++    // Deliberately do NOT call removeAudioOutputDevice() here. It sets the
++    // card profile to "off", which destroys the sink; the default sink then
++    // falls back to another device, so on re-insertion
++    // isActiveOutputDeviceAirPods() reads a non-bluez sink name, and the
++    // resume branch above is skipped. Ear detection should pause playback,
++    // not tear down the audio device.
+   }
+ }
+ 

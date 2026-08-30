@@ -20,11 +20,27 @@
     # 0001 is upstream PR #417 (open, unmerged), comparing the bluez
     # `device.string` MAC exactly instead. 0002 guards a NULL deref that PR
     # leaves in its new callback. Drop both once #417 reaches nixpkgs.
+    #
+    # 0003 is local. On both pods out librepods set the card profile to "off",
+    # destroying the sink, so the default sink fell back to another device and
+    # on re-insertion the MAC read back as garbage -- resume was unreachable
+    # and taking the AirPods off killed playback rather than pausing it. It
+    # also gated the pause on a flaky blocking D-Bus read that left the resume
+    # list empty. Not filed upstream yet.
+    #
+    # 0004 is local. Chromium exports the MPRIS Player interface with no
+    # introspection XML, and QDBusInterface resolves properties through that
+    # metadata, so every PlaybackStatus read came back empty and librepods
+    # concluded nothing was playing -- ear detection paused nothing at all.
+    # Reads org.freedesktop.DBus.Properties directly instead, as playerctl
+    # does. Not filed upstream yet.
     (_final: prev: {
       librepods = prev.librepods.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [
           ../../pkgs/librepods/0001-match-sinks-by-mac-not-name.patch
           ../../pkgs/librepods/0002-guard-null-sink-info.patch
+          ../../pkgs/librepods/0003-pause-on-ear-removal-without-tearing-down-sink.patch
+          ../../pkgs/librepods/0004-read-mpris-properties-without-introspection.patch
         ];
         # The patches are rooted at the repo, but sourceRoot is source/linux.
         patchFlags = [ "-p2" ];
