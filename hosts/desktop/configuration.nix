@@ -46,6 +46,22 @@
         patchFlags = [ "-p2" ];
       });
     })
+    # Ghostty's GTK frontend pulses the OSC 9;4 indeterminate progress bar once
+    # per progress report, and GtkProgressBar paces its animation by the gap
+    # between pulse() calls -- so the bar's speed is whatever rate the program
+    # in the terminal happens to emit at. Claude Code reports about once a
+    # second, which moves the block 10% per second: ten seconds to cross, and a
+    # stall whenever reports pause. The macOS frontend animates its own 1.2s
+    # bounce and ignores the report rate, which is why this only looks wrong on
+    # Linux. 0001 drives the pulse from a 120ms timer instead. Not filed
+    # upstream yet.
+    (_final: prev: {
+      ghostty = prev.ghostty.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ [
+          ../../pkgs/ghostty/0001-pulse-progress-bar-on-a-steady-timer.patch
+        ];
+      });
+    })
   ];
 
   boot.loader.systemd-boot.enable = true;

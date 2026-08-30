@@ -1,0 +1,131 @@
+diff --git a/src/apprt/gtk/class/surface.zig b/src/apprt/gtk/class/surface.zig
+--- a/src/apprt/gtk/class/surface.zig
++++ b/src/apprt/gtk/class/surface.zig
+@@ -645,6 +645,7 @@ pub const Surface = extern struct {
+ 
+         // Progress bar
+         progress_bar_timer: ?c_uint = null,
++        progress_bar_pulse_timer: ?c_uint = null,
+ 
+         // True while the bell is ringing. This will be set to false (after
+         // true) under various scenarios, but can also manually be set to
+@@ -1016,6 +1017,7 @@ pub const Surface = extern struct {
+         if (priv.config) |config| {
+             if (!config.get().@"progress-style") {
+                 log.debug("progress_report action blocked by config", .{});
++                self.stopProgressBarPulse();
+                 priv.progress_bar_overlay.as(gtk.Widget).setVisible(@intFromBool(false));
+                 return;
+             }
+@@ -1025,6 +1027,7 @@ pub const Surface = extern struct {
+         switch (value.state) {
+             // Remove the progress bar
+             .remove => {
++                self.stopProgressBarPulse();
+                 progress_bar.as(gtk.Widget).setVisible(@intFromBool(false));
+                 return;
+             },
+@@ -1034,9 +1037,10 @@ pub const Surface = extern struct {
+             .set => {
+                 progress_bar.as(gtk.Widget).removeCssClass("error");
+                 if (value.progress) |progress| {
++                    self.stopProgressBarPulse();
+                     progress_bar.setFraction(computeFraction(progress));
+                 } else {
+-                    progress_bar.pulse();
++                    self.startProgressBarPulse();
+                 }
+             },
+ 
+@@ -1045,16 +1049,17 @@ pub const Surface = extern struct {
+             .@"error" => {
+                 progress_bar.as(gtk.Widget).addCssClass("error");
+                 if (value.progress) |progress| {
++                    self.stopProgressBarPulse();
+                     progress_bar.setFraction(computeFraction(progress));
+                 } else {
+-                    progress_bar.pulse();
++                    self.startProgressBarPulse();
+                 }
+             },
+ 
+             // The state of progress is unknown, so pulse the progress bar to
+             // indicate that things are still happening.
+             .indeterminate => {
+-                progress_bar.pulse();
++                self.startProgressBarPulse();
+             },
+ 
+             // If a progress value was provided, set the progress bar to that value.
+@@ -1062,6 +1067,7 @@ pub const Surface = extern struct {
+             // happening. Otherwise this is mainly used to keep the progress bar on
+             // screen instead of timing out.
+             .pause => {
++                self.stopProgressBarPulse();
+                 if (value.progress) |progress| {
+                     progress_bar.setFraction(computeFraction(progress));
+                 }
+@@ -1092,6 +1098,54 @@ pub const Surface = extern struct {
+         return @intFromBool(glib.SOURCE_REMOVE);
+     }
+ 
++    /// How often we pulse an indeterminate progress bar.
++    ///
++    /// GtkProgressBar advances the block by one `pulse-step` (0.1 by default)
++    /// per `gtk_progress_bar_pulse` call and interpolates that across frames,
++    /// so a steady pulse every 120ms sweeps the trough in roughly 1.2s. That
++    /// matches the bounce duration the macOS apprt animates at.
++    const progress_bar_pulse_interval_ms = 120;
++
++    /// Start pulsing the progress bar, if it isn't pulsing already.
++    ///
++    /// We drive the pulse from our own timer rather than pulsing once per
++    /// progress report, because GtkProgressBar paces the animation by the
++    /// interval between `pulse` calls. Pulsing only on report would hand the
++    /// animation speed to whatever program is running in the terminal: one
++    /// that reports every second moves the block 10% per second, taking ten
++    /// seconds to cross, and one that reports rarely stalls entirely.
++    fn startProgressBarPulse(self: *Self) void {
++        const priv = self.private();
++
++        // Already pulsing. Leave the existing timer alone so that the
++        // animation keeps a steady cadence instead of being restarted (and
++        // visibly jolted) by every progress report that arrives.
++        if (priv.progress_bar_pulse_timer != null) return;
++
++        priv.progress_bar_overlay.pulse();
++        priv.progress_bar_pulse_timer = glib.timeoutAdd(
++            progress_bar_pulse_interval_ms,
++            progressBarPulseTimer,
++            self,
++        );
++    }
++
++    /// Stop pulsing the progress bar. Safe to call when not pulsing.
++    fn stopProgressBarPulse(self: *Self) void {
++        const priv = self.private();
++        const timer = priv.progress_bar_pulse_timer orelse return;
++        if (glib.Source.remove(timer) == 0) {
++            log.warn("unable to remove progress bar pulse timer", .{});
++        }
++        priv.progress_bar_pulse_timer = null;
++    }
++
++    fn progressBarPulseTimer(ud: ?*anyopaque) callconv(.c) c_int {
++        const self: *Self = @ptrCast(@alignCast(ud.?));
++        self.private().progress_bar_overlay.pulse();
++        return @intFromBool(glib.SOURCE_CONTINUE);
++    }
++
+     /// Request that this terminal come to the front and become focused.
+     /// It is up to the embedding widget to react to this.
+     pub fn present(self: *Self) void {
+@@ -1853,6 +1907,8 @@ pub const Surface = extern struct {
+             priv.progress_bar_timer = null;
+         }
+ 
++        self.stopProgressBarPulse();
++
+         if (priv.idle_rechild) |v| {
+             if (glib.Source.remove(v) == 0) {
+                 log.warn("unable to remove idle source", .{});
