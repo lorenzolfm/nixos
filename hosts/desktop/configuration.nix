@@ -7,6 +7,7 @@
     ./backup.nix
     ./scb-repo.nix
     ./claude-tray.nix
+    ./rgb.nix
   ];
 
   nixpkgs.overlays = [
