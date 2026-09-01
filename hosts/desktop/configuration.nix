@@ -178,6 +178,8 @@
     description = "Lorenzo";
     openssh.authorizedKeys.keys = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID/67UYdIgV7PwpayA/4Ogc7u84q8FQ5AKrLLRX7q3zT lorenzo@lorenzo-mac"
+      # Termius on the iPhone, for SSH over Tailscale from outside the LAN.
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC2msniVULYTITZN4q2LXHkN4AZV97ttv6hW507wuWB6 lorenzo@iphone-termius"
     ];
     extraGroups = [
       "networkmanager"
@@ -289,6 +291,15 @@
     # xdg-desktop-portal (Requisite=graphical-session.target) can never
     # start: no portals, and GTK apps ignore the dark color-scheme.
     withUWSM = true;
+  };
+
+  # Port 22 is only open on tailscale0 (see networking.firewall above), so
+  # reaching sshd already requires being on the tailnet. Keys-only on top of
+  # that means a tailnet device alone is not enough to log in. The physical
+  # console stays available if a key is ever lost.
+  services.openssh.settings = {
+    PasswordAuthentication = false;
+    KbdInteractiveAuthentication = false;
   };
 
   services.fail2ban = {
