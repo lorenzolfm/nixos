@@ -8,6 +8,7 @@
     ./scb-repo.nix
     ./claude-tray.nix
     ./claude-ps.nix
+    ./oss-board.nix
     ./rgb.nix
   ];
 
