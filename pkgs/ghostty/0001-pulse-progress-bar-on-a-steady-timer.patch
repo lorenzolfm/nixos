@@ -71,20 +71,20 @@ diff --git a/src/apprt/gtk/class/surface.zig b/src/apprt/gtk/class/surface.zig
  
 +    /// How often we pulse an indeterminate progress bar.
 +    ///
-+    /// GtkProgressBar advances the block by one `pulse-step` (0.1 by default)
-+    /// per `gtk_progress_bar_pulse` call and interpolates that across frames,
-+    /// so a steady pulse every 120ms sweeps the trough in roughly 1.2s. That
-+    /// matches the bounce duration the macOS apprt animates at.
++    /// GtkProgressBar paces the block by the gap between the last two
++    /// `gtk_progress_bar_pulse` calls, crossing the trough in 10-20x that
++    /// gap. At 120ms that measures ~1.7s a crossing, near the 1.2s bounce
++    /// the macOS apprt animates.
 +    const progress_bar_pulse_interval_ms = 120;
 +
 +    /// Start pulsing the progress bar, if it isn't pulsing already.
 +    ///
 +    /// We drive the pulse from our own timer rather than pulsing once per
 +    /// progress report, because GtkProgressBar paces the animation by the
-+    /// interval between `pulse` calls. Pulsing only on report would hand the
-+    /// animation speed to whatever program is running in the terminal: one
-+    /// that reports every second moves the block 10% per second, taking ten
-+    /// seconds to cross, and one that reports rarely stalls entirely.
++    /// interval between `pulse` calls. Pulsing only on report hands the
++    /// speed to whatever program is running: one reporting every second
++    /// takes 10-20s to cross, and one reporting a single time never moves
++    /// at all -- its first pulse divides by the monotonic clock, not a gap.
 +    fn startProgressBarPulse(self: *Self) void {
 +        const priv = self.private();
 +
