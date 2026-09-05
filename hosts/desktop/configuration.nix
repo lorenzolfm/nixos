@@ -214,6 +214,13 @@
   # apps built without the wayland plugin.
   environment.sessionVariables.QT_QPA_PLATFORM = "wayland;xcb";
 
+  # GTK 4.22 defaults to the Vulkan renderer, which here enumerates only the AMD
+  # iGPU (card1) and never the NVIDIA card driving both monitors. GTK renders on
+  # a GPU wired to no display and hands Hyprland a buffer it cannot sample, so
+  # every GTK4 app (Files, gnome-text-editor) maps a solid black window. Use the
+  # GL renderer instead.
+  environment.sessionVariables.GSK_RENDERER = "ngl";
+
   environment.systemPackages = with pkgs; [
     (appimage-run.override {
       extraPkgs = pkgs: [ pkgs.xorg.libxshmfence ];

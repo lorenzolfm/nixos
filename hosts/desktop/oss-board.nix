@@ -63,6 +63,12 @@ in
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
 
+    # The timer owns when this runs. Without this, a rebuild that changes the
+    # unit stops an in-flight scan and restarts it -- and since it is oneshot,
+    # `nixos-rebuild` then blocks on the whole scan (up to TimeoutStartSec).
+    # A changed definition still lands in /etc and takes effect on next firing.
+    restartIfChanged = false;
+
     path = runtimeDeps;
 
     environment = {
