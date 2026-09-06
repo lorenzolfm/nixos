@@ -14,27 +14,6 @@
   ];
 
   nixpkgs.overlays = [
-    # librepods decides whether the AirPods are the active output by substring
-    # matching the default sink's name. WirePlumber 0.5.13 changed how it formats
-    # those names, so the match silently fails and ear detection stops pausing
-    # media -- the events still fire, the pause is just never reached.
-    # 0001 is upstream PR #417 (open, unmerged), comparing the bluez
-    # `device.string` MAC exactly instead. 0002 guards a NULL deref that PR
-    # leaves in its new callback. Drop both once #417 reaches nixpkgs.
-    #
-    # 0003 is local. On both pods out librepods set the card profile to "off",
-    # destroying the sink, so the default sink fell back to another device and
-    # on re-insertion the MAC read back as garbage -- resume was unreachable
-    # and taking the AirPods off killed playback rather than pausing it. It
-    # also gated the pause on a flaky blocking D-Bus read that left the resume
-    # list empty. Not filed upstream yet.
-    #
-    # 0004 is local. Chromium exports the MPRIS Player interface with no
-    # introspection XML, and QDBusInterface resolves properties through that
-    # metadata, so every PlaybackStatus read came back empty and librepods
-    # concluded nothing was playing -- ear detection paused nothing at all.
-    # Reads org.freedesktop.DBus.Properties directly instead, as playerctl
-    # does. Not filed upstream yet.
     (_final: prev: {
       librepods = prev.librepods.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [
@@ -47,19 +26,6 @@
         patchFlags = [ "-p2" ];
       });
     })
-    # Ghostty's GTK frontend pulses the OSC 9;4 indeterminate progress bar once
-    # per progress report, and GtkProgressBar paces the block by the gap between
-    # the last two pulse() calls -- so the bar's speed is whatever rate the
-    # program in the terminal happens to emit at. Claude Code reports once per
-    # turn, and on that very first pulse there is no previous pulse to measure
-    # against: GtkProgressBar divides by the monotonic clock instead, so the
-    # block does not move at all. Measured on stock 1.3.1: 0px over 14s, then
-    # the bar times out. The macOS frontend animates its own 1.2s bounce and
-    # ignores the report rate, which is why this only looks wrong on Linux.
-    # 0001 drives the pulse from a 120ms timer instead.
-    #
-    # Write-up and reproduction: ~/Projects/misc/ghostty-osc94-progress-bar.
-    # Drafted for upstream, not filed yet -- blocked on checking the macOS half.
     (_final: prev: {
       ghostty = prev.ghostty.overrideAttrs (old: {
         patches = (old.patches or [ ]) ++ [
@@ -129,10 +95,6 @@
 
   services.xserver.enable = true;
   services.xserver.displayManager.gdm.enable = true;
-  # Hyprland installs two sessions; the plain one bypasses UWSM, so
-  # graphical-session.target never activates and the portals stay dead
-  # (GTK apps then ignore color-scheme and render light). Pre-select the
-  # uwsm-managed session so a login can't silently land on the broken one.
   services.displayManager.defaultSession = "hyprland-uwsm";
   services.xserver.desktopManager.gnome.enable = true;
   services.xserver.xkb = {
@@ -179,7 +141,6 @@
     description = "Lorenzo";
     openssh.authorizedKeys.keys = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID/67UYdIgV7PwpayA/4Ogc7u84q8FQ5AKrLLRX7q3zT lorenzo@lorenzo-mac"
-      # Termius on the iPhone, for SSH over Tailscale from outside the LAN.
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC2msniVULYTITZN4q2LXHkN4AZV97ttv6hW507wuWB6 lorenzo@iphone-termius"
     ];
     extraGroups = [
