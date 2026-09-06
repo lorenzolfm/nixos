@@ -1,5 +1,4 @@
 {
-  config,
   pkgs,
   claude-code,
   rust-overlay,
