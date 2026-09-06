@@ -14,7 +14,6 @@
   ];
 
   nixpkgs.overlays = [
-    (final: _prev: { sparrow = final.callPackage ../../pkgs/sparrow/package.nix { }; })
     # librepods decides whether the AirPods are the active output by substring
     # matching the default sink's name. WirePlumber 0.5.13 changed how it formats
     # those names, so the match silently fails and ear detection stops pausing
