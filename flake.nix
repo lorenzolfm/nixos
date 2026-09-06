@@ -3,33 +3,54 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    darwin.url = "github:LnL7/nix-darwin/master";
-    darwin.inputs.nixpkgs.follows = "nixpkgs";
+
+    # Third-party tooling
+    claude-code = {
+      url = "github:sadjow/claude-code-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    sops-nix = {
+      url = "github:Mic92/sops-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    # macOS only
+    darwin = {
+      url = "github:LnL7/nix-darwin/master";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     mac-app-util.url = "github:hraban/mac-app-util";
     nix-homebrew.url = "github:zhaofengli-wip/nix-homebrew/main";
-    claude-code.url = "github:sadjow/claude-code-nix";
-    claude-code.inputs.nixpkgs.follows = "nixpkgs";
-    rust-overlay.url = "github:oxalica/rust-overlay";
-    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
-    sops-nix.url = "github:Mic92/sops-nix";
-    sops-nix.inputs.nixpkgs.follows = "nixpkgs";
-    wt.url = "github:lorenzolfm/wt";
-    wt.inputs.nixpkgs.follows = "nixpkgs";
-    wt.inputs.rust-overlay.follows = "rust-overlay";
-    claude-tray.url = "github:lorenzolfm/claude-tray";
-    claude-tray.inputs.nixpkgs.follows = "nixpkgs";
-    claude-tray.inputs.rust-overlay.follows = "rust-overlay";
-    claude-ps.url = "github:lorenzolfm/claude-ps";
-    claude-ps.inputs.nixpkgs.follows = "nixpkgs";
-    claude-ps.inputs.rust-overlay.follows = "rust-overlay";
-    claude-nav.url = "github:lorenzolfm/claude-nav";
-    claude-nav.inputs.nixpkgs.follows = "nixpkgs";
-    claude-nav.inputs.rust-overlay.follows = "rust-overlay";
+
+    # Mine
+    wt = {
+      url = "github:lorenzolfm/wt";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
+    claude-tray = {
+      url = "github:lorenzolfm/claude-tray";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
+    claude-ps = {
+      url = "github:lorenzolfm/claude-ps";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
+    claude-nav = {
+      url = "github:lorenzolfm/claude-nav";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
   outputs =
     {
-      self,
       nixpkgs,
       darwin,
       mac-app-util,
@@ -42,7 +63,7 @@
       claude-ps,
       claude-nav,
       ...
-    }@inputs:
+    }:
     {
       nixosConfigurations.nixos = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
