@@ -6,6 +6,8 @@
   ...
 }:
 {
+  imports = [ ./claude-ps.nix ];
+
   nixpkgs.config.allowUnfree = true;
   nixpkgs.overlays = [ rust-overlay.overlays.default ];
 

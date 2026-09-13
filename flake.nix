@@ -85,7 +85,14 @@
 
       darwinConfigurations.macbook = darwin.lib.darwinSystem {
         system = "aarch64-darwin";
-        specialArgs = { inherit claude-code rust-overlay wt; };
+        specialArgs = {
+          inherit
+            claude-code
+            rust-overlay
+            wt
+            claude-ps
+            ;
+        };
         modules = [
           {
             nixpkgs.overlays = [
