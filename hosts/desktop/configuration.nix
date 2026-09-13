@@ -7,7 +7,6 @@
     ./backup.nix
     ./scb-repo.nix
     ./claude-tray.nix
-    ./claude-ps.nix
     ./claude-nav.nix
     ./oss-board.nix
     ./rgb.nix
