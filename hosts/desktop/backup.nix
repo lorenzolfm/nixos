@@ -5,9 +5,15 @@ let
   homelab2Port = 2222;
   hotRepoPathHomelab2 = "/data/repo/hot";
 
-  contaboHost = builtins.replaceStrings [ "\n" ] [ "" ] (
-    builtins.readFile "/home/lorenzo/.config/nixos/local-secrets/contabo-host"
-  );
+  # local-secrets/ is gitignored, so it is absent in CI (pure eval). Fall back
+  # to a reserved TLD that can never resolve: a missing file fails loudly at
+  # backup time instead of silently pointing borg somewhere else.
+  contaboHostFile = "/home/lorenzo/.config/nixos/local-secrets/contabo-host";
+  contaboHost =
+    if builtins.pathExists contaboHostFile then
+      builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile contaboHostFile)
+    else
+      "contabo.invalid";
   contaboPort = 22;
   hotRepoPathContabo = "/srv/borg/lorenzo-desktop/hot";
 

@@ -1,0 +1,29 @@
+# Evaluate every host configuration on each change. Evaluation only, no
+# builds: this catches typos, renamed or removed options after a nixpkgs bump,
+# and broken module wiring in a couple of minutes. Patched packages that stop
+# building are not caught here; that needs a build job.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: nixos
+            attr: nixosConfigurations.nixos.config.system.build.toplevel
+          - host: macbook
+            attr: darwinConfigurations.macbook.system
+    name: eval ${{ matrix.host }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - name: Evaluate ${{ matrix.host }}
+        run: nix eval --raw ".#${{ matrix.attr }}.drvPath"

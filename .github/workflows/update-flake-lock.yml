@@ -1,0 +1,30 @@
+# Weekly flake.lock bump as a pull request, so a nixpkgs update that breaks a
+# host shows up in the PR's checks instead of on the next `rebuild`.
+#
+# A PR opened with the default GITHUB_TOKEN does not trigger other workflows,
+# so `check` would not run on it. Store a fine-grained PAT (contents and
+# pull-requests: read/write) as the FLAKE_UPDATE_TOKEN secret to get the
+# checks; without it the PR is still opened, just unchecked.
+name: update-flake-lock
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: DeterminateSystems/update-flake-lock@v29
+        with:
+          token: ${{ secrets.FLAKE_UPDATE_TOKEN || github.token }}
+          pr-title: "chore: update flake.lock"
+          commit-msg: "chore: update flake.lock"
+          branch: update-flake-lock
