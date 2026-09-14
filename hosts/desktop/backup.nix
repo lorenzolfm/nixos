@@ -1,19 +1,24 @@
-{ config, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 let
+  settingsFormat = pkgs.formats.yaml { };
+
   homelab2Host = "10.0.1.2";
   homelab2Port = 2222;
   hotRepoPathHomelab2 = "/data/repo/hot";
 
-  # local-secrets/ is gitignored, so it is absent in CI (pure eval). Fall back
-  # to a reserved TLD that can never resolve: a missing file fails loudly at
-  # backup time instead of silently pointing borg somewhere else.
-  contaboHostFile = "/home/lorenzo/.config/nixos/local-secrets/contabo-host";
-  contaboHost =
-    if builtins.pathExists contaboHostFile then
-      builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile contaboHostFile)
-    else
-      "contabo.invalid";
+  # The contabo hostname and the uptime-kuma push URLs live in secrets.yaml,
+  # not in local-secrets/: flake evaluation is pure (nixos-rebuild and CI
+  # alike), and under pure eval `builtins.pathExists` on an out-of-tree path
+  # returns false even when the file exists, so a pathExists fallback would
+  # silently deploy a broken config. Instead the borgmatic YAML references
+  # sops placeholders and is rendered with the real values at activation.
+  contaboHost = config.sops.placeholder."contabo-host";
   contaboPort = 22;
   hotRepoPathContabo = "/srv/borg/lorenzo-desktop/hot";
 
@@ -34,17 +39,9 @@ let
       config.sops.secrets."borg-ssh-key-${destination}".path
     }";
 
-  uptimeKumaHookFor =
-    destination:
-    let
-      pushUrlFile = "/home/lorenzo/.config/nixos/local-secrets/uptime-kuma-push-${destination}";
-    in
-    if builtins.pathExists pushUrlFile then
-      {
-        uptime_kuma.push_url = builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile pushUrlFile);
-      }
-    else
-      { };
+  uptimeKumaHookFor = destination: {
+    uptime_kuma.push_url = config.sops.placeholder."uptime-kuma-push-${destination}";
+  };
 
   mkConfig =
     {
@@ -101,6 +98,26 @@ in
   sops.secrets."borg-ssh-key-contabo" = {
     mode = "0400";
   };
+  sops.secrets."contabo-host" = { };
+  sops.secrets."uptime-kuma-push-homelab2" = { };
+  sops.secrets."uptime-kuma-push-contabo" = { };
+
+  # Render every borgmatic config through sops so the placeholders above are
+  # substituted at activation, then point /etc/borgmatic.d/<name>.yaml at the
+  # rendered file instead of the placeholder-bearing store copy. The module's
+  # build-time `borgmatic config validate` still runs on the store copy.
+  sops.templates = lib.mapAttrs' (
+    name: cfg:
+    lib.nameValuePair "borgmatic-${name}.yaml" {
+      file = settingsFormat.generate "${name}.yaml" cfg;
+    }
+  ) config.services.borgmatic.configurations;
+  environment.etc = lib.mapAttrs' (
+    name: _:
+    lib.nameValuePair "borgmatic.d/${name}.yaml" {
+      source = lib.mkForce config.sops.templates."borgmatic-${name}.yaml".path;
+    }
+  ) config.services.borgmatic.configurations;
 
   services.borgmatic = {
     enable = true;
