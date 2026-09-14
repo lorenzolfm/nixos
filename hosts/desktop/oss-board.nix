@@ -24,11 +24,6 @@ let
   # Telegram chat id is the openclaw allowlist entry -- not a secret.
   telegramChatId = "507707481";
 
-  pushUrlFile = "${home}/.config/nixos/local-secrets/uptime-kuma-push-oss-board";
-  hasPushUrl = builtins.pathExists pushUrlFile;
-  pushUrl =
-    if hasPushUrl then builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile pushUrlFile) else "";
-
   # systemd services get a minimal PATH -- /run/current-system/sw/bin is NOT on
   # it. Every binary the run shells out to must be listed here explicitly, or
   # the model passes fail open and the board silently degrades to ranking order.
@@ -57,6 +52,13 @@ in
     owner = user;
     mode = "0400";
   };
+  # Read at run time from the sops file, not at eval time from local-secrets/:
+  # flake eval is pure and `builtins.pathExists` on an out-of-tree path is
+  # false there, which silently dropped the heartbeat on every plain rebuild.
+  sops.secrets."uptime-kuma-push-oss-board" = {
+    owner = user;
+    mode = "0400";
+  };
 
   systemd.services.oss-board = {
     description = "Update the open-source contribution board";
@@ -82,8 +84,7 @@ in
       # request body shape is unconfirmed. Flip to "1" once verified.
       OPENCLAW_ENABLED = "0";
       OPENCLAW_URL = "https://oc.lorenzo.sh";
-    }
-    // lib.optionalAttrs hasPushUrl { UPTIME_KUMA_PUSH_URL = pushUrl; };
+    };
 
     serviceConfig = {
       Type = "oneshot";
@@ -91,11 +92,12 @@ in
       Group = "users";
       WorkingDirectory = projectDir;
 
-      # GH_TOKEN must come from the file, not the unit, so it never lands in the
-      # journal or in /proc/*/environ.
+      # GH_TOKEN and the push URL must come from files, not the unit, so they
+      # never land in the journal or in /proc/*/environ.
       ExecStart = pkgs.writeShellScript "oss-board-run" ''
         set -euo pipefail
         export GH_TOKEN="$(cat ${config.sops.secrets."oss-board-github-token".path})"
+        export UPTIME_KUMA_PUSH_URL="$(cat ${config.sops.secrets."uptime-kuma-push-oss-board".path})"
         exec ${pkgs.python3}/bin/python3 ${projectDir}/run.py \
           --board ${lib.escapeShellArg board} \
           --notify
