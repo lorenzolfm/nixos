@@ -59,6 +59,13 @@
       IdentityFile ~/.ssh/id_ed25519
   '';
 
+  # Keys-only, matching the desktop. The local console still works if a key
+  # is ever lost.
+  services.openssh.extraConfig = ''
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+  '';
+
   homebrew = {
     enable = true;
     taps = [
