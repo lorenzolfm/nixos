@@ -146,6 +146,7 @@
       "networkmanager"
       "wheel"
       "docker"
+      "dialout"
     ];
     packages = with pkgs; [
       cliphist

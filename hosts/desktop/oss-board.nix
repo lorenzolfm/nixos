@@ -1,4 +1,4 @@
-# Twice-daily open-source contribution board updater.
+# Floresta triage: refreshes the board hourly, DMs twice a day.
 #
 # Mirrors the borgmatic pattern in backup.nix: a systemd timer with
 # Persistent = true, secrets via sops-nix, and an uptime-kuma push heartbeat so
@@ -33,17 +33,20 @@ let
   ++ (with pkgs; [
     python3
     gh
+    # git reads your local clone for unshipped branches and the footprint.
     git
-    nix
     coreutils
     openssh
     cacert
   ]);
 in
 {
-  # Read-only GitHub token, minted as a fine-grained PAT with no write scopes.
-  # The read-only guarantee is structural: even a misbehaving run cannot comment,
-  # claim, or open a PR as lorenzolfm.
+  # Read-only GitHub token: a CLASSIC PAT whose only scope is `read:project`.
+  # With no `repo` or `public_repo` scope it can read public repositories and
+  # nothing private anywhere -- so it cannot comment, claim, or open a PR as
+  # lorenzolfm, and cannot see an employer repo at all. `read:project` is what
+  # the org board's Needs Review column needs; fine-grained tokens would need
+  # an org admin's approval for that.
   sops.secrets."oss-board-github-token" = {
     owner = user;
     mode = "0400";
@@ -61,7 +64,7 @@ in
   };
 
   systemd.services.oss-board = {
-    description = "Update the open-source contribution board";
+    description = "Refresh the Floresta triage board";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
 
@@ -75,8 +78,6 @@ in
 
     environment = {
       HOME = home;
-      # `nix eval` for the nixpkgs bump check, and TLS for the API calls.
-      NIX_PATH = "nixpkgs=flake:nixpkgs";
       SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       TELEGRAM_CHAT_ID = telegramChatId;
       TELEGRAM_BOT_TOKEN_FILE = config.sops.secrets."oss-board-telegram-token".path;
@@ -103,15 +104,15 @@ in
           --notify
       '';
 
-      # A scan plus the model passes; generous ceiling, then give up rather than
-      # overlap with the next timer firing.
-      TimeoutStartSec = "45min";
+      # A snapshot plus the model passes takes a few minutes; give up well
+      # before the next hourly firing rather than overlap it.
+      TimeoutStartSec = "20min";
 
       Nice = 10;
       IOSchedulingClass = "idle";
 
-      # Hardening. It needs the vault, the project dir, and ~/Projects/misc for
-      # the stranded-branch scan -- and nothing else writable.
+      # Hardening. It writes the vault and its own state dir and nothing else;
+      # the Floresta clone in ~/Projects/misc is only read.
       PrivateTmp = true;
       ProtectSystem = "strict";
       ProtectHome = "read-only";
@@ -132,12 +133,15 @@ in
   };
 
   systemd.timers.oss-board = {
-    description = "Update the open-source contribution board twice daily";
+    description = "Refresh the Floresta triage board hourly";
     wantedBy = [ "timers.target" ];
     timerConfig = {
-      # Off-peak minutes on purpose: :00 and :30 are where every scheduler lands.
+      # Hourly for the board. The DM is not a timer concern: run.py sends it on
+      # the first run at or after each slot in config.DM_SLOTS (08:07, 19:23),
+      # which is why 19:23 is listed too. Off-peak minutes on purpose: :00 and
+      # :30 are where every scheduler lands.
       OnCalendar = [
-        "08:07"
+        "*-*-* *:07:00"
         "19:23"
       ];
       # A run missed while the desktop was off fires on next boot rather than
