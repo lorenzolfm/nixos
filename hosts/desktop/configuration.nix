@@ -262,6 +262,13 @@
     };
   };
 
+  programs.ssh.extraConfig = ''
+    Host mac
+      HostName macbook.tail174781.ts.net
+      User lorenzo
+      IdentityFile ~/.ssh/id_ed25519
+  '';
+
   programs.hyprland = {
     enable = true;
     xwayland.enable = true;

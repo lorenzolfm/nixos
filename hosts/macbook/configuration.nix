@@ -88,6 +88,9 @@
     knownUsers = [ "lorenzo" ];
     users.lorenzo.uid = 501;
     users.lorenzo.shell = pkgs.fish;
+    users.lorenzo.openssh.authorizedKeys.keys = [
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOKP7Z6l0U3ZQbmfyj6yAD62F16A/gkULyiOlG0fcEEL lorenzo@lorenzo-pc"
+    ];
   };
 
   nixpkgs.hostPlatform = "aarch64-darwin";
