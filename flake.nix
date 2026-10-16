@@ -17,6 +17,10 @@
       url = "github:Mic92/sops-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    llm-agents = {
+      url = "github:numtide/llm-agents.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     # macOS only
     darwin = {
@@ -58,6 +62,7 @@
       claude-code,
       rust-overlay,
       sops-nix,
+      llm-agents,
       wt,
       claude-tray,
       claude-ps,
@@ -71,6 +76,7 @@
           inherit
             claude-code
             rust-overlay
+            llm-agents
             wt
             claude-tray
             claude-ps
