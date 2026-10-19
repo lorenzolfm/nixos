@@ -15,6 +15,7 @@
     ./claude-nav.nix
     ./oss-board.nix
     ./rgb.nix
+    ./gaming.nix
   ];
 
   nixpkgs.overlays = [
