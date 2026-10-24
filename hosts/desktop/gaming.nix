@@ -1,4 +1,9 @@
-{ pkgs, ... }:
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
 
 {
   # Also turns on 32-bit graphics, which pulls in the NVIDIA driver's lib32
@@ -19,7 +24,19 @@
   # the wheel under the same HID driver name, so the stock one is
   # blacklisted or it can win the race at boot. The wheel must still sit
   # in PS3 mode.
-  hardware.new-lg4ff.enable = true;
+  #
+  # This is hardware.new-lg4ff.enable spelled out, so the package can be
+  # fixed: nixpkgs splices the kernel's module make flags into a bash array
+  # unquoted, and since the 2026-10-20 nixpkgs one of them is make syntax
+  # (`cmd_sign=...$(space)$@`) that bash runs as a command, failing the
+  # build. Quoting each flag hands it to make as-is. Go back to the option
+  # once nixpkgs quotes them itself.
+  boot.extraModulePackages = [
+    (config.boot.kernelPackages.new-lg4ff.override {
+      kernelModuleMakeFlags = map lib.escapeShellArg config.boot.kernelPackages.kernelModuleMakeFlags;
+    })
+  ];
+  boot.kernelModules = [ "hid-logitech-new" ];
   boot.blacklistedKernelModules = [ "hid_logitech" ];
 
   # DuckStation (PS1) is missing on purpose: nixpkgs dropped it at upstream's

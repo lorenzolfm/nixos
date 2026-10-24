@@ -214,6 +214,7 @@
     libsystemtap
     linuxPackages.perf
     llm-agents.packages.${pkgs.system}.orca
+    (callPackage ../../pkgs/numes { })
     obs-studio
     obsidian
     pamixer
