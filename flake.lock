@@ -803,11 +803,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1792627561,
-        "narHash": "sha256-LuWyd1eTAhHg//SYnAnH9IF6SWnqsG2xNnOZBptRQ2Y=",
+        "lastModified": 1792934388,
+        "narHash": "sha256-l3xB3CjStC4BsbfjujcVDDCvRjNGDNMQfAa3ke98WaA=",
         "owner": "lorenzolfm",
         "repo": "wt",
-        "rev": "316d01f4f2cffa9ac72fb44b34e50ce2a3ae7542",
+        "rev": "e459fc19416d9c67a2bc079e62481332065ef8a7",
         "type": "github"
       },
       "original": {
