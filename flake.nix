@@ -51,6 +51,11 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
     };
+    luneta = {
+      url = "github:lorenzolfm/luneta";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
   outputs =
@@ -67,6 +72,7 @@
       claude-tray,
       claude-ps,
       claude-nav,
+      luneta,
       ...
     }:
     {
@@ -81,6 +87,7 @@
             claude-tray
             claude-ps
             claude-nav
+            luneta
             ;
         };
         modules = [

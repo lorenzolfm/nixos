@@ -13,6 +13,7 @@
     ./scb-repo.nix
     ./claude-tray.nix
     ./claude-nav.nix
+    ./luneta.nix
     ./oss-board.nix
     ./rgb.nix
     ./gaming.nix
