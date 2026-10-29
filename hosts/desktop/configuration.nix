@@ -100,9 +100,9 @@
   };
 
   services.xserver.enable = true;
-  services.xserver.displayManager.gdm.enable = true;
+  services.displayManager.gdm.enable = true;
   services.displayManager.defaultSession = "hyprland-uwsm";
-  services.xserver.desktopManager.gnome.enable = true;
+  services.desktopManager.gnome.enable = true;
   # GNOME turns on the Orca screen reader by default, and its bin/orca would
   # collide with the Orca IDE's CLI of the same name.
   services.orca.enable = false;
