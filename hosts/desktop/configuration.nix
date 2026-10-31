@@ -160,12 +160,9 @@
     ];
     packages = with pkgs; [
       cliphist
-      cmatrix
       fd
-      ffmpeg
       file
       fzf
-      slack
       grim
       pavucontrol
       pinentry-tty
@@ -203,12 +200,10 @@
     docker
     gcc
     ghostty
-    gnumake
     google-chrome
     gws
     heaptrack
     hyperfine
-    jellyfin-desktop
     libevent
     libnotify
     librepods

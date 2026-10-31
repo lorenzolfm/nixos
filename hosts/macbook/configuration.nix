@@ -80,15 +80,12 @@
       "nikitabobko/tap"
     ];
     casks = [
-      "block-buzz"
-      "docker-desktop"
       "ghostty"
       "google-chrome"
       "mullvad-vpn"
       "nikitabobko/tap/aerospace"
       "obsidian"
       "signal"
-      "slack"
       "spotify"
       "telegram"
       "whatsapp"
