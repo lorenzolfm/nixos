@@ -27,7 +27,12 @@
       url = "github:LnL7/nix-darwin/master";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    mac-app-util.url = "github:hraban/mac-app-util";
+    mac-app-util = {
+      url = "github:hraban/mac-app-util";
+      # Its own nixpkgs pins SBCL 2.6.4, which cannot map its heap at
+      # 0x300100000 on macOS 27. Ours carries 2.6.8, where that is fixed.
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     nix-homebrew.url = "github:zhaofengli-wip/nix-homebrew/main";
 
     # Mine
