@@ -30,6 +30,14 @@
     stateVersion = 6;
   };
 
+  # darwin-rebuild picks the flake config by LocalHostName, so this has to
+  # match darwinConfigurations.macbook for a bare `--flake ~/.config/nixos`.
+  networking = {
+    hostName = "macbook";
+    localHostName = "macbook";
+    computerName = "macbook";
+  };
+
   environment = {
     systemPackages = with pkgs; [
       raycast
