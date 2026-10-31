@@ -109,6 +109,7 @@
             rust-overlay
             wt
             claude-ps
+            luneta
             ;
         };
         modules = [

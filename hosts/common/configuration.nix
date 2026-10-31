@@ -6,7 +6,10 @@
   ...
 }:
 {
-  imports = [ ./claude-ps.nix ];
+  imports = [
+    ./claude-ps.nix
+    ./luneta.nix
+  ];
 
   nixpkgs.config.allowUnfree = true;
   nixpkgs.overlays = [ rust-overlay.overlays.default ];
