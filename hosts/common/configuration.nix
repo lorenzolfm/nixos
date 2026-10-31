@@ -6,7 +6,10 @@
   ...
 }:
 {
-  imports = [ ./claude-ps.nix ];
+  imports = [
+    ./claude-ps.nix
+    ./luneta.nix
+  ];
 
   nixpkgs.config.allowUnfree = true;
   nixpkgs.overlays = [ rust-overlay.overlays.default ];
@@ -30,35 +33,24 @@
     })
     cargo-nextest
     claude-code.packages.${pkgs.system}.claude-code
-    codex
     diesel-cli
     direnv
     eza
     gh
     gnupg
-    (google-cloud-sdk.withExtraComponents [
-      google-cloud-sdk.components.gke-gcloud-auth-plugin
-    ])
-    grpcurl
     jq
-    k9s
     kubectl
     kubeseal
     lua-language-server
     neovim
-    ngrok
     nil
     nixfmt-rfc-style
     nodejs_24
     openssl
     pkg-config
-    postgresql
-    postman
-    protobuf
     ripgrep
     rust-script
     sql-formatter
-    sqlx-cli
     starship
     stow
     svelte-language-server

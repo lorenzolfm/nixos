@@ -13,7 +13,6 @@
     ./scb-repo.nix
     ./claude-tray.nix
     ./claude-nav.nix
-    ./luneta.nix
     ./oss-board.nix
     ./rgb.nix
     ./gaming.nix
@@ -160,12 +159,9 @@
     ];
     packages = with pkgs; [
       cliphist
-      cmatrix
       fd
-      ffmpeg
       file
       fzf
-      slack
       grim
       pavucontrol
       pinentry-tty
@@ -203,12 +199,10 @@
     docker
     gcc
     ghostty
-    gnumake
     google-chrome
     gws
     heaptrack
     hyperfine
-    jellyfin-desktop
     libevent
     libnotify
     librepods
