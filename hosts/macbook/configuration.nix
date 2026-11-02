@@ -40,6 +40,7 @@
 
   environment = {
     systemPackages = with pkgs; [
+      discord
       pinentry_mac
       raycast
     ];
