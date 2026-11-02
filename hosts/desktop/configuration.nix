@@ -44,6 +44,17 @@
   boot.loader.systemd-boot.configurationLimit = 5;
   boot.loader.efi.canTouchEfiVariables = true;
 
+  # /tmp lives on the root disk; nix-shell and Claude Code temp dirs piled up
+  # to 111G before anything removed them.
+  boot.tmp.cleanOnBoot = true;
+
+  nix.gc = {
+    automatic = true;
+    dates = "weekly";
+    options = "--delete-older-than 14d";
+  };
+  nix.settings.auto-optimise-store = true;
+
   services.earlyoom = {
     enable = true;
     freeMemThreshold = 5;
