@@ -31,18 +31,22 @@
         patchFlags = [ "-p2" ];
       });
     })
-    (_final: prev: {
-      ghostty = prev.ghostty.overrideAttrs (old: {
-        patches = (old.patches or [ ]) ++ [
-          ../../pkgs/ghostty/0001-pulse-progress-bar-on-a-steady-timer.patch
-        ];
-      });
-    })
   ];
 
   boot.loader.systemd-boot.enable = true;
   boot.loader.systemd-boot.configurationLimit = 5;
   boot.loader.efi.canTouchEfiVariables = true;
+
+  # /tmp lives on the root disk, and systemd only ages it out after 10 days;
+  # nix-shell and Claude Code temp dirs piled up to 111G inside that window.
+  boot.tmp.cleanOnBoot = true;
+
+  nix.gc = {
+    automatic = true;
+    dates = "weekly";
+    options = "--delete-older-than 14d";
+  };
+  nix.settings.auto-optimise-store = true;
 
   services.earlyoom = {
     enable = true;
