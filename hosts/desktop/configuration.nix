@@ -37,8 +37,8 @@
   boot.loader.systemd-boot.configurationLimit = 5;
   boot.loader.efi.canTouchEfiVariables = true;
 
-  # /tmp lives on the root disk; nix-shell and Claude Code temp dirs piled up
-  # to 111G before anything removed them.
+  # /tmp lives on the root disk, and systemd only ages it out after 10 days;
+  # nix-shell and Claude Code temp dirs piled up to 111G inside that window.
   boot.tmp.cleanOnBoot = true;
 
   nix.gc = {
