@@ -35,9 +35,13 @@
     claude-code.packages.${pkgs.system}.claude-code
     diesel-cli
     direnv
+    discord
     eza
     gh
+    # nixpkgs only builds ghostty on Linux; macOS gets the upstream signed app.
+    (if stdenv.hostPlatform.isDarwin then ghostty-bin else ghostty)
     gnupg
+    google-chrome
     jq
     kubectl
     kubeseal
@@ -46,6 +50,7 @@
     nil
     nixfmt-rfc-style
     nodejs_24
+    obsidian
     openssl
     pkg-config
     ripgrep

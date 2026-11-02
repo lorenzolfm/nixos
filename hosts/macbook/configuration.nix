@@ -14,7 +14,7 @@
     defaults = {
       dock = {
         persistent-apps = [
-          "/Applications/Ghostty.app"
+          "/Applications/Nix Apps/Ghostty.app"
           "/Applications/Slack.app"
         ];
         autohide = true;
@@ -40,9 +40,10 @@
 
   environment = {
     systemPackages = with pkgs; [
-      discord
+      aerospace
       pinentry_mac
       raycast
+      terminal-notifier
     ];
 
     etc."gitconfig".text = ''
@@ -76,26 +77,22 @@
     KbdInteractiveAuthentication no
   '';
 
+  # Only what nixpkgs can't provide yet. mullvad-vpn has no macOS build there,
+  # telegram is the native macOS app (nixpkgs has only Telegram Desktop), and
+  # signal, spotify and whatsapp are behind the cask versions: installing them
+  # from nixpkgs would downgrade them.
   homebrew = {
     enable = true;
-    taps = [
-      "nikitabobko/tap"
-    ];
     casks = [
-      "ghostty"
-      "google-chrome"
       "mullvad-vpn"
-      "nikitabobko/tap/aerospace"
-      "obsidian"
       "signal"
       "spotify"
       "telegram"
       "whatsapp"
     ];
-    brews = [
-      "terminal-notifier"
-    ];
-    onActivation.cleanup = "zap";
+    # Not "zap": zapping a cask that moves to nixpkgs deletes the app's data
+    # too, e.g. ~/Library/Application Support/Google/Chrome for google-chrome.
+    onActivation.cleanup = "uninstall";
   };
 
   users = {

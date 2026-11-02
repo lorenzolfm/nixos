@@ -117,6 +117,15 @@
             nixpkgs.overlays = [
               (_final: prev: {
                 direnv = prev.direnv.overrideAttrs { doCheck = false; };
+                # Nix builds unsandboxed on macOS, so these tests see every
+                # process on the Mac. Pi's liveness check takes any process it
+                # cannot read for a running Pi, and the tests fail.
+                atuin = prev.atuin.overrideAttrs (old: {
+                  checkFlags = (old.checkFlags or [ ]) ++ [
+                    "--skip=a_diverged_copy_resumes_only_as_chosen"
+                    "--skip=a_session_gone_on_with_elsewhere_catches_up_where_it_came_from"
+                  ];
+                });
               })
             ];
           }

@@ -199,11 +199,8 @@
     bitcoin
     boost
     cmake
-    discord
     docker
     gcc
-    ghostty
-    google-chrome
     gws
     heaptrack
     hyperfine
@@ -215,7 +212,6 @@
     llm-agents.packages.${pkgs.system}.orca
     (callPackage ../../pkgs/numes { })
     obs-studio
-    obsidian
     pamixer
     pkgconf
     playerctl
