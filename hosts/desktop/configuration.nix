@@ -31,13 +31,6 @@
         patchFlags = [ "-p2" ];
       });
     })
-    (_final: prev: {
-      ghostty = prev.ghostty.overrideAttrs (old: {
-        patches = (old.patches or [ ]) ++ [
-          ../../pkgs/ghostty/0001-pulse-progress-bar-on-a-steady-timer.patch
-        ];
-      });
-    })
   ];
 
   boot.loader.systemd-boot.enable = true;
