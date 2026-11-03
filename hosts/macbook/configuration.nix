@@ -26,6 +26,38 @@
       NSGlobalDomain.AppleICUForce24HourTime = true;
       NSGlobalDomain.AppleInterfaceStyle = "Dark";
       NSGlobalDomain.KeyRepeat = 2;
+
+      # U.S. is the only keyboard layout. Ghostty takes Option for Alt only
+      # on the U.S. layouts, and luneta's Alt keys (Alt r dictates) need it.
+      # The other two sources are macOS's own: the emoji palette and the
+      # accents a held key offers.
+      CustomUserPreferences."com.apple.HIToolbox" =
+        let
+          us = {
+            InputSourceKind = "Keyboard Layout";
+            "KeyboardLayout ID" = 0;
+            "KeyboardLayout Name" = "U.S.";
+          };
+          palette = {
+            "Bundle ID" = "com.apple.CharacterPaletteIM";
+            InputSourceKind = "Non Keyboard Input Method";
+          };
+          pressAndHold = {
+            "Bundle ID" = "com.apple.PressAndHold";
+            InputSourceKind = "Non Keyboard Input Method";
+          };
+        in
+        {
+          AppleEnabledInputSources = [
+            palette
+            pressAndHold
+            us
+          ];
+          AppleSelectedInputSources = [
+            pressAndHold
+            us
+          ];
+        };
     };
     stateVersion = 6;
   };
