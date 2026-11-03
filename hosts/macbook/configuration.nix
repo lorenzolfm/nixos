@@ -95,6 +95,16 @@
     onActivation.cleanup = "uninstall";
   };
 
+  # Not homebrew.masApps: with any entry there, onActivation.cleanup uninstalls
+  # every App Store app missing from that list. mas can only install apps the
+  # Apple Account already has, so get Xcode once in the App Store first.
+  programs.mas = {
+    enable = true;
+    # The default runs `mas update` on every rebuild.
+    update = false;
+    packages.Xcode = 497799835;
+  };
+
   users = {
     knownUsers = [ "lorenzo" ];
     users.lorenzo.uid = 501;
