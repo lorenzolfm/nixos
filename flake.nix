@@ -114,6 +114,7 @@
           inherit
             claude-code
             rust-overlay
+            llm-agents
             wt
             claude-ps
             luneta

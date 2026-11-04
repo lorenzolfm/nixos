@@ -1,6 +1,7 @@
 {
   pkgs,
   claude-code,
+  llm-agents,
   rust-overlay,
   wt,
   ...
@@ -45,6 +46,7 @@
     jq
     kubectl
     kubeseal
+    llm-agents.packages.${pkgs.system}.pi
     lua-language-server
     neovim
     nil
