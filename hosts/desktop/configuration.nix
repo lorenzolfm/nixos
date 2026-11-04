@@ -14,6 +14,7 @@
     ./claude-tray.nix
     ./claude-nav.nix
     ./oss-board.nix
+    ./numes.nix
     ./rgb.nix
     ./gaming.nix
   ];
@@ -210,7 +211,6 @@
     libsystemtap
     linuxPackages.perf
     llm-agents.packages.${pkgs.system}.orca
-    (callPackage ../../pkgs/numes { })
     obs-studio
     pamixer
     pkgconf
