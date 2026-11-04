@@ -1,4 +1,4 @@
-# Floresta triage: refreshes the board hourly, DMs twice a day.
+# Floresta triage: refreshes the board hourly, DMs once each morning.
 #
 # Mirrors the borgmatic pattern in backup.nix: a systemd timer with
 # Persistent = true, secrets via sops-nix, and an uptime-kuma push heartbeat so
@@ -144,13 +144,9 @@ in
     wantedBy = [ "timers.target" ];
     timerConfig = {
       # Hourly for the board. The DM is not a timer concern: the run sends it on
-      # the first run at or after each slot in config::DM_SLOTS (08:07, 19:23),
-      # which is why 19:23 is listed too. Off-peak minutes on purpose: :00 and
-      # :30 are where every scheduler lands.
-      OnCalendar = [
-        "*-*-* *:07:00"
-        "19:23"
-      ];
+      # the first run at or after the slot in config::DM_SLOTS (08:07). Off-peak
+      # minutes on purpose: :00 and :30 are where every scheduler lands.
+      OnCalendar = "*-*-* *:07:00";
       # A run missed while the desktop was off fires on next boot rather than
       # being skipped -- the desktop is not always awake.
       Persistent = true;
