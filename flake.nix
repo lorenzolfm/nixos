@@ -61,6 +61,11 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
     };
+    oss-board = {
+      url = "github:lorenzolfm/oss-board";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
   outputs =
@@ -78,6 +83,7 @@
       claude-ps,
       claude-nav,
       luneta,
+      oss-board,
       ...
     }:
     {
@@ -93,6 +99,7 @@
             claude-ps
             claude-nav
             luneta
+            oss-board
             ;
         };
         modules = [

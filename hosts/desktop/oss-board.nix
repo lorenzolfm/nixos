@@ -6,16 +6,19 @@
 #
 # Import from hosts/desktop/configuration.nix:
 #   imports = [ ./oss-board.nix ];
-# `claude-code` arrives via specialArgs in flake.nix, the same way
+# `claude-code` and `oss-board` arrive via specialArgs in flake.nix, the same way
 # claude-tray.nix and claude-ps.nix receive theirs.
 {
   config,
   pkgs,
   lib,
   claude-code,
+  oss-board,
   ...
 }:
 let
+  package = oss-board.packages.${pkgs.stdenv.hostPlatform.system}.default;
+
   user = "lorenzo";
   home = "/home/${user}";
   projectDir = "${home}/Projects/misc/opensource";
@@ -31,7 +34,6 @@ let
     claude-code.packages.${pkgs.system}.claude-code
   ]
   ++ (with pkgs; [
-    python3
     gh
     # git reads your local clone for unshipped branches and the footprint.
     git
@@ -99,8 +101,9 @@ in
         set -euo pipefail
         export GH_TOKEN="$(cat ${config.sops.secrets."oss-board-github-token".path})"
         export UPTIME_KUMA_PUSH_URL="$(cat ${config.sops.secrets."uptime-kuma-push-oss-board".path})"
-        exec ${pkgs.python3}/bin/python3 ${projectDir}/run.py \
+        exec ${lib.getExe package} refresh \
           --board ${lib.escapeShellArg board} \
+          --state ${lib.escapeShellArg "${projectDir}/state"} \
           --notify
       '';
 
@@ -120,6 +123,10 @@ in
         "${home}/Documents/Vault/Opensource"
         "${projectDir}/state"
       ];
+      # `gh` falls back to the login kept here when GH_TOKEN is unset, and that login
+      # can write. The briefing agent reads text from anyone who can open an issue and
+      # could unset the variable, so the read-only token must be all it can reach.
+      TemporaryFileSystem = "${home}/.config/gh:ro";
       NoNewPrivileges = true;
       ProtectKernelTunables = true;
       ProtectKernelModules = true;
@@ -136,8 +143,8 @@ in
     description = "Refresh the Floresta triage board hourly";
     wantedBy = [ "timers.target" ];
     timerConfig = {
-      # Hourly for the board. The DM is not a timer concern: run.py sends it on
-      # the first run at or after each slot in config.DM_SLOTS (08:07, 19:23),
+      # Hourly for the board. The DM is not a timer concern: the run sends it on
+      # the first run at or after each slot in config::DM_SLOTS (08:07, 19:23),
       # which is why 19:23 is listed too. Off-peak minutes on purpose: :00 and
       # :30 are where every scheduler lands.
       OnCalendar = [
