@@ -14,11 +14,11 @@
 # and a version bump is a new `version` and `hash`.
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "numes";
-  version = "0.0.34";
+  version = "0.0.44";
 
   src = fetchurl {
     url = "https://releases.numes.ai/numes/${finalAttrs.version}/numes-${finalAttrs.version}-linux-x64.tar.gz";
-    hash = "sha256-GyrhcAsNvHWGhjyLOihDTcQbMAUQB2GHKV91RxkL7r0=";
+    hash = "sha256-shKBuygE+eH7EMAjs/R4OmRuq3hkT6sB3IHO8i7enSY=";
   };
 
   sourceRoot = ".";
