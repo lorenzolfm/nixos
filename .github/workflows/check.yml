@@ -42,6 +42,8 @@ jobs:
         include:
           - tool: deadnix
             args: --fail .
+          - tool: statix
+            args: check .
     name: lint ${{ matrix.tool }}
     steps:
       - uses: actions/checkout@v4

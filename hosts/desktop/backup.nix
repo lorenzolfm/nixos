@@ -78,8 +78,7 @@ let
       ];
       encryption_passcommand = passphraseCommand;
       ssh_command = sshCommandFor destination;
-      compression = compression;
-      inherit checks;
+      inherit compression checks;
     }
     // retention
     // uptimeKumaHookFor destination

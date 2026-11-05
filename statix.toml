@@ -1,0 +1,3 @@
+# Setting `services.foo` and `services.bar` separately keeps options grouped by
+# topic. Merging them into one block, as this lint asks, would undo that.
+disabled = ["repeated_keys"]
