@@ -30,3 +30,21 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@v23
       - name: Evaluate ${{ matrix.host }}
         run: nix eval --raw ".#${{ matrix.attr }}.drvPath"
+
+  # Catches what evaluation can't, such as unused bindings, which Nix ignores.
+  # The tools come from flake.lock, so a new lint can only fail the PR that
+  # bumps nixpkgs.
+  lint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tool: deadnix
+            args: --fail .
+    name: lint ${{ matrix.tool }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - name: Run ${{ matrix.tool }}
+        run: nix run --inputs-from . "nixpkgs#${{ matrix.tool }}" -- ${{ matrix.args }}

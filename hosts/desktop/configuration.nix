@@ -1,9 +1,4 @@
-{
-  config,
-  pkgs,
-  llm-agents,
-  ...
-}:
+{ pkgs, llm-agents, ... }:
 
 {
   imports = [
