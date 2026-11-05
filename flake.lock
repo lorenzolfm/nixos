@@ -480,11 +480,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1793869719,
-        "narHash": "sha256-AXGSQqyh0/P+JuU3AHu7hY4vwkjdVWfEIu6+TQFaW9M=",
+        "lastModified": 1793886413,
+        "narHash": "sha256-gTbIf4SfcI1ZU4+taElc0iU/oIHyW9IYlGZrf++PqZQ=",
         "owner": "lorenzolfm",
         "repo": "luneta",
-        "rev": "6bd7a132c562a16898e0087064d1e1619b420108",
+        "rev": "3a8bc40312246b52f65f97403e7eeab264460dd7",
         "type": "github"
       },
       "original": {
@@ -703,11 +703,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1793869059,
-        "narHash": "sha256-zx0fbx1hgl8AklR7zB2j0iTa3CRbs0mPcmzp1SLKg1A=",
+        "lastModified": 1793875503,
+        "narHash": "sha256-8gYEgIqd1drTBN5NixNZPh30eEvi4kvrbmiaq7fffgU=",
         "owner": "lorenzolfm",
         "repo": "oss-board",
-        "rev": "21937675c262c10cc91e4b7b079a2c934ba5da4c",
+        "rev": "34f53eb782d1862d2a0e57e6ca36ea1b744d2378",
         "type": "github"
       },
       "original": {
