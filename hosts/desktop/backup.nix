@@ -85,32 +85,38 @@ let
     // (if skipActions == [ ] then { } else { skip_actions = skipActions; });
 in
 {
-  sops.age.keyFile = "/var/lib/sops-nix/key.txt";
-  sops.age.generateKey = true;
-  sops.age.sshKeyPaths = [ ];
+  sops = {
+    age = {
+      keyFile = "/var/lib/sops-nix/key.txt";
+      generateKey = true;
+      sshKeyPaths = [ ];
+    };
 
-  sops.defaultSopsFile = ./secrets.yaml;
-  sops.secrets."borg-passphrase" = { };
-  sops.secrets."borg-ssh-key-homelab2" = {
-    mode = "0400";
-  };
-  sops.secrets."borg-ssh-key-contabo" = {
-    mode = "0400";
-  };
-  sops.secrets."contabo-host" = { };
-  sops.secrets."uptime-kuma-push-homelab2" = { };
-  sops.secrets."uptime-kuma-push-contabo" = { };
+    defaultSopsFile = ./secrets.yaml;
+    secrets = {
+      "borg-passphrase" = { };
+      "borg-ssh-key-homelab2" = {
+        mode = "0400";
+      };
+      "borg-ssh-key-contabo" = {
+        mode = "0400";
+      };
+      "contabo-host" = { };
+      "uptime-kuma-push-homelab2" = { };
+      "uptime-kuma-push-contabo" = { };
+    };
 
-  # Render every borgmatic config through sops so the placeholders above are
-  # substituted at activation, then point /etc/borgmatic.d/<name>.yaml at the
-  # rendered file instead of the placeholder-bearing store copy. The module's
-  # build-time `borgmatic config validate` still runs on the store copy.
-  sops.templates = lib.mapAttrs' (
-    name: cfg:
-    lib.nameValuePair "borgmatic-${name}.yaml" {
-      file = settingsFormat.generate "${name}.yaml" cfg;
-    }
-  ) config.services.borgmatic.configurations;
+    # Render every borgmatic config through sops so the placeholders above are
+    # substituted at activation, then point /etc/borgmatic.d/<name>.yaml at the
+    # rendered file instead of the placeholder-bearing store copy. The module's
+    # build-time `borgmatic config validate` still runs on the store copy.
+    templates = lib.mapAttrs' (
+      name: cfg:
+      lib.nameValuePair "borgmatic-${name}.yaml" {
+        file = settingsFormat.generate "${name}.yaml" cfg;
+      }
+    ) config.services.borgmatic.configurations;
+  };
   environment.etc = lib.mapAttrs' (
     name: _:
     lib.nameValuePair "borgmatic.d/${name}.yaml" {

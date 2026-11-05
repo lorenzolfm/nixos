@@ -43,26 +43,28 @@ let
   ]);
 in
 {
-  # Read-only GitHub token: a CLASSIC PAT whose only scope is `read:project`.
-  # With no `repo` or `public_repo` scope it can read public repositories and
-  # nothing private anywhere -- so it cannot comment, claim, or open a PR as
-  # lorenzolfm, and cannot see an employer repo at all. `read:project` is what
-  # the org board's Needs Review column needs; fine-grained tokens would need
-  # an org admin's approval for that.
-  sops.secrets."oss-board-github-token" = {
-    owner = user;
-    mode = "0400";
-  };
-  sops.secrets."oss-board-telegram-token" = {
-    owner = user;
-    mode = "0400";
-  };
-  # Read at run time from the sops file, not at eval time from local-secrets/:
-  # flake eval is pure and `builtins.pathExists` on an out-of-tree path is
-  # false there, which silently dropped the heartbeat on every plain rebuild.
-  sops.secrets."uptime-kuma-push-oss-board" = {
-    owner = user;
-    mode = "0400";
+  sops.secrets = {
+    # Read-only GitHub token: a CLASSIC PAT whose only scope is `read:project`.
+    # With no `repo` or `public_repo` scope it can read public repositories and
+    # nothing private anywhere -- so it cannot comment, claim, or open a PR as
+    # lorenzolfm, and cannot see an employer repo at all. `read:project` is what
+    # the org board's Needs Review column needs; fine-grained tokens would need
+    # an org admin's approval for that.
+    "oss-board-github-token" = {
+      owner = user;
+      mode = "0400";
+    };
+    "oss-board-telegram-token" = {
+      owner = user;
+      mode = "0400";
+    };
+    # Read at run time from the sops file, not at eval time from local-secrets/:
+    # flake eval is pure and `builtins.pathExists` on an out-of-tree path is
+    # false there, which silently dropped the heartbeat on every plain rebuild.
+    "uptime-kuma-push-oss-board" = {
+      owner = user;
+      mode = "0400";
+    };
   };
 
   systemd.services.oss-board = {
