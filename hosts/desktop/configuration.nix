@@ -1,9 +1,4 @@
-{
-  config,
-  pkgs,
-  llm-agents,
-  ...
-}:
+{ pkgs, llm-agents, ... }:
 
 {
   imports = [
@@ -34,13 +29,20 @@
     })
   ];
 
-  boot.loader.systemd-boot.enable = true;
-  boot.loader.systemd-boot.configurationLimit = 5;
-  boot.loader.efi.canTouchEfiVariables = true;
+  boot = {
+    loader = {
+      systemd-boot.enable = true;
+      systemd-boot.configurationLimit = 5;
+      efi.canTouchEfiVariables = true;
+    };
 
-  # /tmp lives on the root disk, and systemd only ages it out after 10 days;
-  # nix-shell and Claude Code temp dirs piled up to 111G inside that window.
-  boot.tmp.cleanOnBoot = true;
+    # /tmp lives on the root disk, and systemd only ages it out after 10 days;
+    # nix-shell and Claude Code temp dirs piled up to 111G inside that window.
+    tmp.cleanOnBoot = true;
+
+    kernel.sysctl."kernel.perf_event_paranoid" = 1;
+    kernel.sysctl."kernel.kptr_restrict" = 0;
+  };
 
   nix.gc = {
     automatic = true;
@@ -48,19 +50,6 @@
     options = "--delete-older-than 14d";
   };
   nix.settings.auto-optimise-store = true;
-
-  services.earlyoom = {
-    enable = true;
-    freeMemThreshold = 5;
-    freeSwapThreshold = 10;
-    extraArgs = [
-      "--sort-by-rss"
-      "--avoid"
-      "(^systemd|Hyprland|gnome-shell|gnome-keyring|^gdm|pipewire|wireplumber|dbus-broker|dconf|xdg-|at-spi|gvfsd|swaync|waybar|portal)"
-      "--prefer"
-      "(chrome|rust-analyzer)"
-    ];
-  };
 
   zramSwap.enable = true;
 
@@ -103,41 +92,81 @@
     LC_TIME = "en_US.UTF-8";
   };
 
-  services.xserver.enable = true;
-  services.displayManager.gdm.enable = true;
-  services.displayManager.defaultSession = "hyprland-uwsm";
-  services.desktopManager.gnome.enable = true;
-  # GNOME turns on the Orca screen reader by default, and its bin/orca would
-  # collide with the Orca IDE's CLI of the same name.
-  services.orca.enable = false;
-  services.xserver.xkb = {
-    layout = "us";
-    variant = "";
-  };
-
-  services.printing.enable = true;
-
-  services.pulseaudio.enable = false;
   security.rtkit.enable = true;
-  services.pipewire = {
-    enable = true;
-    alsa.enable = true;
-    alsa.support32Bit = true;
-    pulse.enable = true;
-    jack.enable = true;
-    # The AirPods' own play/pause button sends an AVRCP passthrough command,
-    # which only reaches the desktop if something registers a player with
-    # bluez and forwards to MPRIS. Two things can register one and only one
-    # may, or the registration is refused and the button does nothing.
-    #
-    # WirePlumber's dummy player registers but forwards nothing, so it is
-    # explicitly off; mpris-proxy below does the forwarding and is what
-    # actually makes the button work. Verified by testing both in isolation.
-    wireplumber.extraConfig."51-bluez-avrcp" = {
-      "monitor.bluez.properties" = {
-        "bluez5.dummy-avrcp-player" = false;
+
+  services = {
+    earlyoom = {
+      enable = true;
+      freeMemThreshold = 5;
+      freeSwapThreshold = 10;
+      extraArgs = [
+        "--sort-by-rss"
+        "--avoid"
+        "(^systemd|Hyprland|gnome-shell|gnome-keyring|^gdm|pipewire|wireplumber|dbus-broker|dconf|xdg-|at-spi|gvfsd|swaync|waybar|portal)"
+        "--prefer"
+        "(chrome|rust-analyzer)"
+      ];
+    };
+
+    xserver = {
+      enable = true;
+      xkb = {
+        layout = "us";
+        variant = "";
+      };
+      videoDrivers = [ "nvidia" ];
+    };
+    displayManager.gdm.enable = true;
+    displayManager.defaultSession = "hyprland-uwsm";
+    desktopManager.gnome.enable = true;
+    # GNOME turns on the Orca screen reader by default, and its bin/orca would
+    # collide with the Orca IDE's CLI of the same name.
+    orca.enable = false;
+
+    printing.enable = true;
+
+    pulseaudio.enable = false;
+    pipewire = {
+      enable = true;
+      alsa.enable = true;
+      alsa.support32Bit = true;
+      pulse.enable = true;
+      jack.enable = true;
+      # The AirPods' own play/pause button sends an AVRCP passthrough command,
+      # which only reaches the desktop if something registers a player with
+      # bluez and forwards to MPRIS. Two things can register one and only one
+      # may, or the registration is refused and the button does nothing.
+      #
+      # WirePlumber's dummy player registers but forwards nothing, so it is
+      # explicitly off; mpris-proxy below does the forwarding and is what
+      # actually makes the button work. Verified by testing both in isolation.
+      wireplumber.extraConfig."51-bluez-avrcp" = {
+        "monitor.bluez.properties" = {
+          "bluez5.dummy-avrcp-player" = false;
+        };
       };
     };
+
+    # Port 22 is only open on tailscale0 (see networking.firewall above), so
+    # reaching sshd already requires being on the tailnet. Keys-only on top of
+    # that means a tailnet device alone is not enough to log in. The physical
+    # console stays available if a key is ever lost.
+    openssh.settings = {
+      PasswordAuthentication = false;
+      KbdInteractiveAuthentication = false;
+    };
+
+    fail2ban = {
+      enable = true;
+      # Never ban trusted networks: loopback, LAN, and the Tailscale
+      # CGNAT range (100.64.0.0/10) so my notebook over Tailscale is exempt.
+      ignoreIP = [
+        "127.0.0.1/8"
+        "10.0.0.0/8"
+        "100.64.0.0/10"
+      ];
+    };
+    blueman.enable = true;
   };
 
   # Bridges AVRCP passthrough from the AirPods to MPRIS, so the button on the
@@ -181,122 +210,102 @@
     ];
   };
 
-  # Qt defaults to the xcb platform plugin and aborts under Hyprland, where
-  # there is no X display. Prefer wayland, keeping xcb as fallback for Qt
-  # apps built without the wayland plugin.
-  environment.sessionVariables.QT_QPA_PLATFORM = "wayland;xcb";
+  environment = {
+    # Qt defaults to the xcb platform plugin and aborts under Hyprland, where
+    # there is no X display. Prefer wayland, keeping xcb as fallback for Qt
+    # apps built without the wayland plugin.
+    sessionVariables.QT_QPA_PLATFORM = "wayland;xcb";
 
-  # GTK 4.22 defaults to the Vulkan renderer, which here enumerates only the AMD
-  # iGPU (card1) and never the NVIDIA card driving both monitors. GTK renders on
-  # a GPU wired to no display and hands Hyprland a buffer it cannot sample, so
-  # every GTK4 app (Files, gnome-text-editor) maps a solid black window. Use the
-  # GL renderer instead.
-  environment.sessionVariables.GSK_RENDERER = "ngl";
+    # GTK 4.22 defaults to the Vulkan renderer, which here enumerates only the AMD
+    # iGPU (card1) and never the NVIDIA card driving both monitors. GTK renders on
+    # a GPU wired to no display and hands Hyprland a buffer it cannot sample, so
+    # every GTK4 app (Files, gnome-text-editor) maps a solid black window. Use the
+    # GL renderer instead.
+    sessionVariables.GSK_RENDERER = "ngl";
 
-  environment.systemPackages = with pkgs; [
-    (appimage-run.override {
-      extraPkgs = pkgs: [ pkgs.xorg.libxshmfence ];
-    })
-    bitcoin
-    boost
-    cmake
-    docker
-    gcc
-    gws
-    heaptrack
-    hyperfine
-    libevent
-    libnotify
-    librepods
-    libsystemtap
-    linuxPackages.perf
-    llm-agents.packages.${pkgs.system}.orca
-    obs-studio
-    pamixer
-    pkgconf
-    playerctl
-    protols
-    python314
-    qrencode
-    rofi
-    signal-desktop
-    spotify
-    sqlite
-    ssss
-    swaynotificationcenter
-    telegram-desktop
-    terraform
-    trezor-suite
-    vicinae
-    waybar
-    zbar
-    zmqpp
-  ];
-
-  boot.kernel.sysctl."kernel.perf_event_paranoid" = 1;
-  boot.kernel.sysctl."kernel.kptr_restrict" = 0;
+    systemPackages = with pkgs; [
+      (appimage-run.override {
+        extraPkgs = pkgs: [ pkgs.xorg.libxshmfence ];
+      })
+      bitcoin
+      boost
+      cmake
+      docker
+      gcc
+      gws
+      heaptrack
+      hyperfine
+      libevent
+      libnotify
+      librepods
+      libsystemtap
+      linuxPackages.perf
+      llm-agents.packages.${pkgs.system}.orca
+      obs-studio
+      pamixer
+      pkgconf
+      playerctl
+      protols
+      python314
+      qrencode
+      rofi
+      signal-desktop
+      spotify
+      sqlite
+      ssss
+      swaynotificationcenter
+      telegram-desktop
+      terraform
+      trezor-suite
+      vicinae
+      waybar
+      zbar
+      zmqpp
+    ];
+  };
 
   virtualisation.docker.enable = true;
   users.defaultUserShell = pkgs.fish;
 
-  programs.git = {
-    enable = true;
-    config = {
-      user = {
-        signingKey = "/home/lorenzo/.ssh/id_ed25519.pub";
-        email = "maturanolorenzo@gmail.com";
-        name = "Lorenzo";
-      };
-      gpg = {
-        format = "ssh";
-        ssh = {
-          allowedSignersFile = "/home/lorenzo/.ssh/allowed-signers";
+  programs = {
+    git = {
+      enable = true;
+      config = {
+        user = {
+          signingKey = "/home/lorenzo/.ssh/id_ed25519.pub";
+          email = "maturanolorenzo@gmail.com";
+          name = "Lorenzo";
+        };
+        gpg = {
+          format = "ssh";
+          ssh = {
+            allowedSignersFile = "/home/lorenzo/.ssh/allowed-signers";
+          };
+        };
+        commit = {
+          gpgSign = true;
         };
       };
-      commit = {
-        gpgSign = true;
-      };
+    };
+
+    ssh.extraConfig = ''
+      Host mac
+        HostName macbook.tail174781.ts.net
+        User lorenzo
+        IdentityFile ~/.ssh/id_ed25519
+    '';
+
+    hyprland = {
+      enable = true;
+      xwayland.enable = true;
+      # Without UWSM nothing activates graphical-session.target, so
+      # xdg-desktop-portal (Requisite=graphical-session.target) can never
+      # start: no portals, and GTK apps ignore the dark color-scheme.
+      withUWSM = true;
+      portalPackage = pkgs.xdg-desktop-portal-hyprland;
     };
   };
 
-  programs.ssh.extraConfig = ''
-    Host mac
-      HostName macbook.tail174781.ts.net
-      User lorenzo
-      IdentityFile ~/.ssh/id_ed25519
-  '';
-
-  programs.hyprland = {
-    enable = true;
-    xwayland.enable = true;
-    # Without UWSM nothing activates graphical-session.target, so
-    # xdg-desktop-portal (Requisite=graphical-session.target) can never
-    # start: no portals, and GTK apps ignore the dark color-scheme.
-    withUWSM = true;
-  };
-
-  # Port 22 is only open on tailscale0 (see networking.firewall above), so
-  # reaching sshd already requires being on the tailnet. Keys-only on top of
-  # that means a tailnet device alone is not enough to log in. The physical
-  # console stays available if a key is ever lost.
-  services.openssh.settings = {
-    PasswordAuthentication = false;
-    KbdInteractiveAuthentication = false;
-  };
-
-  services.fail2ban = {
-    enable = true;
-    # Never ban trusted networks: loopback, LAN, and the Tailscale
-    # CGNAT range (100.64.0.0/10) so my notebook over Tailscale is exempt.
-    ignoreIP = [
-      "127.0.0.1/8"
-      "10.0.0.0/8"
-      "100.64.0.0/10"
-    ];
-  };
-  services.blueman.enable = true;
-
-  services.xserver.videoDrivers = [ "nvidia" ];
   hardware = {
     enableAllFirmware = true;
 
@@ -332,8 +341,6 @@
     extraPortals = [ pkgs.xdg-desktop-portal-gtk ];
     xdgOpenUsePortal = true;
   };
-
-  programs.hyprland.portalPackage = pkgs.xdg-desktop-portal-hyprland;
 
   system.stateVersion = "24.11";
 }

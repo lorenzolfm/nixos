@@ -1,4 +1,4 @@
-{ config, pkgs, ... }:
+{ pkgs, ... }:
 
 {
   imports = [
@@ -23,9 +23,11 @@
       };
       finder.FXPreferredViewStyle = "clmv";
       screensaver.askForPasswordDelay = 10;
-      NSGlobalDomain.AppleICUForce24HourTime = true;
-      NSGlobalDomain.AppleInterfaceStyle = "Dark";
-      NSGlobalDomain.KeyRepeat = 2;
+      NSGlobalDomain = {
+        AppleICUForce24HourTime = true;
+        AppleInterfaceStyle = "Dark";
+        KeyRepeat = 2;
+      };
     };
     stateVersion = 6;
   };
@@ -107,11 +109,13 @@
 
   users = {
     knownUsers = [ "lorenzo" ];
-    users.lorenzo.uid = 501;
-    users.lorenzo.shell = pkgs.fish;
-    users.lorenzo.openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOKP7Z6l0U3ZQbmfyj6yAD62F16A/gkULyiOlG0fcEEL lorenzo@lorenzo-pc"
-    ];
+    users.lorenzo = {
+      uid = 501;
+      shell = pkgs.fish;
+      openssh.authorizedKeys.keys = [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOKP7Z6l0U3ZQbmfyj6yAD62F16A/gkULyiOlG0fcEEL lorenzo@lorenzo-pc"
+      ];
+    };
   };
 
   nixpkgs.hostPlatform = "aarch64-darwin";
