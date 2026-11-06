@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ config, pkgs, ... }:
 
 {
   imports = [
@@ -30,6 +30,20 @@
       };
     };
     stateVersion = 6;
+  };
+
+  # hidutil's mapping is lost on reboot, and nix-darwin's boot daemon
+  # (activate-system) never reapplies it: its App Management check fails outside
+  # a GUI session and aborts the script before the keyboard step. So do it at
+  # login instead.
+  launchd.user.agents.keyboard-remap.serviceConfig = {
+    ProgramArguments = [
+      "/usr/bin/hidutil"
+      "property"
+      "--set"
+      (builtins.toJSON { UserKeyMapping = config.system.keyboard.userKeyMapping; })
+    ];
+    RunAtLoad = true;
   };
 
   # darwin-rebuild picks the flake config by LocalHostName, so this has to
