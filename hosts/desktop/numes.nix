@@ -19,6 +19,11 @@ in
     # NUMES_API_KEY overrides the key numes would save under ~/.config/numes/apps
     # and is never written to disk. Set here rather than in the shell so only this
     # process tree sees it, and read at run time so it stays out of the store.
+    #
+    # Extra args go before "run"'s app name only as numes options; pi flags such
+    # as --provider/--model must come after "pi", so "run pi" stays mid-line
+    # and user args are appended. The default model pins what numes injects into
+    # pi's command line; without it numes picks its own default model.
     (pkgs.writeShellScriptBin "numes-pi" ''
       set -euo pipefail
       export NUMES_API_KEY="$(cat ${config.sops.secrets."numes-api-key".path})"
@@ -32,7 +37,10 @@ in
         mkdir -p "$HOME/.local/share/numes/apps/pi/extensions"
         ln -sfn "$luneta_ext" "$HOME/.local/share/numes/apps/pi/extensions/luneta.ts"
       fi
-      exec ${lib.getExe numes} run pi "$@"
+      exec ${lib.getExe numes} run pi \
+        --provider numes-org-cashu-devs \
+        --model z-ai/glm-5.3:org-cashu-devs \
+        "$@"
     '')
   ];
 }
