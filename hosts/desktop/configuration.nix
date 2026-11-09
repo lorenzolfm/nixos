@@ -100,9 +100,8 @@
       freeMemThreshold = 5;
       freeSwapThreshold = 10;
       extraArgs = [
-        "--sort-by-rss"
         "--avoid"
-        "(^systemd|Hyprland|gnome-shell|gnome-keyring|^gdm|pipewire|wireplumber|dbus-broker|dconf|xdg-|at-spi|gvfsd|swaync|waybar|portal)"
+        "(^systemd|Hyprland|gnome-shell|gnome-keyring|^gdm|pipewire|wireplumber|dbus-broker|dconf|xdg-|at-spi|gvfsd|swaync|waybar|portal|sshd|tailscaled|NetworkManager|zellij)"
         "--prefer"
         "(chrome|rust-analyzer)"
       ];
