@@ -56,7 +56,14 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
     };
+    # Pinned to a release; bump the tag to upgrade.
     luneta = {
+      url = "github:lorenzolfm/luneta/v0.3.0";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
+    # luneta's main, installed beside the pin as `luneta-unstable`.
+    luneta-unstable = {
       url = "github:lorenzolfm/luneta";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
@@ -83,6 +90,7 @@
       claude-ps,
       claude-nav,
       luneta,
+      luneta-unstable,
       oss-board,
       ...
     }:
@@ -99,6 +107,7 @@
             claude-ps
             claude-nav
             luneta
+            luneta-unstable
             oss-board
             ;
         };
@@ -118,6 +127,7 @@
             wt
             claude-ps
             luneta
+            luneta-unstable
             ;
         };
         modules = [
