@@ -8,21 +8,21 @@
 let
   system = pkgs.stdenv.hostPlatform.system;
 
-  # luneta's main, as `luneta-unstable` and `lunetad-unstable`. They are
-  # symlinks into the tip's store path. luneta starts the lunetad beside its
-  # resolved binary, so `luneta-unstable` starts the tip's daemon and not the
-  # pinned one. The fish hook is left out, as the pinned package installs it.
-  tip = luneta-unstable.packages.${system}.lunetad;
-  lunetaUnstable = pkgs.runCommand "luneta-unstable-${tip.version}" { } ''
+  # The release pinned in flake.nix, as `luneta-stable` and `lunetad-stable`.
+  # They are symlinks into the pinned store path. luneta starts the lunetad
+  # beside its resolved binary, so `luneta-stable` starts the pinned daemon and
+  # not the tip's. The fish hook is left out, as the tip's package installs it.
+  pinned = luneta.packages.${system}.lunetad;
+  lunetaStable = pkgs.runCommand "luneta-stable-${pinned.version}" { } ''
     mkdir -p $out/bin
-    ln -s ${tip}/bin/luneta $out/bin/luneta-unstable
-    ln -s ${tip}/bin/lunetad $out/bin/lunetad-unstable
+    ln -s ${pinned}/bin/luneta $out/bin/luneta-stable
+    ln -s ${pinned}/bin/lunetad $out/bin/lunetad-stable
   '';
 in
 {
   environment.systemPackages = [
-    # Both `luneta` and `lunetad`, pinned to a release in flake.nix.
-    luneta.packages.${system}.lunetad
-    lunetaUnstable
+    # Both `luneta` and `lunetad`, at luneta's main.
+    luneta-unstable.packages.${system}.lunetad
+    lunetaStable
   ];
 }

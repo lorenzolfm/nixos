@@ -62,7 +62,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
     };
-    # luneta's main, installed beside the pin as `luneta-unstable`.
+    # luneta's main, installed as `luneta`; the pin above is `luneta-stable`.
     luneta-unstable = {
       url = "github:lorenzolfm/luneta";
       inputs.nixpkgs.follows = "nixpkgs";
