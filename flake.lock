@@ -230,6 +230,21 @@
     },
     "crane_5": {
       "locked": {
+        "lastModified": 1792350552,
+        "narHash": "sha256-292lvpvxTGKryKxh3/3tcIVi85CwYGdl4oOi113Sob8=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "e675a36b7377bebe41d548388a2501cbb16d380d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
+    "crane_6": {
+      "locked": {
         "lastModified": 1793669695,
         "narHash": "sha256-9EtV4I6Ohw0tjidL31TMOKHhW/QGVG8NuGiemzIaNCs=",
         "owner": "ipetkov",
@@ -243,7 +258,7 @@
         "type": "github"
       }
     },
-    "crane_6": {
+    "crane_7": {
       "locked": {
         "lastModified": 1787326676,
         "narHash": "sha256-lWhBbBvC05/xwivKBBiM2YNizpmgqCgyOIzomvRuwxs=",
@@ -480,11 +495,36 @@
         ]
       },
       "locked": {
-        "lastModified": 1794267285,
-        "narHash": "sha256-6Q1QA0EP4mSoTcOqXzT5a8jDSrSa/S1q8FOnIWjMEno=",
+        "lastModified": 1794269570,
+        "narHash": "sha256-iIdOE6H9bQhx1Ym9BOkRmHDzU5/KkixYSsN1VQBF07I=",
         "owner": "lorenzolfm",
         "repo": "luneta",
-        "rev": "9dc277e4faaec78fc3385428d97f722f1fbfb691",
+        "rev": "39b3a65ee5413de5d3e3a0b4eed96ff01a0365a8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "lorenzolfm",
+        "ref": "v0.3.0",
+        "repo": "luneta",
+        "type": "github"
+      }
+    },
+    "luneta-unstable": {
+      "inputs": {
+        "crane": "crane_5",
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "rust-overlay": [
+          "rust-overlay"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794270798,
+        "narHash": "sha256-BYQTU0HoSAmDU7xJubu+IQ7vx6Ib2Y7L1FncSrH6FNY=",
+        "owner": "lorenzolfm",
+        "repo": "luneta",
+        "rev": "0dcfe127be87462e6989efe5b608879aad1b2743",
         "type": "github"
       },
       "original": {
@@ -693,7 +733,7 @@
     },
     "oss-board": {
       "inputs": {
-        "crane": "crane_5",
+        "crane": "crane_6",
         "flake-parts": "flake-parts_6",
         "nixpkgs": [
           "nixpkgs"
@@ -725,6 +765,7 @@
         "darwin": "darwin",
         "llm-agents": "llm-agents",
         "luneta": "luneta",
+        "luneta-unstable": "luneta-unstable",
         "mac-app-util": "mac-app-util",
         "nix-homebrew": "nix-homebrew",
         "nixpkgs": "nixpkgs_4",
@@ -893,7 +934,7 @@
     },
     "wt": {
       "inputs": {
-        "crane": "crane_6",
+        "crane": "crane_7",
         "flake-parts": "flake-parts_7",
         "nixpkgs": [
           "nixpkgs"
