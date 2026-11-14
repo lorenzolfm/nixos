@@ -32,6 +32,13 @@
     stateVersion = 6;
   };
 
+  # Minutes of inactivity, same on battery and charger. nix-darwin applies this
+  # through systemsetup with its output silenced, so check `pmset -g custom`.
+  power.sleep = {
+    display = 30;
+    computer = 60;
+  };
+
   # hidutil's mapping is lost on reboot, and nix-darwin's boot daemon
   # (activate-system) never reapplies it: its App Management check fails outside
   # a GUI session and aborts the script before the keyboard step. So do it at
