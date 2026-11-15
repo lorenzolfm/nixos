@@ -15,7 +15,6 @@
       dock = {
         persistent-apps = [
           "/Applications/Nix Apps/Ghostty.app"
-          "/Applications/Slack.app"
         ];
         autohide = true;
         show-recents = false;
