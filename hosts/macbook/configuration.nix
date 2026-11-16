@@ -3,6 +3,7 @@
 {
   imports = [
     ../common/configuration.nix
+    ./display-arrangement.nix
   ];
 
   system = {
