@@ -69,6 +69,10 @@
       terminal-notifier
     ];
 
+    # Nix's git reads its system config from its own store path, not
+    # /etc/gitconfig (only Apple's /usr/bin/git does), so point it here.
+    variables.GIT_CONFIG_SYSTEM = "/etc/gitconfig";
+
     etc."gitconfig".text = ''
       [user]
       name = Lorenzo
@@ -83,6 +87,10 @@
 
       [commit]
       gpgSign = true
+
+      # GIT_CONFIG_SYSTEM replaces the store gitconfig that set this.
+      [credential]
+      helper = osxkeychain
     '';
   };
 
