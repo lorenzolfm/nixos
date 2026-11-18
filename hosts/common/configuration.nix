@@ -20,7 +20,7 @@
       "nix-command"
       "flakes"
     ];
-    # Prebuilt llm-agents packages (codex, pi, orca).
+    # Prebuilt llm-agents packages (codex, pi).
     extra-substituters = [ "https://cache.numtide.com" ];
     extra-trusted-public-keys = [
       "niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g="
@@ -40,7 +40,7 @@
       ];
     })
     cargo-nextest
-    claude-code.packages.${pkgs.system}.claude-code
+    claude-code.packages.${pkgs.stdenv.hostPlatform.system}.claude-code
     diesel-cli
     direnv
     discord
@@ -57,12 +57,12 @@
     jq
     kubectl
     kubeseal
-    llm-agents.packages.${pkgs.system}.codex
-    llm-agents.packages.${pkgs.system}.pi
+    llm-agents.packages.${pkgs.stdenv.hostPlatform.system}.codex
+    llm-agents.packages.${pkgs.stdenv.hostPlatform.system}.pi
     lua-language-server
     neovim
     nil
-    nixfmt-rfc-style
+    nixfmt
     nodejs_24
     obsidian
     openssl
@@ -77,7 +77,7 @@
     tree-sitter
     typescript-language-server
     vscode-langservers-extracted
-    wt.packages.${pkgs.system}.default
+    wt.packages.${pkgs.stdenv.hostPlatform.system}.default
     yaml-language-server
     yamlfmt
     zellij
