@@ -1,4 +1,4 @@
-{ pkgs, llm-agents, ... }:
+{ pkgs, ... }:
 
 {
   imports = [
@@ -118,8 +118,7 @@
     displayManager.gdm.enable = true;
     displayManager.defaultSession = "hyprland-uwsm";
     desktopManager.gnome.enable = true;
-    # GNOME turns on the Orca screen reader by default, and its bin/orca would
-    # collide with the Orca IDE's CLI of the same name.
+    # GNOME turns on the Orca screen reader by default; it isn't used here.
     orca.enable = false;
 
     printing.enable = true;
@@ -130,7 +129,6 @@
       alsa.enable = true;
       alsa.support32Bit = true;
       pulse.enable = true;
-      jack.enable = true;
       # The AirPods' own play/pause button sends an AVRCP passthrough command,
       # which only reaches the desktop if something registers a player with
       # bluez and forwards to MPRIS. Two things can register one and only one
@@ -224,7 +222,7 @@
 
     systemPackages = with pkgs; [
       (appimage-run.override {
-        extraPkgs = pkgs: [ pkgs.xorg.libxshmfence ];
+        extraPkgs = pkgs: [ pkgs.libxshmfence ];
       })
       bitcoin
       boost
@@ -238,10 +236,9 @@
       libnotify
       librepods
       libsystemtap
-      linuxPackages.perf
-      llm-agents.packages.${pkgs.system}.orca
       obs-studio
       pamixer
+      perf
       pkgconf
       playerctl
       protols

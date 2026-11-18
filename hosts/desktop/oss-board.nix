@@ -31,7 +31,7 @@ let
   # it. Every binary the run shells out to must be listed here explicitly, or
   # the model passes fail open and the board silently degrades to ranking order.
   runtimeDeps = [
-    claude-code.packages.${pkgs.system}.claude-code
+    claude-code.packages.${pkgs.stdenv.hostPlatform.system}.claude-code
   ]
   ++ (with pkgs; [
     gh
