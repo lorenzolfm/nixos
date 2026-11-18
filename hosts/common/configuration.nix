@@ -15,10 +15,17 @@
   nixpkgs.config.allowUnfree = true;
   nixpkgs.overlays = [ rust-overlay.overlays.default ];
 
-  nix.settings.experimental-features = [
-    "nix-command"
-    "flakes"
-  ];
+  nix.settings = {
+    experimental-features = [
+      "nix-command"
+      "flakes"
+    ];
+    # Prebuilt llm-agents packages (codex, pi, orca).
+    extra-substituters = [ "https://cache.numtide.com" ];
+    extra-trusted-public-keys = [
+      "niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g="
+    ];
+  };
 
   environment.systemPackages = with pkgs; [
     atuin
@@ -46,6 +53,7 @@
     jq
     kubectl
     kubeseal
+    llm-agents.packages.${pkgs.system}.codex
     llm-agents.packages.${pkgs.system}.pi
     lua-language-server
     neovim
