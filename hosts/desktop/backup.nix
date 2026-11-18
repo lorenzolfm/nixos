@@ -8,7 +8,10 @@
 let
   settingsFormat = pkgs.formats.yaml { };
 
-  homelab2Host = "10.0.1.2";
+  # A name, not the ingress VIP: the homelab is moving from ingress-nginx
+  # (10.0.1.2) to Envoy Gateway (10.0.1.10, later back to .2), and Pi-hole's
+  # lab.local follows whichever proxy is live (lorenzolfm/homelab#416).
+  homelab2Host = "lab.local";
   homelab2Port = 2222;
   hotRepoPathHomelab2 = "/data/repo/hot";
 
