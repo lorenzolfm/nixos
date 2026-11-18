@@ -17,10 +17,10 @@
       url = "github:Mic92/sops-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    llm-agents = {
-      url = "github:numtide/llm-agents.nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    # Not following our nixpkgs on purpose: on its own pin every package is a
+    # hit in cache.numtide.com (see nix.settings in hosts/common), and on ours
+    # codex fails to build (openssl-sys cannot find OpenSSL).
+    llm-agents.url = "github:numtide/llm-agents.nix";
 
     # macOS only
     darwin = {
