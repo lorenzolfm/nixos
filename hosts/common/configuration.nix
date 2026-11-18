@@ -46,6 +46,10 @@
     discord
     eza
     gh
+    # A real git ahead of /usr/bin/git on macOS. That one is Apple's xcrun shim,
+    # and inside a Nix dev shell DEVELOPER_DIR points it at the Nix apple-sdk,
+    # which has no git, so it fails with "tool 'git' not found".
+    git
     # nixpkgs only builds ghostty on Linux; macOS gets the upstream signed app.
     (if stdenv.hostPlatform.isDarwin then ghostty-bin else ghostty)
     gnupg
