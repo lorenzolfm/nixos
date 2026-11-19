@@ -67,11 +67,20 @@
       pinentry_mac
       raycast
       terminal-notifier
+      # Nix's git reads its system config from its own store path, not
+      # /etc/gitconfig (only Apple's /usr/bin/git does). Bake the path into
+      # the binary rather than a session variable: shells, tmux and GUI apps
+      # started before a switch never see a new variable, and commit as
+      # user@hostname. hiPrio wins over the plain git from common.
+      (lib.hiPrio (symlinkJoin {
+        name = "git-etc-gitconfig";
+        paths = [ git ];
+        nativeBuildInputs = [ makeWrapper ];
+        postBuild = ''
+          wrapProgram $out/bin/git --set-default GIT_CONFIG_SYSTEM /etc/gitconfig
+        '';
+      }))
     ];
-
-    # Nix's git reads its system config from its own store path, not
-    # /etc/gitconfig (only Apple's /usr/bin/git does), so point it here.
-    variables.GIT_CONFIG_SYSTEM = "/etc/gitconfig";
 
     etc."gitconfig".text = ''
       [user]
@@ -88,7 +97,8 @@
       [commit]
       gpgSign = true
 
-      # GIT_CONFIG_SYSTEM replaces the store gitconfig that set this.
+      # The git wrapper's GIT_CONFIG_SYSTEM replaces the store gitconfig that
+      # set this.
       [credential]
       helper = osxkeychain
     '';
