@@ -497,11 +497,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1795103609,
-        "narHash": "sha256-odwVrpiOV1P8UQbtOyfU7V3jpVUwi4+dnLkfF7J6Yd0=",
+        "lastModified": 1795108043,
+        "narHash": "sha256-OgMR8G7cvljS7eRM0K8KmIFjx1lJMQ4e5IncU+5J4lg=",
         "owner": "lorenzolfm",
         "repo": "luneta",
-        "rev": "f9348c49c5946b9f8cd9df034bf9f0fb091a5898",
+        "rev": "285e7026634c3a2563988fb4dcd47a5c22e260e4",
         "type": "github"
       },
       "original": {
