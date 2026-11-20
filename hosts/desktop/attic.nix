@@ -79,14 +79,21 @@ in
           exit 1
         fi
 
-        echo "cache-push: building ''${#installables[@]} outputs of $flake" >&2
-        nix build --no-link "''${installables[@]}"
+        # Evaluate once and use these derivations for both the build and the
+        # push. Evaluating again after a long build would see any edit made
+        # meanwhile (or a moved github: ref) and push a closure whose outputs
+        # were never built.
+        drvs_out="$(nix path-info --derivation "''${installables[@]}")"
+        mapfile -t drvs <<<"$drvs_out"
+
+        echo "cache-push: building ''${#drvs[@]} derivations of $flake" >&2
+        nix build --no-link "''${drvs[@]/%/^*}"
 
         # Push the whole build closure, not only the results: crane's deps-only
         # artifacts, the toolchain and the sources are what save CI the most
         # time, and none of them is in a check's runtime closure. attic skips
         # paths signed by cache.nixos.org and paths the cache already has.
-        nix path-info --derivation "''${installables[@]}" \
+        printf '%s\n' "''${drvs[@]}" \
           | xargs -r nix-store --query --requisites --include-outputs \
           | grep -v '\.drv$' \
           | XDG_CONFIG_HOME=${atticConfigHome} attic push homelab:main --stdin
