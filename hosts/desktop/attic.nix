@@ -1,7 +1,11 @@
 # `cache-push [flake]`: build a flake's checks and packages, then push them to
 # the homelab's attic cache (lorenzolfm/homelab#431) so CI and the Mac can pull
-# them instead of building. Run it on purpose, from luneta, elo or any flake;
-# nothing pushes automatically. The Mac only pulls (see hosts/common).
+# them instead of building. Run it on purpose, from luneta, elo or another
+# public flake; nothing pushes automatically. The Mac only pulls (see
+# hosts/common).
+#
+# Public flakes only: cache `main` is world-readable on the tailnet, and the
+# push includes the flake's cleaned source.
 {
   config,
   lib,
@@ -24,7 +28,8 @@ let
   '';
 in
 {
-  # Push token, sub `desktop`, pull+push on `main` only. Expires 2027-11-20.
+  # Push token, sub `desktop`, pull+push on `main` only. It lasts a year; the
+  # rotation is tracked in lorenzolfm/homelab#431.
   sops.secrets."attic-push-token" = {
     owner = "lorenzo";
     mode = "0400";
@@ -49,6 +54,8 @@ in
         installables_of() {
           local names
           if names="$(nix eval --json "$flake#$1.$system" --apply builtins.attrNames 2>"$err")"; then
+            # Keep warnings such as "Git tree is dirty" visible.
+            cat "$err" >&2
             jq -r --arg prefix "$flake#$1.$system" '.[] | "\($prefix).\"\(.)\""' <<<"$names"
           elif grep -q "does not provide attribute" "$err"; then
             return 0
@@ -80,7 +87,7 @@ in
         # time, and none of them is in a check's runtime closure. attic skips
         # paths signed by cache.nixos.org and paths the cache already has.
         nix path-info --derivation "''${installables[@]}" \
-          | xargs nix-store --query --requisites --include-outputs \
+          | xargs -r nix-store --query --requisites --include-outputs \
           | grep -v '\.drv$' \
           | XDG_CONFIG_HOME=${atticConfigHome} attic push homelab:main --stdin
       '';

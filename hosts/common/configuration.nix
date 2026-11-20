@@ -34,8 +34,8 @@
       "main:4Zt9CH+9bGa5vSsFCdxOmqGjhItSREekmxJaB9wmgYY="
     ];
     # Off the tailnet (the Mac on the road) attic does not resolve. These two
-    # make that cost about 5 s, and the build then falls back to building
-    # locally instead of failing.
+    # cap that at about 5 s, after which the build runs locally instead of
+    # failing. They apply to every substituter, not only attic.
     connect-timeout = 5;
     fallback = true;
   };
