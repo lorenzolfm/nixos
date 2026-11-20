@@ -20,11 +20,24 @@
       "nix-command"
       "flakes"
     ];
-    # Prebuilt llm-agents packages (codex, pi).
-    extra-substituters = [ "https://cache.numtide.com" ];
+    extra-substituters = [
+      # Prebuilt llm-agents packages (codex, pi).
+      "https://cache.numtide.com"
+      # The homelab's attic cache (lorenzolfm/homelab#431): luneta and elo
+      # builds pushed by CI and by the desktop's cache-push. It resolves only
+      # on the tailnet. It reports priority 41, so cache.nixos.org (40) is
+      # still asked first.
+      "https://attic.tail174781.ts.net/main"
+    ];
     extra-trusted-public-keys = [
       "niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g="
+      "main:4Zt9CH+9bGa5vSsFCdxOmqGjhItSREekmxJaB9wmgYY="
     ];
+    # Off the tailnet (the Mac on the road) attic does not resolve. These two
+    # make that cost about 5 s, and the build then falls back to building
+    # locally instead of failing.
+    connect-timeout = 5;
+    fallback = true;
   };
 
   environment.systemPackages = with pkgs; [
