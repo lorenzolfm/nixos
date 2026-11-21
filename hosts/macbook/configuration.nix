@@ -119,6 +119,7 @@
   '';
 
   # Only what nixpkgs can't provide yet. mullvad-vpn has no macOS build there,
+  # obscura-vpn isn't packaged at all,
   # telegram is the native macOS app (nixpkgs has only Telegram Desktop), and
   # signal, spotify and whatsapp are behind the cask versions: installing them
   # from nixpkgs would downgrade them.
@@ -126,6 +127,7 @@
     enable = true;
     casks = [
       "mullvad-vpn"
+      "obscura-vpn"
       "signal"
       "spotify"
       "telegram"
