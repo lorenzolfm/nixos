@@ -8,6 +8,7 @@
 }:
 {
   imports = [
+    ./attic.nix
     ./claude-ps.nix
     ./luneta.nix
   ];
@@ -24,7 +25,7 @@
       # Prebuilt llm-agents packages (codex, pi).
       "https://cache.numtide.com"
       # The homelab's attic cache (lorenzolfm/homelab#431): luneta and elo
-      # builds pushed by CI and by the desktop's cache-push. It resolves only
+      # builds pushed by CI and by cache-push (./attic.nix). It resolves only
       # on the tailnet. It reports priority 41, so cache.nixos.org (40) is
       # still asked first.
       "https://attic.tail174781.ts.net/main"
