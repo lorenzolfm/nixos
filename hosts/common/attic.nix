@@ -1,7 +1,11 @@
-# `cache-push [flake]`: build a flake's checks and packages, then push them to
-# the homelab's attic cache (lorenzolfm/homelab#431) so CI and the other
-# machines can pull them instead of building. Run it on purpose, from luneta,
-# elo or another public flake; nothing pushes automatically.
+# `cache-push [flake [check...]]`: build a flake's checks and packages, then
+# push them to the homelab's attic cache (lorenzolfm/homelab#431) so CI and the
+# other machines can pull them instead of building. Run it on purpose, from
+# luneta, elo or another public flake; nothing pushes automatically.
+#
+# With check names, only checks.<system>.<name> is built, for each system, and
+# no packages: `cache-push . lunetad` is all luneta's CI asks for before it
+# skips a runner.
 #
 # Each machine pushes the systems it builds: the desktop x86_64-linux, the Mac
 # aarch64-darwin and, through its linux-builder (hosts/macbook/linux-builder.nix),
@@ -50,6 +54,7 @@ in
       ];
       text = ''
         flake="''${1:-.}"
+        named=("''${@:2}")
         systems=(${lib.escapeShellArgs systems})
 
         err="$(mktemp)"
@@ -74,6 +79,14 @@ in
 
         installables=()
         for system in "''${systems[@]}"; do
+          if [ "''${#named[@]}" -gt 0 ]; then
+            # Named checks are taken as given: one the flake lacks fails the
+            # eval below, rather than being skipped.
+            for name in "''${named[@]}"; do
+              installables+=("$flake#checks.$system.\"$name\"")
+            done
+            continue
+          fi
           for output in checks packages; do
             # A plain assignment, so set -e stops on an eval error; a process
             # substitution would hide it.
