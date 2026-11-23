@@ -59,6 +59,9 @@
       10.0.1.1 homelab.local
       10.0.1.9 homelab-1.local
       10.0.1.4 homelab-2.local
+      # Stable kube-apiserver endpoint (homelab#396). Points at the control-plane node;
+      # moving the control plane only changes this line, not every kubeconfig.
+      10.0.1.4 k8s-api.internal
     '';
     networkmanager.enable = true;
     nftables.enable = true;
