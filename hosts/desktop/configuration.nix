@@ -59,6 +59,8 @@
       10.0.1.1 homelab.local
       10.0.1.9 homelab-1.local
       10.0.1.4 homelab-2.local
+      # Kubernetes API (homelab #396). Moves to 10.0.1.4 with the control plane.
+      10.0.1.1 k8s.home.arpa
     '';
     networkmanager.enable = true;
     nftables.enable = true;
