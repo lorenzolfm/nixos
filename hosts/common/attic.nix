@@ -1,15 +1,15 @@
 # `cache-push [flake [check...]]`: build a flake's checks and packages, then
 # push them to the homelab's attic cache (lorenzolfm/homelab#431) so CI and the
 # other machines can pull them instead of building. Run it on purpose, from
-# luneta, elo or another public flake; nothing pushes automatically.
+# lune, elo or another public flake; nothing pushes automatically.
 #
 # With check names, only checks.<system>.<name> is built, for each system, and
-# no packages: `cache-push . lunetad` is all luneta's CI asks for before it
+# no packages: `cache-push . luned` is all lune's CI asks for before it
 # skips a runner.
 #
 # Each machine pushes the systems it builds: the desktop x86_64-linux, the Mac
 # aarch64-darwin and, through its linux-builder (hosts/macbook/linux-builder.nix),
-# aarch64-linux. luneta's CI skips a runner whose tested lunetad attic holds,
+# aarch64-linux. lune's CI skips a runner whose tested luned attic holds,
 # so running this on both machines covers all three of its runners.
 #
 # Public flakes only: cache `main` is world-readable on the tailnet, and the

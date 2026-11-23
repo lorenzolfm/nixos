@@ -484,7 +484,7 @@
         "type": "github"
       }
     },
-    "luneta": {
+    "lune": {
       "inputs": {
         "crane": "crane_4",
         "ghostty": "ghostty",
@@ -497,16 +497,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1795363401,
-        "narHash": "sha256-I0MBz040GDMpZbl5ORH+1k4ZXDYHpYgbR0s9NzREf6M=",
+        "lastModified": 1795453058,
+        "narHash": "sha256-72E4THN1QS/wNcDZAWrUBBvttWT0tFT8MFswQ0Pvr4Q=",
         "owner": "lorenzolfm",
-        "repo": "luneta",
-        "rev": "8deb01bb8019b0a185eb1b4dcf4dc9a9b5a04a37",
+        "repo": "lune",
+        "rev": "23dc7a2bcfef7e81912b082949218d0895eef691",
         "type": "github"
       },
       "original": {
         "owner": "lorenzolfm",
-        "repo": "luneta",
+        "repo": "lune",
         "type": "github"
       }
     },
@@ -773,7 +773,7 @@
         "claude-tray": "claude-tray",
         "darwin": "darwin",
         "llm-agents": "llm-agents",
-        "luneta": "luneta",
+        "lune": "lune",
         "mac-app-util": "mac-app-util",
         "nix-homebrew": "nix-homebrew",
         "nixpkgs": "nixpkgs_5",

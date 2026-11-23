@@ -57,8 +57,8 @@
       inputs.rust-overlay.follows = "rust-overlay";
     };
     # Pinned to a release; bump the tag to upgrade.
-    luneta = {
-      url = "github:lorenzolfm/luneta";
+    lune = {
+      url = "github:lorenzolfm/lune";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
     };
@@ -83,7 +83,7 @@
       claude-tray,
       claude-ps,
       claude-nav,
-      luneta,
+      lune,
       oss-board,
       ...
     }:
@@ -99,7 +99,7 @@
             claude-tray
             claude-ps
             claude-nav
-            luneta
+            lune
             oss-board
             ;
         };
@@ -118,7 +118,7 @@
             llm-agents
             wt
             claude-ps
-            luneta
+            lune
             ;
         };
         modules = [

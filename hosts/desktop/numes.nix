@@ -27,15 +27,15 @@ in
     (pkgs.writeShellScriptBin "numes-pi" ''
       set -euo pipefail
       export NUMES_API_KEY="$(cat ${config.sops.secrets."numes-api-key".path})"
-      # numes gives pi its own agent dir, so pi misses the luneta extension that
-      # lunetad keeps current in ~/.pi; without it these agents are invisible to
-      # luneta. Link the one file: the rest of ~/.pi's extensions are not for
+      # numes gives pi its own agent dir, so pi misses the lune extension that
+      # luned keeps current in ~/.pi; without it these agents are invisible to
+      # lune. Link the one file: the rest of ~/.pi's extensions are not for
       # numes. Done here, as the user, because tmpfiles would make any missing
       # parent dirs root-owned.
-      luneta_ext="$HOME/.pi/agent/extensions/luneta.ts"
-      if [ -e "$luneta_ext" ]; then
+      lune_ext="$HOME/.pi/agent/extensions/lune.ts"
+      if [ -e "$lune_ext" ]; then
         mkdir -p "$HOME/.local/share/numes/apps/pi/extensions"
-        ln -sfn "$luneta_ext" "$HOME/.local/share/numes/apps/pi/extensions/luneta.ts"
+        ln -sfn "$lune_ext" "$HOME/.local/share/numes/apps/pi/extensions/lune.ts"
       fi
       exec ${lib.getExe numes} run pi \
         --provider numes-org-cashu-devs \
