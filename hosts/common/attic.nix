@@ -1,8 +1,16 @@
-# `cache-push [flake]`: build a flake's checks and packages, then push them to
-# the homelab's attic cache (lorenzolfm/homelab#431) so CI and the Mac can pull
-# them instead of building. Run it on purpose, from luneta, elo or another
-# public flake; nothing pushes automatically. The Mac only pulls (see
-# hosts/common).
+# `cache-push [flake [check...]]`: build a flake's checks and packages, then
+# push them to the homelab's attic cache (lorenzolfm/homelab#431) so CI and the
+# other machines can pull them instead of building. Run it on purpose, from
+# luneta, elo or another public flake; nothing pushes automatically.
+#
+# With check names, only checks.<system>.<name> is built, for each system, and
+# no packages: `cache-push . lunetad` is all luneta's CI asks for before it
+# skips a runner.
+#
+# Each machine pushes the systems it builds: the desktop x86_64-linux, the Mac
+# aarch64-darwin and, through its linux-builder (hosts/macbook/linux-builder.nix),
+# aarch64-linux. luneta's CI skips a runner whose tested lunetad attic holds,
+# so running this on both machines covers all three of its runners.
 #
 # Public flakes only: cache `main` is world-readable on the tailnet, and the
 # push includes the flake's cleaned source.
@@ -13,7 +21,8 @@
   ...
 }:
 let
-  system = pkgs.stdenv.hostPlatform.system;
+  inherit (pkgs.stdenv.hostPlatform) system isDarwin;
+  systems = [ system ] ++ lib.optional isDarwin "aarch64-linux";
 
   # Nothing secret in here: attic reads the token from the sops file at run
   # time, so the token never reaches the store or ~/.config. The wrapper points
@@ -28,8 +37,9 @@ let
   '';
 in
 {
-  # Push token, sub `desktop`, pull+push on `main` only. It lasts a year; the
-  # rotation is tracked in lorenzolfm/homelab#431.
+  # Push token, sub `desktop`, pull+push on `main` only, the same token on both
+  # machines (each host's secrets.yaml). It lasts a year; the rotation is
+  # tracked in lorenzolfm/homelab#431.
   sops.secrets."attic-push-token" = {
     owner = "lorenzo";
     mode = "0400";
@@ -44,19 +54,21 @@ in
       ];
       text = ''
         flake="''${1:-.}"
-        system=${lib.escapeShellArg system}
+        named=("''${@:2}")
+        systems=(${lib.escapeShellArgs systems})
 
         err="$(mktemp)"
         trap 'rm -f "$err"' EXIT
 
-        # Prints the flake's installables under $1 (checks or packages). A flake
-        # without that output is fine; any other eval error stops the push.
+        # Prints the flake's installables under $1.$2 (checks or packages, then
+        # a system). A flake without that output is fine; any other eval error
+        # stops the push.
         installables_of() {
           local names
-          if names="$(nix eval --json "$flake#$1.$system" --apply builtins.attrNames 2>"$err")"; then
+          if names="$(nix eval --json "$flake#$1.$2" --apply builtins.attrNames 2>"$err")"; then
             # Keep warnings such as "Git tree is dirty" visible.
             cat "$err" >&2
-            jq -r --arg prefix "$flake#$1.$system" '.[] | "\($prefix).\"\(.)\""' <<<"$names"
+            jq -r --arg prefix "$flake#$1.$2" '.[] | "\($prefix).\"\(.)\""' <<<"$names"
           elif grep -q "does not provide attribute" "$err"; then
             return 0
           else
@@ -66,16 +78,26 @@ in
         }
 
         installables=()
-        for output in checks packages; do
-          # A plain assignment, so set -e stops on an eval error; a process
-          # substitution would hide it.
-          found="$(installables_of "$output")"
-          if [ -n "$found" ]; then
-            mapfile -t -O "''${#installables[@]}" installables <<<"$found"
+        for system in "''${systems[@]}"; do
+          if [ "''${#named[@]}" -gt 0 ]; then
+            # Named checks are taken as given: one the flake lacks fails the
+            # eval below, rather than being skipped.
+            for name in "''${named[@]}"; do
+              installables+=("$flake#checks.$system.\"$name\"")
+            done
+            continue
           fi
+          for output in checks packages; do
+            # A plain assignment, so set -e stops on an eval error; a process
+            # substitution would hide it.
+            found="$(installables_of "$output" "$system")"
+            if [ -n "$found" ]; then
+              mapfile -t -O "''${#installables[@]}" installables <<<"$found"
+            fi
+          done
         done
         if [ "''${#installables[@]}" -eq 0 ]; then
-          echo "cache-push: $flake has no checks or packages for $system" >&2
+          echo "cache-push: $flake has no checks or packages for ''${systems[*]}" >&2
           exit 1
         fi
 
@@ -86,7 +108,7 @@ in
         drvs_out="$(nix path-info --derivation "''${installables[@]}")"
         mapfile -t drvs <<<"$drvs_out"
 
-        echo "cache-push: building ''${#drvs[@]} derivations of $flake" >&2
+        echo "cache-push: building ''${#drvs[@]} derivations of $flake for ''${systems[*]}" >&2
         nix build --no-link "''${drvs[@]/%/^*}"
 
         # Push the whole build closure, not only the results: crane's deps-only

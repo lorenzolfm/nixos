@@ -10,7 +10,6 @@
     ./claude-nav.nix
     ./oss-board.nix
     ./numes.nix
-    ./attic.nix
     ./rgb.nix
     ./gaming.nix
   ];

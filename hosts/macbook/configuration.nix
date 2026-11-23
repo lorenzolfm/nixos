@@ -4,6 +4,8 @@
   imports = [
     ../common/configuration.nix
     ./display-arrangement.nix
+    ./linux-builder.nix
+    ./sops.nix
   ];
 
   system = {

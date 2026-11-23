@@ -148,6 +148,7 @@
             };
           }
           ./hosts/macbook/configuration.nix
+          sops-nix.darwinModules.sops
         ];
       };
     };
