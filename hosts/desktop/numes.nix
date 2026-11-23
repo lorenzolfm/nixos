@@ -32,6 +32,9 @@ in
       # lune. Link the one file: the rest of ~/.pi's extensions are not for
       # numes. Done here, as the user, because tmpfiles would make any missing
       # parent dirs root-owned.
+      # The link from before the rename of luneta to lune would load a second,
+      # stale extension.
+      rm -f "$HOME/.local/share/numes/apps/pi/extensions/luneta.ts"
       lune_ext="$HOME/.pi/agent/extensions/lune.ts"
       if [ -e "$lune_ext" ]; then
         mkdir -p "$HOME/.local/share/numes/apps/pi/extensions"

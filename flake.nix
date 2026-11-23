@@ -56,7 +56,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.rust-overlay.follows = "rust-overlay";
     };
-    # Pinned to a release; bump the tag to upgrade.
+    # Follows main; `nix flake update lune` to upgrade.
     lune = {
       url = "github:lorenzolfm/lune";
       inputs.nixpkgs.follows = "nixpkgs";
