@@ -56,7 +56,8 @@
   };
 
   # darwin-rebuild picks the flake config by LocalHostName, so this has to
-  # match darwinConfigurations.macbook for a bare `--flake ~/.config/nixos`.
+  # match darwinConfigurations.macbook for a bare `darwin-rebuild switch`,
+  # which reads the flake from /etc/nix-darwin -> ~/.config/nixos/main.
   networking = {
     hostName = "macbook";
     localHostName = "macbook";
