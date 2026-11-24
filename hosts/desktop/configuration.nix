@@ -68,7 +68,10 @@
       logRefusedConnections = true;
       interfaces = {
         tailscale0 = {
-          allowedTCPPorts = [ 22 ];
+          allowedTCPPorts = [
+            22
+            7473
+          ];
         };
         "br-*" = {
           allowedTCPPorts = [ 8000 ];
