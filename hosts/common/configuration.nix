@@ -22,7 +22,7 @@
       "flakes"
     ];
     extra-substituters = [
-      # Prebuilt llm-agents packages (codex, pi).
+      # Prebuilt llm-agents packages (antigravity-cli, codex, pi).
       "https://cache.numtide.com"
       # The homelab's attic cache (lorenzolfm/homelab#431): lune and elo
       # builds pushed by CI and by cache-push (./attic.nix). It resolves only
@@ -71,6 +71,7 @@
     jq
     kubectl
     kubeseal
+    llm-agents.packages.${pkgs.stdenv.hostPlatform.system}.antigravity-cli
     llm-agents.packages.${pkgs.stdenv.hostPlatform.system}.codex
     llm-agents.packages.${pkgs.stdenv.hostPlatform.system}.pi
     lua-language-server
