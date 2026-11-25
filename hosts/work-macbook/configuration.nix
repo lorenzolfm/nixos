@@ -9,7 +9,6 @@
 
   environment.systemPackages = [ pkgs.slack ];
 
-  # Not in nixpkgs.
   homebrew.casks = [ "granola" ];
 
   # Oneleet's agent checks the firewall (below) and the screen lock. Oneleet
