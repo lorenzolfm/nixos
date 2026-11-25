@@ -58,6 +58,7 @@
     diesel-cli
     direnv
     discord
+    (callPackage ../../pkgs/ephyra-cli { })
     eza
     gh
     # A real git ahead of /usr/bin/git on macOS. That one is Apple's xcrun shim,
