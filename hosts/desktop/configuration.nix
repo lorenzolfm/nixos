@@ -3,6 +3,7 @@
 {
   imports = [
     ../common/configuration.nix
+    ../common/attic.nix
     ./hardware-configuration.nix
     ./backup.nix
     ./scb-repo.nix

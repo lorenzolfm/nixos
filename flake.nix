@@ -109,47 +109,58 @@
         ];
       };
 
-      darwinConfigurations.macbook = darwin.lib.darwinSystem {
-        system = "aarch64-darwin";
-        specialArgs = {
-          inherit
-            claude-code
-            rust-overlay
-            llm-agents
-            wt
-            claude-ps
-            lune
-            ;
-        };
-        modules = [
-          {
-            nixpkgs.overlays = [
-              (_final: prev: {
-                direnv = prev.direnv.overrideAttrs { doCheck = false; };
-                # Nix builds unsandboxed on macOS, so these tests see every
-                # process on the Mac. Pi's liveness check takes any process it
-                # cannot read for a running Pi, and the tests fail.
-                atuin = prev.atuin.overrideAttrs (old: {
-                  checkFlags = (old.checkFlags or [ ]) ++ [
-                    "--skip=a_diverged_copy_resumes_only_as_chosen"
-                    "--skip=a_session_gone_on_with_elsewhere_catches_up_where_it_came_from"
+      darwinConfigurations =
+        let
+          mkDarwin =
+            hostModules:
+            darwin.lib.darwinSystem {
+              system = "aarch64-darwin";
+              specialArgs = {
+                inherit
+                  claude-code
+                  rust-overlay
+                  llm-agents
+                  wt
+                  claude-ps
+                  lune
+                  ;
+              };
+              modules = [
+                {
+                  nixpkgs.overlays = [
+                    (_final: prev: {
+                      direnv = prev.direnv.overrideAttrs { doCheck = false; };
+                      # Nix builds unsandboxed on macOS, so these tests see every
+                      # process on the Mac. Pi's liveness check takes any process it
+                      # cannot read for a running Pi, and the tests fail.
+                      atuin = prev.atuin.overrideAttrs (old: {
+                        checkFlags = (old.checkFlags or [ ]) ++ [
+                          "--skip=a_diverged_copy_resumes_only_as_chosen"
+                          "--skip=a_session_gone_on_with_elsewhere_catches_up_where_it_came_from"
+                        ];
+                      });
+                    })
                   ];
-                });
-              })
-            ];
-          }
-          mac-app-util.darwinModules.default
-          nix-homebrew.darwinModules.nix-homebrew
-          {
-            nix-homebrew = {
-              enable = true;
-              enableRosetta = true;
-              user = "lorenzo";
+                }
+                mac-app-util.darwinModules.default
+                nix-homebrew.darwinModules.nix-homebrew
+                {
+                  nix-homebrew = {
+                    enable = true;
+                    enableRosetta = true;
+                    user = "lorenzo";
+                  };
+                }
+              ]
+              ++ hostModules;
             };
-          }
-          ./hosts/macbook/configuration.nix
-          sops-nix.darwinModules.sops
-        ];
-      };
+        in
+        {
+          macbook = mkDarwin [
+            ./hosts/macbook/configuration.nix
+            sops-nix.darwinModules.sops
+          ];
+          work-macbook = mkDarwin [ ./hosts/work-macbook/configuration.nix ];
+        };
     };
 }

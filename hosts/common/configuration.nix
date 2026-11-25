@@ -8,7 +8,6 @@
 }:
 {
   imports = [
-    ./attic.nix
     ./claude-ps.nix
     ./lune.nix
   ];
