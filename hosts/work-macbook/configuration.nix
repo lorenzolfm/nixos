@@ -7,7 +7,10 @@
     ../darwin/configuration.nix
   ];
 
-  environment.systemPackages = [ pkgs.slack ];
+  environment.systemPackages = [
+    pkgs.awscli2
+    pkgs.slack
+  ];
 
   homebrew.casks = [ "granola" ];
 
