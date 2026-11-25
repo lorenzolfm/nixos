@@ -9,6 +9,9 @@
 
   environment.systemPackages = [ pkgs.slack ];
 
+  # Not in nixpkgs.
+  homebrew.casks = [ "granola" ];
+
   # Oneleet's agent checks the firewall (below) and the screen lock. Oneleet
   # itself is installed from its own .pkg: it is in neither nixpkgs nor
   # Homebrew, and it runs root daemons and updates itself.
