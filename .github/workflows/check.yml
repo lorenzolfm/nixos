@@ -24,6 +24,8 @@ jobs:
             attr: nixosConfigurations.nixos.config.system.build.toplevel
           - host: macbook
             attr: darwinConfigurations.macbook.system
+          - host: work-macbook
+            attr: darwinConfigurations.work-macbook.system
     name: eval ${{ matrix.host }}
     steps:
       - uses: actions/checkout@v4
