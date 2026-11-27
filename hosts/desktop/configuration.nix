@@ -4,6 +4,7 @@
   imports = [
     ../common/configuration.nix
     ../common/attic.nix
+    ../common/colab-llm.nix
     ./hardware-configuration.nix
     ./backup.nix
     ./scb-repo.nix

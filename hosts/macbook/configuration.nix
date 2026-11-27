@@ -3,6 +3,7 @@
   imports = [
     ../darwin/configuration.nix
     ../common/attic.nix
+    ../common/colab-llm.nix
     ./linux-builder.nix
     ./sops.nix
   ];
