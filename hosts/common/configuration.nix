@@ -89,6 +89,7 @@
     stow
     svelte-language-server
     tailscale
+    (callPackage ../../pkgs/terminal-browser { })
     tree-sitter
     typescript-language-server
     vscode-langservers-extracted
