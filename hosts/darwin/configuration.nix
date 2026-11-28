@@ -5,6 +5,7 @@
 {
   imports = [
     ../common/configuration.nix
+    ./disk-cleanup.nix
     ./display-arrangement.nix
   ];
 
