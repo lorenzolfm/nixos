@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "colab-llm"
+version = "0.1.0"
+description = "Auditable, zero-idle on-demand LLM inference launcher for Google Colab G4 runtimes"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+colab-llm = "colab_llm.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["colab_llm"]
