@@ -1,7 +1,7 @@
 {
   lib,
-  stdenvNoCC,
-  python3,
+  stdenv,
+  rustPlatform,
   makeWrapper,
   nix,
   libnotify,
@@ -15,35 +15,32 @@ let
   runtimeBinPaths = [
     nix
   ]
-  ++ lib.optional stdenvNoCC.hostPlatform.isLinux libnotify
-  ++ lib.optional stdenvNoCC.hostPlatform.isDarwin terminal-notifier;
+  ++ lib.optional stdenv.hostPlatform.isLinux libnotify
+  ++ lib.optional stdenv.hostPlatform.isDarwin terminal-notifier;
 in
-stdenvNoCC.mkDerivation {
+rustPlatform.buildRustPackage {
   pname = "disk-cleanup";
   version = "0.1.0";
 
-  src = ./.;
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [
+      ./Cargo.toml
+      ./Cargo.lock
+      ./src
+      ./tests
+    ];
+  };
+
+  cargoLock.lockFile = ./Cargo.lock;
 
   nativeBuildInputs = [
     makeWrapper
-    python3
   ];
 
-  doCheck = true;
-  checkPhase = ''
-    runHook preCheck
-    python3 -m unittest discover -s . -v
-    runHook postCheck
-  '';
-
-  installPhase = ''
-    runHook preInstall
-    install -Dm755 disk_cleanup.py $out/libexec/disk-cleanup/disk_cleanup.py
-    mkdir -p $out/bin
-    makeWrapper ${lib.getExe python3} $out/bin/disk-cleanup \
-      --add-flags "$out/libexec/disk-cleanup/disk_cleanup.py" \
+  postInstall = ''
+    wrapProgram $out/bin/disk-cleanup \
       --prefix PATH : ${lib.makeBinPath runtimeBinPaths}
-    runHook postInstall
   '';
 
   meta = {

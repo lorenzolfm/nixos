@@ -35,4 +35,11 @@ in
     StandardOutPath = "/var/log/disk-cleanup.log";
     StandardErrorPath = "/var/log/disk-cleanup.log";
   };
+
+  # Bound /var/log/disk-cleanup.log via macOS newsyslog (rotate at 1 MiB,
+  # keep 3 gzipped archives, N = no daemon to signal for a oneshot job).
+  environment.etc."newsyslog.d/disk-cleanup.conf".text = ''
+    # logfilename              [owner:group]  mode count size  when  flags
+    /var/log/disk-cleanup.log  root:wheel     644  3     1024  *     ZN
+  '';
 }
