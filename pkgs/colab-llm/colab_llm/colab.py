@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from colab_llm.config import (
+    Attach,
     validate_loopback_host,
     validate_port,
     validate_session_name,
@@ -22,8 +23,8 @@ from colab_llm.config import (
 
 SSH_HOST = "root@colab-runtime"
 _DEFAULT_KEY_CANDIDATES = ("id_ed25519", "id_ecdsa")
-# Colab rejects `shape=hm` (HTTP 400) on single-shape GPU tiers such as G4 and L4.
-_SINGLE_SHAPE_GPUS = frozenset({"G4", "L4"})
+# How `colab sessions` prints a server assignment no local session name tracks.
+_UNNAMED_SESSION_LABEL = "?"
 
 _BALANCE_RE = re.compile(r"Current balance:\s*([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 _RATE_RE = re.compile(r"Usage rate:\s*([0-9]+(?:\.[0-9]+)?)/hr", re.IGNORECASE)
@@ -49,8 +50,10 @@ class UsageSnapshot:
 
 @dataclass(frozen=True)
 class ColabSessionInfo:
-    name: str
+    # None for a server assignment that no local session name tracks.
+    name: str | None
     endpoint: str
+    # Upper-cased once when parsed, so it compares directly with a validated GPU.
     hardware: str
     shape: str
     variant: str
@@ -86,11 +89,12 @@ def parse_sessions_output(text: str) -> list[ColabSessionInfo]:
             if line.startswith("[colab]"):
                 continue
             raise ColabError(f"Could not parse `colab sessions` line: {line!r}")
+        name = match.group("name").strip()
         sessions.append(
             ColabSessionInfo(
-                name=match.group("name").strip(),
+                name=None if name == _UNNAMED_SESSION_LABEL else name,
                 endpoint=match.group("endpoint").strip(),
-                hardware=match.group("hardware").strip(),
+                hardware=match.group("hardware").strip().upper(),
                 shape=match.group("shape").strip(),
                 variant=match.group("variant").strip(),
                 status=match.group("status").strip() if match.group("status") else None,
@@ -413,6 +417,12 @@ class ColabClient:
 
         Registers the endpoint with an empty token and lets `colab sessions`
         refresh the live runtime proxy token/URL via official `list_assignments()`.
+
+        Known weakness: sessions.json belongs to google-colab-cli, which has no
+        attach command and no lock. This read-modify-replace can lose an update
+        the CLI makes at the same moment, so do not run `colab` concurrently
+        with an attach. A file that is not the expected JSON object is left
+        untouched and reported.
         """
         validate_session_name(session)
         listed = self.list_sessions()
@@ -420,7 +430,7 @@ class ColabClient:
         # Already tracked under this session name?
         for item in listed:
             if item.name == session:
-                if item.hardware.upper() != gpu.upper():
+                if item.hardware != gpu:
                     raise ColabError(
                         f"Session {session!r} already exists on hardware {item.hardware!r}, "
                         f"not requested {gpu!r}."
@@ -435,14 +445,14 @@ class ColabClient:
                     "Allocate a runtime first in https://colab.research.google.com."
                 )
             target = candidates[0]
-            if target.hardware.upper() != gpu.upper():
+            if target.hardware != gpu:
                 raise ColabError(
                     f"Endpoint {endpoint!r} has hardware {target.hardware!r}, "
                     f"not requested {gpu!r}."
                 )
         else:
             candidates = [
-                s for s in listed if s.name == "?" and s.hardware.upper() == gpu.upper()
+                s for s in listed if s.name is None and s.hardware == gpu
             ]
             if not candidates:
                 raise ColabError(
@@ -464,9 +474,16 @@ class ColabClient:
         if sessions_path.is_file():
             raw = sessions_path.read_text(encoding="utf-8").strip()
             if raw:
-                loaded = json.loads(raw)
-                if isinstance(loaded, dict):
-                    existing_data = loaded
+                try:
+                    loaded = json.loads(raw)
+                except ValueError as exc:
+                    raise ColabError(f"{sessions_path} is not valid JSON: {exc}") from exc
+                if not isinstance(loaded, dict):
+                    # Replacing it would erase every session the CLI tracks.
+                    raise ColabError(
+                        f"{sessions_path} is not a JSON object; refusing to overwrite it."
+                    )
+                existing_data = loaded
 
         shape_enum = "HIGH_RAM" if "high" in target.shape.lower() else "STANDARD"
         existing_data[session] = {
@@ -476,7 +493,7 @@ class ColabClient:
             "endpoint": target.endpoint,
             "token_expires_at": None,
             "variant": target.variant.upper(),
-            "accelerator": target.hardware.upper(),
+            "accelerator": target.hardware,
             "machine_shape": shape_enum,
             "kernel_id": None,
             "session_id": None,
@@ -513,26 +530,25 @@ class ColabClient:
         session: str,
         gpu: str,
         high_mem: bool = False,
-        attach: bool = False,
-        attach_endpoint: str | None = None,
+        attach: Attach | None = None,
     ) -> tuple[ColabSessionInfo, bool]:
         """Ensure a Colab session with the requested GPU exists.
 
         Returns (session_info, created). Refuses to silently reuse a session
         allocated with a different accelerator.
         """
-        if attach or attach_endpoint is not None:
+        if attach is not None:
             info = self.attach_session(
                 session=session,
                 gpu=gpu,
-                endpoint=attach_endpoint,
+                endpoint=attach.endpoint,
             )
             return info, False
 
         existing = {s.name: s for s in self.list_sessions()}
         if session in existing:
             info = existing[session]
-            if info.hardware.upper() != gpu.upper():
+            if info.hardware != gpu:
                 raise ColabError(
                     f"Session {session!r} already exists on hardware {info.hardware!r}, "
                     f"not requested {gpu!r}. Stop it first with "
@@ -540,8 +556,9 @@ class ColabClient:
                 )
             return info, False
 
+        # `LaunchConfig` already refuses --high-mem on single-shape GPUs.
         args = ["new", "-s", session, "--gpu", gpu]
-        if high_mem and gpu.upper() not in _SINGLE_SHAPE_GPUS:
+        if high_mem:
             args.append("--high-mem")
         # From here a billable runtime may exist. Any failure, including Ctrl+C,
         # must stop it before propagating: the caller has no session to clean up.
@@ -572,7 +589,7 @@ class ColabClient:
                 f"Session {session!r} was created but did not appear in `colab sessions`."
             )
         info = after[session]
-        if info.hardware.upper() != gpu.upper():
+        if info.hardware != gpu:
             raise ColabError(
                 f"Session {session!r} was created on hardware {info.hardware!r}, "
                 f"not requested {gpu!r}."
@@ -590,24 +607,12 @@ class ColabClient:
                 file=sys.stderr,
             )
 
-    def stop_session(self, session: str) -> bool:
-        """Stop a single session idempotently. Returns True if a session was stopped."""
-        validate_session_name(session)
-        existing = {s.name for s in self.list_sessions()}
-        if session not in existing:
-            return False
-        self._run_colab(["stop", "-s", session], capture=False, timeout=120)
-        remaining = {s.name for s in self.list_sessions()}
-        if session in remaining:
-            raise ColabError(f"Session {session!r} is still listed after `colab stop`.")
-        return True
-
     def teardown_session(self, session: str) -> None:
-        """Billing-safety stop: always issue `colab stop`, then verify it took effect.
+        """The one way to stop a session: always issue `colab stop`, then verify.
 
-        Unlike `stop_session`, this never trusts a prior listing to decide
-        whether a stop is needed. Stopping an absent session is harmless;
-        skipping the stop of a present one is not.
+        It never consults a listing first to decide whether a stop is needed.
+        Stopping an absent session is harmless; skipping the stop of a present
+        one is not, and a listing that fails to parse must not prevent the stop.
         """
         validate_session_name(session)
         stop = self._run_colab(["stop", "-s", session], check=False, timeout=120)
@@ -624,16 +629,16 @@ class ColabClient:
         # `colab stop --all` only stops locally tracked sessions; also clean up
         # any remaining unnamed (`[?]`) server assignments (e.g. Web UI tabs).
         for index, leftover in enumerate(self.list_sessions()):
-            if leftover.name == "?":
+            if leftover.name is None:
                 cleanup_name = f"colab-llm-cleanup-{index}"
                 self.attach_session(
                     session=cleanup_name,
                     gpu=leftover.hardware,
                     endpoint=leftover.endpoint,
                 )
-                self.stop_session(cleanup_name)
+                self.teardown_session(cleanup_name)
             else:
-                self.stop_session(leftover.name)
+                self.teardown_session(leftover.name)
 
     def ssh_exec(
         self,

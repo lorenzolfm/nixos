@@ -3,6 +3,7 @@
   python3Packages,
   google-colab-cli,
   openssh,
+  mypy,
   ruff,
   shellcheck,
 }:
@@ -45,6 +46,7 @@ python3Packages.buildPythonApplication {
 
   nativeCheckInputs = [
     python3Packages.pytestCheckHook
+    mypy
     ruff
     shellcheck
   ];
@@ -53,6 +55,8 @@ python3Packages.buildPythonApplication {
   postCheck = ''
     shellcheck engines/*.sh
     ruff check colab_llm engines/deadman.py tests
+    # Without a checker the sum types and `assert_never` branches are comments.
+    mypy --strict colab_llm
     HOME="$TMPDIR" "$out/bin/colab-llm" --help > /dev/null
     HOME="$TMPDIR" "$out/bin/colab-llm" engines > /dev/null
   '';
@@ -64,6 +68,7 @@ python3Packages.buildPythonApplication {
     "colab_llm.config"
     "colab_llm.engines"
     "colab_llm.proxy"
+    "colab_llm.state"
   ];
 
   meta = {

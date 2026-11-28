@@ -18,6 +18,8 @@ BOOTSTRAP_PID_FILE="${WORK_DIR}/bootstrap.pid"
 DEADMAN_PID_FILE="${WORK_DIR}/deadman.pid"
 HEARTBEAT_FILE="${WORK_DIR}/heartbeat"
 HF_TOKEN_PATH="${WORK_DIR}/.hf_token"
+# Identifies the launch values the running server was started from.
+FINGERPRINT_FILE="${WORK_DIR}/server.fingerprint"
 
 # Every value is set by the launcher (colab_llm/engines.py). There are no
 # defaults here on purpose: a fallback would only ever hide a launcher bug by
@@ -25,6 +27,7 @@ HF_TOKEN_PATH="${WORK_DIR}/.hf_token"
 ENGINE_NAME="${COLAB_LLM_ENGINE:?}"
 REMOTE_PORT="${COLAB_LLM_REMOTE_PORT:?}"
 CONTEXT_LENGTH="${COLAB_LLM_CONTEXT_LENGTH:?}"
+CONFIG_FINGERPRINT="${COLAB_LLM_CONFIG_FINGERPRINT:?}"
 BOOTSTRAP_TIMEOUT_S="${COLAB_LLM_BOOTSTRAP_TIMEOUT_S:?}"
 BOOTSTRAP_HEARTBEAT_INTERVAL_S="${COLAB_LLM_BOOTSTRAP_HEARTBEAT_INTERVAL_S:?}"
 DEADMAN_HEARTBEAT_TIMEOUT_S="${COLAB_LLM_DEADMAN_HEARTBEAT_TIMEOUT_S:?}"
@@ -93,6 +96,14 @@ server_is_healthy() {
   curl -fsS --max-time 2 "http://127.0.0.1:${REMOTE_PORT}/health" >/dev/null 2>&1
 }
 
+# A healthy server is only the requested one if it was started from the same
+# engine, model and options. Without this, a different `start` would reuse it
+# and report a model that is not the one being served.
+server_matches_config() {
+  [[ -f "${FINGERPRINT_FILE}" ]] || return 1
+  [[ "$(cat "${FINGERPRINT_FILE}")" == "${CONFIG_FINGERPRINT}" ]]
+}
+
 # Start the remote deadman and refuse to continue without it: a bootstrap with
 # no watchdog is a runtime that nothing will stop if the workstation vanishes.
 start_deadman() {
@@ -135,13 +146,17 @@ bootstrap_begin() {
   mkdir -p "${WORK_DIR}"
 
   if [[ "${RECONFIGURE}" != "1" ]] && server_is_healthy; then
-    log "Server already healthy on 127.0.0.1:${REMOTE_PORT}; reusing it under a fresh deadman."
-    stop_pid_file "${DEADMAN_PID_FILE}"
-    start_deadman
-    exit 0
+    if server_matches_config; then
+      log "Server already healthy on 127.0.0.1:${REMOTE_PORT}; reusing it under a fresh deadman."
+      stop_pid_file "${DEADMAN_PID_FILE}"
+      start_deadman
+      exit 0
+    fi
+    log "A healthy server is running from a different configuration; replacing it."
   fi
 
   stop_pid_file "${PID_FILE}"
+  rm -f "${FINGERPRINT_FILE}"
   stop_pid_file "${DEADMAN_PID_FILE}"
 
   echo "$$" > "${BOOTSTRAP_PID_FILE}"
@@ -186,5 +201,6 @@ bootstrap_finish() {
     tail -n 40 "${LOG_FILE}" >&2 || true
     exit 1
   fi
+  printf '%s\n' "${CONFIG_FINGERPRINT}" > "${FINGERPRINT_FILE}"
   log "${ENGINE_NAME} launched (pid=${server_pid}); local supervisor will poll /health over the SSH tunnel."
 }

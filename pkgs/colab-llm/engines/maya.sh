@@ -12,11 +12,12 @@ MODELS_DIR="${WORK_DIR}/models"
 HF_VENV="${WORK_DIR}/.hf-venv"
 
 # `:?` requires a non-empty value; `?` only requires the variable to be set,
-# for the two that are legitimately empty when no HF prefetch applies.
+# for the ones that are legitimately empty: the model name when a custom repo
+# is served, and the repo and revision when no HF prefetch applies.
 MAYA_REPO_URL="${MAYA_REPO_URL:?}"
 MAYA_PINNED_TAG="${MAYA_PINNED_TAG:?}"
 MAYA_PINNED_COMMIT="${MAYA_PINNED_COMMIT:?}"
-MAYA_MODEL="${MAYA_MODEL:?}"
+MAYA_MODEL="${MAYA_MODEL?}"
 MAYA_DRAFT="${MAYA_DRAFT:?}"
 MAYA_PARALLEL="${MAYA_PARALLEL:?}"
 MAYA_VISION="${MAYA_VISION:?}"
@@ -27,6 +28,20 @@ MAYA_HF_REVISION="${MAYA_HF_REVISION?}"
 MAYA_CUSTOM_MODEL_DIR="${MAYA_CUSTOM_MODEL_DIR:?}"
 HF_HUB_PINNED_VERSION="${HF_HUB_PINNED_VERSION:?}"
 HF_TRANSFER_PINNED_VERSION="${HF_TRANSFER_PINNED_VERSION:?}"
+
+# Exactly one model source: a custom repo, or a named Maya model.
+case "${MAYA_CUSTOM_MODEL_DIR}" in
+  1)
+    [[ -n "${MAYA_HF_REPO}" && -z "${MAYA_MODEL}" ]] \
+      || die "a custom model needs MAYA_HF_REPO and no MAYA_MODEL"
+    ;;
+  0)
+    [[ -n "${MAYA_MODEL}" ]] || die "MAYA_MODEL is required without a custom model"
+    ;;
+  *)
+    die "unsupported MAYA_CUSTOM_MODEL_DIR=${MAYA_CUSTOM_MODEL_DIR}"
+    ;;
+esac
 
 bootstrap_begin
 mkdir -p "${MODELS_DIR}"

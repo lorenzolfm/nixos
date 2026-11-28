@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+import signal
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import assert_never
 
 DEFAULT_SESSION = "colab-llm"
 DEFAULT_GPU = "G4"
 ALLOWED_GPUS = ("G4", "A100", "H100", "L4", "T4")
+# Colab rejects `shape=hm` (HTTP 400) on single-shape GPU tiers.
+SINGLE_SHAPE_GPUS = frozenset({"G4", "L4"})
+assert SINGLE_SHAPE_GPUS <= set(ALLOWED_GPUS)
 
 # Colab AUP guardrail: bind strictly to loopback so endpoints are never exposed
 # publicly or accidentally bound to wildcard interfaces.
@@ -44,12 +49,27 @@ DEADMAN_DURATION_GRACE_S = 300
 assert HEARTBEAT_INTERVAL_S * 2 <= DEADMAN_HEARTBEAT_GRACE_S
 assert BOOTSTRAP_HEARTBEAT_INTERVAL_S <= HEARTBEAT_INTERVAL_S
 
-DEFAULT_ENGINE = "maya"
-ALLOWED_ENGINES = ("maya", "vllm", "llama-cpp", "sglang")
+class Engine(StrEnum):
+    MAYA = "maya"
+    VLLM = "vllm"
+    LLAMA_CPP = "llama-cpp"
+    SGLANG = "sglang"
+
+
+class Draft(StrEnum):
+    """Project Maya drafting mode."""
+
+    DFLASH2 = "dflash2"
+    MTP = "mtp"
+    OFF = "off"
+
+
+DEFAULT_ENGINE = Engine.MAYA
+ALLOWED_ENGINES = tuple(engine.value for engine in Engine)
 
 DEFAULT_MAYA_MODEL = "EXL3-3.05bpw"
-DEFAULT_MAYA_DRAFT = "dflash2"
-ALLOWED_MAYA_DRAFTS = ("dflash2", "mtp", "off")
+DEFAULT_MAYA_DRAFT = Draft.DFLASH2
+ALLOWED_MAYA_DRAFTS = tuple(draft.value for draft in Draft)
 DEFAULT_CONTEXT_LENGTH = 131072
 CONTEXT_LENGTH_MIN = 4096
 CONTEXT_LENGTH_MAX = 1048576
@@ -58,13 +78,13 @@ PARALLEL_MAX = 8
 
 # Model used when neither --model nor --hf-repo is given, per engine. Resolved at
 # config construction so a missing model can never surface after GPU allocation.
-DEFAULT_ENGINE_MODELS: dict[str, str] = {
-    "maya": DEFAULT_MAYA_MODEL,
-    "vllm": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
-    "llama-cpp": "unsloth/GLM-5.3-Flash-GGUF:UD-IQ2_XXS",
-    "sglang": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+DEFAULT_ENGINE_MODELS: dict[Engine, str] = {
+    Engine.MAYA: DEFAULT_MAYA_MODEL,
+    Engine.VLLM: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    Engine.LLAMA_CPP: "unsloth/GLM-5.3-Flash-GGUF:UD-IQ2_XXS",
+    Engine.SGLANG: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
 }
-assert set(DEFAULT_ENGINE_MODELS) == set(ALLOWED_ENGINES)
+assert set(DEFAULT_ENGINE_MODELS) == set(Engine)
 
 # Pinned Project Maya upstream release (audited commit SHA).
 MAYA_REPO_URL = "https://github.com/mw00/project-maya.git"
@@ -111,11 +131,36 @@ class StopReason(StrEnum):
     TUNNEL_DISCONNECTED = "tunnel_disconnected"
 
 
+SIGNAL_STOP_REASONS: dict[signal.Signals, StopReason] = {
+    signal.SIGINT: StopReason.SIGNAL_SIGINT,
+    signal.SIGTERM: StopReason.SIGNAL_SIGTERM,
+    signal.SIGHUP: StopReason.SIGNAL_SIGHUP,
+}
+
+
+def exit_code_for(stop_reason: StopReason, *, was_ready: bool) -> int:
+    """Process exit code for a finished session. Total: every reason is decided here."""
+    match stop_reason:
+        case StopReason.SIGNAL_SIGINT | StopReason.SIGNAL_SIGTERM | StopReason.SIGNAL_SIGHUP:
+            return 0
+        case StopReason.IDLE_TIMEOUT | StopReason.MAX_DURATION:
+            return 0
+        case StopReason.TUNNEL_DISCONNECTED:
+            # A tunnel that never carried a ready engine is a failed start.
+            return 0 if was_ready else 1
+        case StopReason.HEALTH_TIMEOUT | StopReason.REMOTE_PROCESS_EXITED | StopReason.ERROR:
+            return 1
+        case _:
+            assert_never(stop_reason)
+
+
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _DURATION_TOKEN_RE = re.compile(r"(\d+)\s*([hms]?)", re.IGNORECASE)
 _HF_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _HF_REV_RE = re.compile(r"^[A-Za-z0-9_./-]{1,128}$")
 _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9_./:-]{1,200}$")
+# What `llama-server -hf` accepts: owner/repo with an optional quant tag.
+_GGUF_MODEL_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(:[A-Za-z0-9_.-]+)?$")
 
 
 def validate_session_name(name: str) -> str:
@@ -259,20 +304,181 @@ def resolve_hf_token(token_file: Path | None = None) -> str | None:
     return env_token or None
 
 
+def _validate_parallel(parallel: int) -> None:
+    if not (1 <= parallel <= PARALLEL_MAX):
+        raise ValueError(f"parallel={parallel} out of bounds [1, {PARALLEL_MAX}]")
+
+
+@dataclass(frozen=True)
+class HfModel:
+    """A Hugging Face repository, optionally pinned to a branch, tag or commit."""
+
+    repo: str
+    revision: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _HF_REPO_RE.fullmatch(self.repo):
+            raise ValueError(f"Invalid Hugging Face repo {self.repo!r}: expected 'owner/repo'")
+        if self.revision is not None and not _HF_REV_RE.fullmatch(self.revision):
+            raise ValueError(f"Invalid Hugging Face revision: {self.revision!r}")
+
+
+# One variant per engine, each holding only the options that engine has. An
+# option for the wrong engine is therefore not a value that can be built.
+
+
+@dataclass(frozen=True)
+class MayaConfig:
+    # A named Maya quant, or a custom EXL3 repo served from its own directory.
+    model: str | HfModel = DEFAULT_MAYA_MODEL
+    draft: Draft = DEFAULT_MAYA_DRAFT
+    parallel: int = DEFAULT_PARALLEL
+    vision: bool = True
+    web_ui: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.model, str) and not _MODEL_NAME_RE.fullmatch(self.model):
+            raise ValueError(f"Invalid model identifier: {self.model!r}")
+        _validate_parallel(self.parallel)
+
+    @property
+    def kind(self) -> Engine:
+        return Engine.MAYA
+
+    @property
+    def served_model(self) -> str:
+        return self.model.repo if isinstance(self.model, HfModel) else self.model
+
+
+@dataclass(frozen=True)
+class VllmConfig:
+    model: HfModel = field(default_factory=lambda: HfModel(DEFAULT_ENGINE_MODELS[Engine.VLLM]))
+
+    @property
+    def kind(self) -> Engine:
+        return Engine.VLLM
+
+    @property
+    def served_model(self) -> str:
+        return self.model.repo
+
+
+@dataclass(frozen=True)
+class LlamaCppConfig:
+    # `owner/repo[:quant]`, as taken by `llama-server -hf`. It has no revision.
+    model: str = DEFAULT_ENGINE_MODELS[Engine.LLAMA_CPP]
+    parallel: int = DEFAULT_PARALLEL
+
+    def __post_init__(self) -> None:
+        if not _GGUF_MODEL_RE.fullmatch(self.model):
+            raise ValueError(
+                f"Invalid GGUF model {self.model!r}: expected 'owner/repo' or 'owner/repo:quant'"
+            )
+        _validate_parallel(self.parallel)
+
+    @property
+    def kind(self) -> Engine:
+        return Engine.LLAMA_CPP
+
+    @property
+    def served_model(self) -> str:
+        return self.model
+
+
+@dataclass(frozen=True)
+class SglangConfig:
+    model: HfModel = field(default_factory=lambda: HfModel(DEFAULT_ENGINE_MODELS[Engine.SGLANG]))
+
+    @property
+    def kind(self) -> Engine:
+        return Engine.SGLANG
+
+    @property
+    def served_model(self) -> str:
+        return self.model.repo
+
+
+EngineConfig = MayaConfig | VllmConfig | LlamaCppConfig | SglangConfig
+
+
+def build_engine_config(
+    engine: Engine,
+    *,
+    model: str | None = None,
+    hf_repo: str | None = None,
+    hf_revision: str | None = None,
+    draft: str | None = None,
+    parallel: int | None = None,
+    no_vision: bool = False,
+    web_ui: bool = False,
+) -> EngineConfig:
+    """Parse the engine flags of `start` into the one variant they describe.
+
+    `None` and `False` mean the flag was not given. A flag the chosen engine
+    does not have is rejected by name instead of being dropped.
+    """
+
+    def reject(**flags: object) -> None:
+        for name, value in flags.items():
+            if value is not None and value is not False:
+                flag = "--" + name.replace("_", "-")
+                raise ValueError(f"{flag} does not apply to --engine {engine.value}")
+
+    if model is not None and hf_repo is not None:
+        raise ValueError("--model and --hf-repo both name the model to serve: pass only one")
+
+    match engine:
+        case Engine.MAYA:
+            if hf_revision is not None and hf_repo is None:
+                raise ValueError("--hf-revision requires --hf-repo")
+            maya_model: str | HfModel = DEFAULT_MAYA_MODEL
+            if hf_repo is not None:
+                maya_model = HfModel(hf_repo, hf_revision)
+            elif model is not None:
+                maya_model = model
+            return MayaConfig(
+                model=maya_model,
+                draft=Draft(draft) if draft is not None else DEFAULT_MAYA_DRAFT,
+                parallel=parallel if parallel is not None else DEFAULT_PARALLEL,
+                vision=not no_vision,
+                web_ui=web_ui,
+            )
+        case Engine.VLLM:
+            reject(draft=draft, parallel=parallel, no_vision=no_vision, web_ui=web_ui)
+            repo = model or hf_repo or DEFAULT_ENGINE_MODELS[engine]
+            return VllmConfig(model=HfModel(repo, hf_revision))
+        case Engine.SGLANG:
+            reject(draft=draft, parallel=parallel, no_vision=no_vision, web_ui=web_ui)
+            repo = model or hf_repo or DEFAULT_ENGINE_MODELS[engine]
+            return SglangConfig(model=HfModel(repo, hf_revision))
+        case Engine.LLAMA_CPP:
+            reject(hf_revision=hf_revision, draft=draft, no_vision=no_vision, web_ui=web_ui)
+            return LlamaCppConfig(
+                model=model or hf_repo or DEFAULT_ENGINE_MODELS[engine],
+                parallel=parallel if parallel is not None else DEFAULT_PARALLEL,
+            )
+        case _:
+            assert_never(engine)
+
+
+@dataclass(frozen=True)
+class Attach:
+    """Adopt an existing Colab runtime instead of allocating one.
+
+    `endpoint` names the runtime; None means the single unnamed runtime with
+    the requested GPU.
+    """
+
+    endpoint: str | None = None
+
+
 @dataclass(frozen=True)
 class LaunchConfig:
     session: str = DEFAULT_SESSION
     gpu: str = DEFAULT_GPU
     high_mem: bool = False
-    engine: str = DEFAULT_ENGINE
-    model: str | None = None
-    hf_repo: str | None = None
-    hf_revision: str | None = None
-    draft: str = DEFAULT_MAYA_DRAFT
+    engine: EngineConfig = field(default_factory=MayaConfig)
     context_length: int = DEFAULT_CONTEXT_LENGTH
-    parallel: int = DEFAULT_PARALLEL
-    vision: bool = True
-    web_ui: bool = False
     bind_host: str = DEFAULT_BIND_HOST
     local_port: int = DEFAULT_LOCAL_PORT
     remote_port: int = DEFAULT_REMOTE_PORT
@@ -282,8 +488,7 @@ class LaunchConfig:
     fast_hf: bool = True
     rm_on_disconnect: bool = False
     reconfigure: bool = False
-    attach: bool = False
-    attach_endpoint: str | None = None
+    attach: Attach | None = None
     identity: Path | None = None
     colab_config: Path | None = None
     hf_token_file: Path | None = None
@@ -296,47 +501,15 @@ class LaunchConfig:
         validate_port(self.remote_port, "remote_port")
         validate_timeouts(self.idle_timeout_s, self.max_duration_s)
 
-        if self.engine not in ALLOWED_ENGINES:
-            raise ValueError(
-                f"Unsupported engine {self.engine!r}: "
-                f"choose one of {', '.join(ALLOWED_ENGINES)}"
-            )
-        if self.draft not in ALLOWED_MAYA_DRAFTS:
-            raise ValueError(
-                f"Unsupported draft mode {self.draft!r}: "
-                f"choose one of {', '.join(ALLOWED_MAYA_DRAFTS)}"
-            )
+        if self.high_mem and self.gpu in SINGLE_SHAPE_GPUS:
+            raise ValueError(f"--high-mem is not available on {self.gpu}: it has a single shape")
         if not (CONTEXT_LENGTH_MIN <= self.context_length <= CONTEXT_LENGTH_MAX):
             raise ValueError(
                 f"context_length={self.context_length} out of bounds "
                 f"[{CONTEXT_LENGTH_MIN}, {CONTEXT_LENGTH_MAX}]"
             )
-        if not (1 <= self.parallel <= PARALLEL_MAX):
-            raise ValueError(f"parallel={self.parallel} out of bounds [1, {PARALLEL_MAX}]")
         if not (BOOTSTRAP_TIMEOUT_S_MIN <= self.bootstrap_timeout_s <= BOOTSTRAP_TIMEOUT_S_MAX):
             raise ValueError(
                 f"bootstrap_timeout_s={self.bootstrap_timeout_s} out of bounds "
                 f"[{BOOTSTRAP_TIMEOUT_S_MIN}, {BOOTSTRAP_TIMEOUT_S_MAX}]"
             )
-        if self.model is not None and not _MODEL_NAME_RE.fullmatch(self.model):
-            raise ValueError(f"Invalid model identifier: {self.model!r}")
-        if self.hf_repo is not None and not _HF_REPO_RE.fullmatch(self.hf_repo):
-            raise ValueError(
-                f"Invalid Hugging Face repo {self.hf_repo!r}: expected 'owner/repo'"
-            )
-        if self.hf_revision is not None and not _HF_REV_RE.fullmatch(self.hf_revision):
-            raise ValueError(f"Invalid Hugging Face revision: {self.hf_revision!r}")
-        if self.hf_revision is not None and self.hf_repo is None:
-            raise ValueError("--hf-revision requires --hf-repo")
-
-    @property
-    def effective_model(self) -> str:
-        """The model to serve. Total: every engine has a default, so this never raises."""
-        assert self.engine in DEFAULT_ENGINE_MODELS
-        if self.model:
-            return self.model
-        if self.engine == "maya":
-            return DEFAULT_MAYA_MODEL
-        if self.hf_repo:
-            return self.hf_repo
-        return DEFAULT_ENGINE_MODELS[self.engine]
