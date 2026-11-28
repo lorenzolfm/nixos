@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ from colab_llm.config import (
     validate_session_name,
 )
 
-_SSH_HOST = "root@colab-runtime"
+SSH_HOST = "root@colab-runtime"
 _DEFAULT_KEY_CANDIDATES = ("id_ed25519", "id_ecdsa")
 # Colab rejects `shape=hm` (HTTP 400) on single-shape GPU tiers such as G4 and L4.
 _SINGLE_SHAPE_GPUS = frozenset({"G4", "L4"})
@@ -42,7 +43,7 @@ class ColabError(RuntimeError):
 @dataclass(frozen=True)
 class UsageSnapshot:
     balance_cu: float
-    rate_per_hour: float
+    rate_cu_per_hour: float
     active_assignments: int
 
 
@@ -65,7 +66,7 @@ def parse_usage_output(text: str) -> UsageSnapshot:
         raise ColabError(f"Could not parse `colab usage` output:\n{text.strip()}")
     return UsageSnapshot(
         balance_cu=float(bal.group(1)),
-        rate_per_hour=float(rate.group(1)),
+        rate_cu_per_hour=float(rate.group(1)),
         active_assignments=int(count.group(1)),
     )
 
@@ -75,11 +76,16 @@ def parse_sessions_output(text: str) -> list[ColabSessionInfo]:
     sessions: list[ColabSessionInfo] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("[colab]"):
+        if not line:
             continue
         match = _SESSION_LINE_RE.match(line)
         if not match:
-            continue
+            # `[colab] ...` lines are the CLI's own notices. Anything else is a
+            # format this parser does not know: fail rather than report a
+            # running (billable) session as absent.
+            if line.startswith("[colab]"):
+                continue
+            raise ColabError(f"Could not parse `colab sessions` line: {line!r}")
         sessions.append(
             ColabSessionInfo(
                 name=match.group("name").strip(),
@@ -189,6 +195,45 @@ def build_proxy_command(
     return " ".join(shlex.quote(p) for p in parts)
 
 
+# Options for a fresh connection through `colab ssh --proxy-mode`. The VM's host
+# key changes on every allocation and the transport is Colab's authenticated
+# WebSocket, so host-key pinning is deliberately off.
+_SSH_TRANSPORT_OPTIONS = (
+    "StrictHostKeyChecking=no",
+    "UserKnownHostsFile=/dev/null",
+    "LogLevel=ERROR",
+    "IdentitiesOnly=yes",
+    "ServerAliveInterval=30",
+    "ServerAliveCountMax=3",
+    "ConnectTimeout=30",
+)
+
+
+def _ssh_option_args(options: Sequence[str]) -> list[str]:
+    args: list[str] = []
+    for option in options:
+        assert "=" in option, option
+        args.extend(["-o", option])
+    return args
+
+
+def build_ssh_mux_args(
+    *,
+    ssh_bin: str,
+    control_path: Path,
+    batch_mode: bool = True,
+    connect_timeout_s: int | None = None,
+) -> list[str]:
+    """Arguments that reuse the live ControlMaster socket (no new Colab SSH session)."""
+    options = ["LogLevel=ERROR"]
+    if batch_mode:
+        options.insert(0, "BatchMode=yes")
+    if connect_timeout_s is not None:
+        assert connect_timeout_s > 0
+        options.append(f"ConnectTimeout={connect_timeout_s}")
+    return [ssh_bin, *_ssh_option_args(options), "-S", str(control_path), SSH_HOST]
+
+
 def build_ssh_base_args(
     *,
     ssh_bin: str,
@@ -196,29 +241,15 @@ def build_ssh_base_args(
     identity: Path | None = None,
     control_path: Path | None = None,
     control_master: bool = False,
+    batch_mode: bool = True,
 ) -> list[str]:
     """Construct OpenSSH arguments using `colab ssh --proxy-mode` as ProxyCommand."""
-    args: list[str] = [
-        ssh_bin,
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "LogLevel=ERROR",
-        "-o",
-        "IdentitiesOnly=yes",
-        "-o",
-        "ServerAliveInterval=30",
-        "-o",
-        "ServerAliveCountMax=3",
-        "-o",
-        "ConnectTimeout=30",
-        "-o",
-        f"ProxyCommand={proxy_command}",
-    ]
+    assert proxy_command, "a ProxyCommand is the only supported transport"
+    options = list(_SSH_TRANSPORT_OPTIONS)
+    if batch_mode:
+        options.insert(0, "BatchMode=yes")
+    options.append(f"ProxyCommand={proxy_command}")
+    args: list[str] = [ssh_bin, *_ssh_option_args(options)]
     if identity is not None:
         priv = (
             identity.with_suffix("")
@@ -261,7 +292,7 @@ def build_ssh_tunnel_args(
             "ExitOnForwardFailure=yes",
             "-L",
             f"{host}:{local_forward_port}:127.0.0.1:{remote_port}",
-            _SSH_HOST,
+            SSH_HOST,
         ]
     )
     return args
@@ -512,6 +543,17 @@ class ColabClient:
         args = ["new", "-s", session, "--gpu", gpu]
         if high_mem and gpu.upper() not in _SINGLE_SHAPE_GPUS:
             args.append("--high-mem")
+        # From here a billable runtime may exist. Any failure, including Ctrl+C,
+        # must stop it before propagating: the caller has no session to clean up.
+        try:
+            return self._create_session(session=session, gpu=gpu, args=args), True
+        except BaseException:
+            self._stop_after_failed_create(session)
+            raise
+
+    def _create_session(
+        self, *, session: str, gpu: str, args: Sequence[str]
+    ) -> ColabSessionInfo:
         try:
             self._run_colab(args, capture=False, timeout=300)
         except ColabError as exc:
@@ -529,7 +571,24 @@ class ColabClient:
             raise ColabError(
                 f"Session {session!r} was created but did not appear in `colab sessions`."
             )
-        return after[session], True
+        info = after[session]
+        if info.hardware.upper() != gpu.upper():
+            raise ColabError(
+                f"Session {session!r} was created on hardware {info.hardware!r}, "
+                f"not requested {gpu!r}."
+            )
+        return info
+
+    def _stop_after_failed_create(self, session: str) -> None:
+        try:
+            self.teardown_session(session)
+        except ColabError as exc:
+            # Do not mask the original failure; make the leak impossible to miss.
+            print(
+                f"[colab-llm] WARNING: session {session!r} may still be running and "
+                f"billing: {exc}\n  Run manually: colab stop -s {session}",
+                file=sys.stderr,
+            )
 
     def stop_session(self, session: str) -> bool:
         """Stop a single session idempotently. Returns True if a session was stopped."""
@@ -538,23 +597,43 @@ class ColabClient:
         if session not in existing:
             return False
         self._run_colab(["stop", "-s", session], capture=False, timeout=120)
+        remaining = {s.name for s in self.list_sessions()}
+        if session in remaining:
+            raise ColabError(f"Session {session!r} is still listed after `colab stop`.")
         return True
+
+    def teardown_session(self, session: str) -> None:
+        """Billing-safety stop: always issue `colab stop`, then verify it took effect.
+
+        Unlike `stop_session`, this never trusts a prior listing to decide
+        whether a stop is needed. Stopping an absent session is harmless;
+        skipping the stop of a present one is not.
+        """
+        validate_session_name(session)
+        stop = self._run_colab(["stop", "-s", session], check=False, timeout=120)
+        remaining = {s.name for s in self.list_sessions()}
+        if session in remaining:
+            detail = (stop.stderr or stop.stdout or "").strip()
+            raise ColabError(
+                f"Session {session!r} is still listed after `colab stop` "
+                f"(exit {stop.returncode})" + (f":\n{detail}" if detail else "")
+            )
 
     def stop_all(self) -> None:
         self._run_colab(["stop", "--all"], capture=False, timeout=180)
         # `colab stop --all` only stops locally tracked sessions; also clean up
         # any remaining unnamed (`[?]`) server assignments (e.g. Web UI tabs).
-        for idx, rem in enumerate(self.list_sessions()):
-            if rem.name == "?":
-                tmp_name = f"colab-llm-cleanup-{idx}"
+        for index, leftover in enumerate(self.list_sessions()):
+            if leftover.name == "?":
+                cleanup_name = f"colab-llm-cleanup-{index}"
                 self.attach_session(
-                    session=tmp_name,
-                    gpu=rem.hardware,
-                    endpoint=rem.endpoint,
+                    session=cleanup_name,
+                    gpu=leftover.hardware,
+                    endpoint=leftover.endpoint,
                 )
-                self.stop_session(tmp_name)
+                self.stop_session(cleanup_name)
             else:
-                self.stop_session(rem.name)
+                self.stop_session(leftover.name)
 
     def ssh_exec(
         self,
@@ -570,17 +649,8 @@ class ColabClient:
     ) -> subprocess.CompletedProcess[bytes]:
         """Run a remote command over official `colab ssh --proxy-mode` (or active ControlMaster)."""
         if control_path is not None and control_path.exists():
-            cmd = [
-                self.ssh_bin,
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "LogLevel=ERROR",
-                "-S",
-                str(control_path),
-                _SSH_HOST,
-                remote_command,
-            ]
+            cmd = build_ssh_mux_args(ssh_bin=self.ssh_bin, control_path=control_path)
+            cmd.append(remote_command)
         else:
             proxy_cmd = build_proxy_command(
                 colab_bin=self.colab_bin,
@@ -594,7 +664,7 @@ class ColabClient:
                 proxy_command=proxy_cmd,
                 identity=identity,
             )
-            cmd.extend([_SSH_HOST, remote_command])
+            cmd.extend([SSH_HOST, remote_command])
 
         try:
             proc = subprocess.run(
@@ -629,12 +699,9 @@ class ColabClient:
     ) -> int:
         """Open an interactive shell or command over official `colab ssh --proxy-mode`."""
         if control_path is not None and control_path.exists():
-            cmd = [
-                self.ssh_bin,
-                "-S",
-                str(control_path),
-                _SSH_HOST,
-            ]
+            cmd = build_ssh_mux_args(
+                ssh_bin=self.ssh_bin, control_path=control_path, batch_mode=False
+            )
         else:
             proxy_cmd = build_proxy_command(
                 colab_bin=self.colab_bin,
@@ -642,26 +709,13 @@ class ColabClient:
                 identity=identity,
                 colab_config=self.colab_config,
             )
-            cmd = [
-                self.ssh_bin,
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "LogLevel=ERROR",
-                "-o",
-                "IdentitiesOnly=yes",
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-o",
-                f"ProxyCommand={proxy_cmd}",
-                "-i",
-                str(identity),
-                _SSH_HOST,
-            ]
+            cmd = build_ssh_base_args(
+                ssh_bin=self.ssh_bin,
+                proxy_command=proxy_cmd,
+                identity=identity,
+                batch_mode=False,
+            )
+            cmd.append(SSH_HOST)
         if remote_cmd:
             cmd.append(" ".join(shlex.quote(arg) for arg in remote_cmd))
         proc = subprocess.run(cmd, check=False)

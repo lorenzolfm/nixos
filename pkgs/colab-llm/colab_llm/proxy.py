@@ -19,15 +19,51 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from colab_llm.colab import build_proxy_command, build_ssh_tunnel_args
-from colab_llm.config import format_duration, validate_loopback_host, validate_port
+from colab_llm.colab import (
+    build_proxy_command,
+    build_ssh_mux_args,
+    build_ssh_tunnel_args,
+)
+from colab_llm.config import (
+    HEARTBEAT_INTERVAL_S,
+    StopReason,
+    deadman_heartbeat_timeout_s,
+    format_duration,
+    validate_loopback_host,
+    validate_port,
+)
+
+# Loopback clients are few (one harness, a handful of pooled sockets); the cap
+# exists so a runaway client cannot grow the task set without bound.
+CLIENT_CONNECTIONS_MAX = 64
+PIPE_CHUNK_SIZE_BYTES = 65536
+UPSTREAM_CONNECT_TIMEOUT_S = 15.0
+PROXY_CLOSE_TIMEOUT_S = 5.0
+WRITER_CLOSE_TIMEOUT_S = 5.0
+
+TUNNEL_BACKOFF_S_MIN = 2.0
+TUNNEL_BACKOFF_S_MAX = 15.0
+# A tunnel that stayed up this long was a working tunnel, so the next drop
+# starts a fresh failure streak.
+TUNNEL_STABLE_S = 60.0
+# About five minutes of back-to-back failures at maximum backoff: the runtime is
+# gone or unreachable, so stop supervising and let the session tear down.
+TUNNEL_FAILURES_CONSECUTIVE_MAX = 20
+
+HEALTH_PROBE_INTERVAL_S = 3.0
+HEALTH_LOG_INTERVAL_S = 15.0
+WATCHDOG_TICK_S = 5.0
+STATE_WRITE_INTERVAL_S = 10.0
+STATUS_LOG_INTERVAL_S = 300.0
 
 
 def pick_free_loopback_port() -> int:
     """Allocate an ephemeral unused TCP port on 127.0.0.1."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+        port = int(sock.getsockname()[1])
+    assert 0 < port <= 65535
+    return port
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -67,7 +103,10 @@ def append_jsonl(path: Path, record: dict[str, Any]) -> None:
 
 
 def read_jsonl_tail(path: Path, limit: int = 10) -> list[dict[str, Any]]:
-    if not path.is_file():
+    """Return up to `limit` of the most recent records, oldest first."""
+    assert limit >= 0, limit
+    # `lines[-0:]` is the whole list, so a zero count needs its own branch.
+    if limit == 0 or not path.is_file():
         return []
     lines = path.read_text(encoding="utf-8").splitlines()
     records: list[dict[str, Any]] = []
@@ -81,6 +120,7 @@ def read_jsonl_tail(path: Path, limit: int = 10) -> list[dict[str, Any]]:
                 records.append(parsed)
         except ValueError:
             continue
+    assert len(records) <= limit
     return records
 
 
@@ -125,29 +165,35 @@ class ProxyStats:
     bytes_in: int = 0
     bytes_out: int = 0
 
-    def idle_seconds(self, now: float | None = None) -> float:
+    def idle_s(self, now: float | None = None) -> float:
+        """Seconds since a byte last moved or a connection last opened or closed.
+
+        An open connection is not activity by itself: a client that holds a
+        silent socket must not keep a billable runtime alive.
+        """
         current = time.monotonic() if now is None else now
-        if self.active_connections > 0:
-            return 0.0
+        # Callers sample `now` before awaiting, so activity can be newer than it.
         return max(0.0, current - self.last_activity_monotonic)
 
-    def elapsed_seconds(self, now: float | None = None) -> float:
+    def elapsed_s(self, now: float | None = None) -> float:
         current = time.monotonic() if now is None else now
         return max(0.0, current - self.started_monotonic)
 
     def is_idle_expired(self, idle_timeout_s: int, now: float | None = None) -> bool:
-        return self.active_connections == 0 and self.idle_seconds(now) >= idle_timeout_s
+        assert idle_timeout_s > 0
+        return self.idle_s(now) >= idle_timeout_s
 
     def is_hard_cap_expired(self, max_duration_s: int, now: float | None = None) -> bool:
-        return self.elapsed_seconds(now) >= max_duration_s
+        assert max_duration_s > 0
+        return self.elapsed_s(now) >= max_duration_s
 
 
 class ActivityTrackingProxy:
     """Asyncio loopback TCP relay tracking genuine client traffic for idle teardown.
 
     Health probes hit the internal SSH tunnel port directly so they never reset
-    the idle timer; only real client connections to the user-facing loopback
-    port count as activity, and in-flight streams pause idle expiration.
+    the idle timer; only bytes moving through the user-facing loopback port
+    count as activity.
     """
 
     def __init__(
@@ -161,11 +207,13 @@ class ActivityTrackingProxy:
         self.bind_host = validate_loopback_host(bind_host)
         self.listen_port = validate_port(listen_port, "listen_port")
         self.upstream_port = validate_port(upstream_port, "upstream_port")
+        assert self.listen_port != self.upstream_port, "proxy would connect to itself"
         self._clock = clock
         now = clock()
         self.stats = ProxyStats(started_monotonic=now, last_activity_monotonic=now)
         self._server: asyncio.Server | None = None
-        self._tasks: set[asyncio.Task[Any]] = set()
+        self._handlers: set[asyncio.Task[Any]] = set()
+        self._closing = False
 
     @property
     def bound_port(self) -> int:
@@ -174,6 +222,8 @@ class ActivityTrackingProxy:
         return self.listen_port
 
     async def start(self) -> None:
+        assert self._server is None, "proxy already started"
+        self._closing = False
         self._server = await asyncio.start_server(
             self._handle_client,
             host=self.bind_host,
@@ -181,15 +231,35 @@ class ActivityTrackingProxy:
         )
 
     async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        for task in list(self._tasks):
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-            self._tasks.clear()
+        """Stop accepting, drop every client, and return within a bounded time.
+
+        Teardown of the billable runtime waits on this call, so it must never
+        depend on a client choosing to disconnect: `Server.wait_closed()` blocks
+        until every connection is gone, hence connections are cancelled first.
+        """
+        self._closing = True
+        server = self._server
+        self._server = None
+        if server is not None:
+            server.close()
+
+        handlers = list(self._handlers)
+        for handler in handlers:
+            handler.cancel()
+        if handlers:
+            await asyncio.gather(*handlers, return_exceptions=True)
+        assert not self._handlers
+        assert self.stats.active_connections == 0, self.stats.active_connections
+
+        if server is not None:
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=PROXY_CLOSE_TIMEOUT_S)
+            except TimeoutError:
+                print(
+                    "[colab-llm] Warning: proxy listener did not close within "
+                    f"{PROXY_CLOSE_TIMEOUT_S:.0f}s; continuing teardown.",
+                    file=sys.stderr,
+                )
 
     async def _pipe(
         self,
@@ -198,11 +268,14 @@ class ActivityTrackingProxy:
         *,
         inbound: bool,
     ) -> None:
+        # Runs until EOF, a transport error, or cancellation. `close()` cancels
+        # every connection, so the session's hard cap bounds this loop.
         try:
             while True:
-                data = await reader.read(65536)
+                data = await reader.read(PIPE_CHUNK_SIZE_BYTES)
                 if not data:
                     break
+                assert len(data) <= PIPE_CHUNK_SIZE_BYTES
                 writer.write(data)
                 await writer.drain()
                 self.stats.last_activity_monotonic = self._clock()
@@ -210,53 +283,82 @@ class ActivityTrackingProxy:
                     self.stats.bytes_in += len(data)
                 else:
                     self.stats.bytes_out += len(data)
-        except (ConnectionError, OSError, asyncio.CancelledError):
+        except (ConnectionError, OSError):
+            # The peer went away mid-stream; the other direction sees EOF below.
             pass
         finally:
             try:
                 if writer.can_write_eof():
                     writer.write_eof()
-            except OSError:
+            except (OSError, RuntimeError):
                 pass
+
+    async def _close_writer(self, writer: asyncio.StreamWriter) -> None:
+        if self._closing:
+            # Shutdown must not wait on a peer that has stopped reading.
+            writer.transport.abort()
+            return
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=WRITER_CLOSE_TIMEOUT_S)
+        except (TimeoutError, OSError):
+            writer.transport.abort()
 
     async def _handle_client(
         self,
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> None:
+        handler = asyncio.current_task()
+        assert handler is not None
+        if self._closing:
+            client_writer.transport.abort()
+            return
+        if self.stats.active_connections < CLIENT_CONNECTIONS_MAX:
+            await self._relay_client(handler, client_reader, client_writer)
+        else:
+            client_writer.transport.abort()
+
+    async def _relay_client(
+        self,
+        handler: asyncio.Task[Any],
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        self._handlers.add(handler)
         self.stats.active_connections += 1
         self.stats.total_connections += 1
         self.stats.last_activity_monotonic = self._clock()
+        assert self.stats.active_connections <= CLIENT_CONNECTIONS_MAX
+
         upstream_writer: asyncio.StreamWriter | None = None
+        pipes: list[asyncio.Task[None]] = []
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
                 asyncio.open_connection("127.0.0.1", self.upstream_port),
-                timeout=15.0,
+                timeout=UPSTREAM_CONNECT_TIMEOUT_S,
             )
-            t_in = asyncio.create_task(
-                self._pipe(client_reader, upstream_writer, inbound=True)
-            )
-            t_out = asyncio.create_task(
-                self._pipe(upstream_reader, client_writer, inbound=False)
-            )
-            self._tasks.update({t_in, t_out})
-            try:
-                await asyncio.gather(t_in, t_out, return_exceptions=True)
-            finally:
-                self._tasks.discard(t_in)
-                self._tasks.discard(t_out)
-        except (TimeoutError, OSError, asyncio.CancelledError):
+            pipes = [
+                asyncio.create_task(self._pipe(client_reader, upstream_writer, inbound=True)),
+                asyncio.create_task(self._pipe(upstream_reader, client_writer, inbound=False)),
+            ]
+            await asyncio.gather(*pipes)
+        except (TimeoutError, OSError):
+            # Upstream (the SSH tunnel) is unreachable: drop this client. The
+            # tunnel supervisor reports and repairs the tunnel itself.
             pass
         finally:
-            self.stats.active_connections = max(0, self.stats.active_connections - 1)
+            for pipe in pipes:
+                pipe.cancel()
+            if pipes:
+                await asyncio.gather(*pipes, return_exceptions=True)
+            assert self.stats.active_connections > 0
+            self.stats.active_connections -= 1
             self.stats.last_activity_monotonic = self._clock()
-            for w in (upstream_writer, client_writer):
-                if w is not None:
-                    try:
-                        w.close()
-                        await w.wait_closed()
-                    except OSError:
-                        pass
+            self._handlers.discard(handler)
+            if upstream_writer is not None:
+                await self._close_writer(upstream_writer)
+            await self._close_writer(client_writer)
 
 
 class TunnelSupervisor:
@@ -288,6 +390,8 @@ class TunnelSupervisor:
         self._stopping = False
         self._task: asyncio.Task[None] | None = None
         self.reconnect_count = 0
+        # Set when the supervisor stops trying; the session must then end.
+        self.gave_up = False
 
     def _build_cmd(self, *, force: bool = False) -> list[str]:
         proxy_cmd = build_proxy_command(
@@ -309,21 +413,27 @@ class TunnelSupervisor:
         )
 
     async def start(self) -> None:
+        assert self._task is None, "tunnel supervisor already started"
         self._stopping = False
+        self.gave_up = False
         self._task = asyncio.create_task(self._supervise_loop())
 
+    def _remove_control_socket(self) -> None:
+        # A stale socket would make the next `ssh -M` refuse to start.
+        self.control_path.unlink(missing_ok=True)
+
     async def _supervise_loop(self) -> None:
-        backoff_s = 2.0
+        backoff_s = TUNNEL_BACKOFF_S_MIN
+        failures_consecutive = 0
+        # Bounded by TUNNEL_FAILURES_CONSECUTIVE_MAX failures in a row; a tunnel
+        # that keeps working runs until `stop()`, which the hard cap guarantees.
         while not self._stopping:
-            if self.control_path.exists():
-                try:
-                    self.control_path.unlink()
-                except OSError:
-                    pass
+            self._remove_control_socket()
             # Pass --force so a just-closed bootstrap SSH session slot on Colab
             # (which enforces a 1-session limit on some tiers) never causes a
             # spurious HTTP 429 when bringing up the ControlMaster tunnel.
             cmd = self._build_cmd(force=True)
+            started = time.monotonic()
             self._proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -331,52 +441,67 @@ class TunnelSupervisor:
                 stderr=asyncio.subprocess.PIPE,
             )
             _, stderr_bytes = await self._proc.communicate()
-            rc = self._proc.returncode
+            exit_code = self._proc.returncode
             self._proc = None
             if self._stopping:
                 break
             err_msg = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
             if self.rm_on_disconnect:
                 print(
-                    f"[colab-llm] SSH tunnel exited (rc={rc}) with --rm-on-disconnect enabled.",
+                    f"[colab-llm] SSH tunnel exited (rc={exit_code}) "
+                    "with --rm-on-disconnect enabled.",
                     file=sys.stderr,
                 )
+                self.gave_up = True
                 break
+
+            if time.monotonic() - started >= TUNNEL_STABLE_S:
+                failures_consecutive = 0
+                backoff_s = TUNNEL_BACKOFF_S_MIN
+            failures_consecutive += 1
+            if failures_consecutive > TUNNEL_FAILURES_CONSECUTIVE_MAX:
+                print(
+                    f"[colab-llm] SSH tunnel failed {failures_consecutive} times in a row "
+                    f"(rc={exit_code}); giving up" + (f": {err_msg}" if err_msg else "."),
+                    file=sys.stderr,
+                )
+                self.gave_up = True
+                break
+
             self.reconnect_count += 1
             print(
-                f"[colab-llm] SSH tunnel dropped (rc={rc}); reconnecting in {backoff_s:.0f}s"
-                + (f": {err_msg}" if err_msg else ""),
+                f"[colab-llm] SSH tunnel dropped (rc={exit_code}); "
+                f"reconnecting in {backoff_s:.0f}s" + (f": {err_msg}" if err_msg else ""),
                 file=sys.stderr,
             )
             await asyncio.sleep(backoff_s)
-            backoff_s = min(backoff_s * 2.0, 15.0)
+            backoff_s = min(backoff_s * 2.0, TUNNEL_BACKOFF_S_MAX)
+        assert self._stopping or self.gave_up
 
-    def touch_remote_heartbeat(self) -> None:
-        """Touch the remote deadman heartbeat over the active ControlMaster socket."""
+    def touch_remote_heartbeat(self) -> bool:
+        """Touch the remote deadman heartbeat over the live ControlMaster socket.
+
+        Returns whether the VM acknowledged it. A heartbeat that is not
+        delivered brings the remote deadman closer to firing, so the caller
+        must be told.
+        """
         if not self.control_path.exists():
-            return
+            return False
+        cmd = build_ssh_mux_args(
+            ssh_bin=self.ssh_bin, control_path=self.control_path, connect_timeout_s=10
+        )
+        cmd.append("date +%s > /content/colab-llm/heartbeat")
         try:
-            subprocess.run(
-                [
-                    self.ssh_bin,
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "LogLevel=ERROR",
-                    "-o",
-                    "ConnectTimeout=10",
-                    "-S",
-                    str(self.control_path),
-                    "root@colab-runtime",
-                    "date +%s > /content/colab-llm/heartbeat",
-                ],
+            proc = subprocess.run(
+                cmd,
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=15,
             )
         except (OSError, subprocess.TimeoutExpired):
-            pass
+            return False
+        return proc.returncode == 0
 
     @property
     def is_running(self) -> bool:
@@ -395,11 +520,7 @@ class TunnelSupervisor:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
-        if self.control_path.exists():
-            try:
-                self.control_path.unlink()
-            except OSError:
-                pass
+        self._remove_control_socket()
 
 
 async def run_supervised_session(
@@ -414,7 +535,7 @@ async def run_supervised_session(
     health_path: str,
     idle_timeout_s: int,
     max_duration_s: int,
-    startup_timeout_s: int,
+    health_timeout_s: int,
     state_file: Path,
     control_path: Path,
     colab_bin: str,
@@ -424,13 +545,18 @@ async def run_supervised_session(
     colab_config: Path | None = None,
     on_ready: Callable[[dict[str, Any]], None] | None = None,
     check_remote_alive: Callable[[], bool] | None = None,
-) -> tuple[str, ProxyStats]:
+) -> tuple[StopReason, ProxyStats]:
     """Run the SSH tunnel, loopback activity proxy, health check, and idle/cap watchdog.
 
     Returns (stop_reason, final_stats). Caller is responsible for executing
     `colab stop -s <session>` after this coroutine returns.
     """
+    assert 0 < idle_timeout_s <= max_duration_s
+    assert health_timeout_s > 0
+    assert health_path.startswith("/")
+
     tunnel_port = pick_free_loopback_port()
+    assert tunnel_port != local_port
     tunnel = TunnelSupervisor(
         colab_bin=colab_bin,
         ssh_bin=ssh_bin,
@@ -449,9 +575,11 @@ async def run_supervised_session(
     )
 
     stop_event = asyncio.Event()
-    stop_reason = "signal"
+    # Stays ERROR unless a branch below names the reason, so an exception that
+    # escapes this coroutine is recorded as one.
+    stop_reason = StopReason.ERROR
 
-    def _request_stop(reason: str) -> None:
+    def _request_stop(reason: StopReason) -> None:
         nonlocal stop_reason
         if not stop_event.is_set():
             stop_reason = reason
@@ -459,11 +587,12 @@ async def run_supervised_session(
 
     loop = asyncio.get_running_loop()
     installed_signals: list[signal.Signals] = []
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         try:
-            loop.add_signal_handler(sig, _request_stop, f"signal:{sig.name}")
+            loop.add_signal_handler(sig, _request_stop, StopReason(f"signal:{sig.name}"))
             installed_signals.append(sig)
         except NotImplementedError:
+            # Platform without loop signal support: the caller's handlers remain.
             pass
 
     def _write_state(phase: str, extra: dict[str, Any] | None = None) -> None:
@@ -482,8 +611,8 @@ async def run_supervised_session(
             "control_path": str(control_path),
             "idle_timeout_s": idle_timeout_s,
             "max_duration_s": max_duration_s,
-            "idle_seconds": round(proxy.stats.idle_seconds(now), 1),
-            "elapsed_seconds": round(proxy.stats.elapsed_seconds(now), 1),
+            "idle_s": round(proxy.stats.idle_s(now), 1),
+            "elapsed_s": round(proxy.stats.elapsed_s(now), 1),
             "active_connections": proxy.stats.active_connections,
             "total_connections": proxy.stats.total_connections,
             "bytes_in": proxy.stats.bytes_in,
@@ -494,13 +623,37 @@ async def run_supervised_session(
             payload.update(extra)
         write_json_atomic(state_file, payload)
 
+    heartbeat_last = float("-inf")
+    heartbeat_failures_consecutive = 0
+    heartbeat_timeout_s = deadman_heartbeat_timeout_s(idle_timeout_s)
+
+    async def _heartbeat_if_due(now: float, *, tunnel_expected: bool) -> None:
+        nonlocal heartbeat_last, heartbeat_failures_consecutive
+        if now - heartbeat_last < HEARTBEAT_INTERVAL_S:
+            return
+        if not tunnel_expected and not control_path.exists():
+            # The tunnel is still coming up; try again on the next tick.
+            return
+        heartbeat_last = now
+        if await asyncio.to_thread(tunnel.touch_remote_heartbeat):
+            heartbeat_failures_consecutive = 0
+            return
+        heartbeat_failures_consecutive += 1
+        print(
+            f"[colab-llm] Warning: heartbeat not delivered to the VM "
+            f"({heartbeat_failures_consecutive} in a row). The remote deadman stops the "
+            f"runtime after {format_duration(heartbeat_timeout_s)} without one.",
+            file=sys.stderr,
+        )
+
     await tunnel.start()
     await proxy.start()
     _write_state("waiting_health")
 
     try:
         # Phase 1: wait for inference engine health through the internal tunnel port.
-        deadline = time.monotonic() + startup_timeout_s
+        # Bounded by `deadline`.
+        deadline = time.monotonic() + health_timeout_s
         last_log = time.monotonic()
         health_info: dict[str, Any] = {}
         ready = False
@@ -509,7 +662,7 @@ async def run_supervised_session(
                 probe_http_health,
                 port=tunnel_port,
                 health_path=health_path,
-                timeout_s=3.0,
+                timeout_s=HEALTH_PROBE_INTERVAL_S,
             )
             if ok:
                 ready = True
@@ -517,30 +670,35 @@ async def run_supervised_session(
                 break
             now = time.monotonic()
             if now >= deadline:
-                _request_stop("startup_timeout")
+                _request_stop(StopReason.HEALTH_TIMEOUT)
                 break
-            if now - last_log >= 15.0:
-                rem = max(0.0, deadline - now)
+            if tunnel.gave_up:
+                _request_stop(StopReason.TUNNEL_DISCONNECTED)
+                break
+            await _heartbeat_if_due(now, tunnel_expected=False)
+            if now - last_log >= HEALTH_LOG_INTERVAL_S:
+                remaining_s = max(0.0, deadline - now)
                 status_hint = ""
                 if data and data.get("status"):
                     status_hint = f" (engine status: {data['status']})"
                 print(
                     f"[colab-llm] Waiting for {engine} on 127.0.0.1:{remote_port}{health_path}"
-                    f"{status_hint} — {format_duration(rem)} remaining...",
+                    f"{status_hint} — {format_duration(remaining_s)} remaining...",
                     flush=True,
                 )
                 last_log = now
                 if check_remote_alive is not None and control_path.exists():
                     alive = await asyncio.to_thread(check_remote_alive)
                     if not alive:
-                        _request_stop("remote_process_exited")
+                        _request_stop(StopReason.REMOTE_PROCESS_EXITED)
                         break
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=3.0)
+                await asyncio.wait_for(stop_event.wait(), timeout=HEALTH_PROBE_INTERVAL_S)
             except TimeoutError:
-                pass
+                pass  # The timeout is the poll interval, not an error.
 
         if not ready:
+            assert stop_event.is_set()
             return stop_reason, proxy.stats
 
         # Reset idle timer at the moment the endpoint becomes ready so long model
@@ -551,8 +709,8 @@ async def run_supervised_session(
             on_ready(health_info)
 
         # Phase 2: serve traffic and enforce idle timeout + hard max duration.
+        # Bounded by the hard cap, which is checked first on every tick.
         last_state_write = 0.0
-        last_heartbeat = 0.0
         last_status_log = time.monotonic()
         while not stop_event.is_set():
             now = time.monotonic()
@@ -561,52 +719,58 @@ async def run_supervised_session(
                     f"[colab-llm] Hard session cap reached "
                     f"({format_duration(max_duration_s)}). Stopping Colab runtime."
                 )
-                _request_stop("max_duration")
+                _request_stop(StopReason.MAX_DURATION)
                 break
             if proxy.stats.is_idle_expired(idle_timeout_s, now):
                 print(
                     f"[colab-llm] Idle timeout reached "
-                    f"({format_duration(idle_timeout_s)} with 0 active requests). "
+                    f"({format_duration(idle_timeout_s)} with no traffic). "
                     "Stopping Colab runtime."
                 )
-                _request_stop("idle_timeout")
+                _request_stop(StopReason.IDLE_TIMEOUT)
                 break
-            if rm_on_disconnect and not tunnel.is_running:
-                _request_stop("tunnel_disconnected")
+            if tunnel.gave_up:
+                _request_stop(StopReason.TUNNEL_DISCONNECTED)
                 break
 
-            if now - last_state_write >= 10.0:
+            if now - last_state_write >= STATE_WRITE_INTERVAL_S:
                 _write_state("ready", {"health": health_info})
                 last_state_write = now
 
-            if now - last_heartbeat >= 300.0:
-                await asyncio.to_thread(tunnel.touch_remote_heartbeat)
-                last_heartbeat = now
+            await _heartbeat_if_due(now, tunnel_expected=True)
 
-            if now - last_status_log >= 300.0:
-                idle_rem = max(0.0, idle_timeout_s - proxy.stats.idle_seconds(now))
-                cap_rem = max(0.0, max_duration_s - proxy.stats.elapsed_seconds(now))
+            if now - last_status_log >= STATUS_LOG_INTERVAL_S:
+                idle_left_s = max(0.0, idle_timeout_s - proxy.stats.idle_s(now))
+                cap_left_s = max(0.0, max_duration_s - proxy.stats.elapsed_s(now))
                 print(
                     f"[colab-llm] Alive ({session}): "
                     f"active={proxy.stats.active_connections}, "
-                    f"requests={proxy.stats.total_connections}, "
-                    f"idle_left={format_duration(idle_rem)}, "
-                    f"cap_left={format_duration(cap_rem)}"
+                    f"connections={proxy.stats.total_connections}, "
+                    f"idle_left={format_duration(idle_left_s)}, "
+                    f"cap_left={format_duration(cap_left_s)}"
                 )
                 last_status_log = now
 
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=5.0)
+                await asyncio.wait_for(stop_event.wait(), timeout=WATCHDOG_TICK_S)
             except TimeoutError:
-                pass
+                pass  # The timeout is the tick interval, not an error.
 
+        assert stop_event.is_set()
         return stop_reason, proxy.stats
     finally:
-        for sig in installed_signals:
+        # Each step is bounded; none may prevent the caller's `colab stop`. The
+        # signal handlers stay installed meanwhile: a repeated Ctrl+C is then an
+        # idempotent stop request instead of an interruption of the cleanup.
+        try:
+            await proxy.close()
+        finally:
             try:
-                loop.remove_signal_handler(sig)
-            except (NotImplementedError, RuntimeError):
-                pass
-        await proxy.close()
-        await tunnel.stop()
-        _write_state("stopped", {"stop_reason": stop_reason})
+                await tunnel.stop()
+            finally:
+                for sig in installed_signals:
+                    try:
+                        loop.remove_signal_handler(sig)
+                    except (NotImplementedError, RuntimeError):
+                        pass
+                _write_state("stopped", {"stop_reason": stop_reason})

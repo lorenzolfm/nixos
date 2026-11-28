@@ -5,13 +5,18 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import stat
+import subprocess
+import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
 
+from colab_llm import cli
 from colab_llm.cli import main as cli_main
 from colab_llm.colab import (
     ColabClient,
@@ -25,7 +30,9 @@ from colab_llm.colab import (
     resolve_ssh_identity,
 )
 from colab_llm.config import (
+    DEADMAN_HEARTBEAT_GRACE_S,
     DEFAULT_MAYA_MODEL,
+    HEARTBEAT_INTERVAL_S,
     MAYA_PINNED_COMMIT,
     LaunchConfig,
     parse_duration,
@@ -97,6 +104,16 @@ def test_timeout_invariants_enforced() -> None:
         LaunchConfig(hf_revision="main")
 
 
+@pytest.mark.parametrize("engine", ["maya", "vllm", "llama-cpp", "sglang"])
+def test_every_engine_resolves_a_model_before_any_gpu_is_allocated(engine: str) -> None:
+    # A config that constructs must be launchable: a missing model may not
+    # surface later, after a billable runtime exists.
+    config = LaunchConfig(engine=engine)
+    assert config.effective_model == get_engine(engine).default_model
+    assert get_engine(engine).build_env(config)
+    assert LaunchConfig(engine=engine, model="owner/custom").effective_model == "owner/custom"
+
+
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
@@ -149,7 +166,7 @@ def test_parse_usage_output() -> None:
     )
     snap = parse_usage_output(sample)
     assert snap.balance_cu == pytest.approx(398.42)
-    assert snap.rate_per_hour == pytest.approx(6.71)
+    assert snap.rate_cu_per_hour == pytest.approx(6.71)
     assert snap.active_assignments == 1
 
 
@@ -169,6 +186,60 @@ def test_parse_sessions_output() -> None:
         status=None,
     )
     assert sessions[1].status == "IDLE"
+
+
+def test_parse_sessions_output_skips_cli_notices_but_rejects_unknown_lines() -> None:
+    assert parse_sessions_output("[colab] No active sessions found on server.\n") == []
+    # An unrecognised line could be a running session in a new format; reporting
+    # it as "no sessions" would let teardown skip the stop.
+    with pytest.raises(ColabError, match="Could not parse"):
+        parse_sessions_output("colab-llm  m-s-abc123  G4  running\n")
+
+
+def _session(name: str) -> ColabSessionInfo:
+    return ColabSessionInfo(
+        name=name, endpoint="m-s-1", hardware="G4", shape="Standard", variant="GPU"
+    )
+
+
+def test_teardown_session_always_stops_and_verifies(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = ColabClient(colab_bin="/bin/true", ssh_bin="/bin/true")
+    stops: list[list[str]] = []
+
+    def _fake_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        stops.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(client, "_run_colab", _fake_run)
+
+    monkeypatch.setattr(client, "list_sessions", list)
+    client.teardown_session("colab-llm")
+    assert stops == [["stop", "-s", "colab-llm"]]
+
+    monkeypatch.setattr(client, "list_sessions", lambda: [_session("colab-llm")])
+    with pytest.raises(ColabError, match="still listed"):
+        client.teardown_session("colab-llm")
+
+
+def test_ensure_session_stops_runtime_when_creation_fails_part_way(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ColabClient(colab_bin="/bin/true", ssh_bin="/bin/true")
+    commands: list[list[str]] = []
+
+    def _fake_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    # `colab new` succeeds but the session never shows up in the listing.
+    monkeypatch.setattr(client, "_run_colab", _fake_run)
+    monkeypatch.setattr(client, "list_sessions", list)
+    with pytest.raises(ColabError, match="did not appear"):
+        client.ensure_session(session="colab-llm", gpu="G4")
+    assert commands == [
+        ["new", "-s", "colab-llm", "--gpu", "G4"],
+        ["stop", "-s", "colab-llm"],
+    ]
 
 
 def test_resolve_ssh_identity_prefers_ed25519_and_rejects_rsa(tmp_path: Path) -> None:
@@ -394,6 +465,16 @@ def test_maya_env_pins_commit_and_known_hf_prefetch() -> None:
     assert env["MAYA_CUSTOM_MODEL_DIR"] == "0"
     assert env["MAYA_WEB_UI"] == "0"
 
+    # The deadman must tolerate at least two missed supervisor heartbeats, and
+    # its hard cap must outlast bootstrap + health wait + the local cap.
+    config = LaunchConfig()
+    heartbeat_timeout_s = int(env["COLAB_LLM_DEADMAN_HEARTBEAT_TIMEOUT_S"])
+    assert heartbeat_timeout_s == config.idle_timeout_s + DEADMAN_HEARTBEAT_GRACE_S
+    assert heartbeat_timeout_s >= config.idle_timeout_s + 2 * HEARTBEAT_INTERVAL_S
+    assert int(env["COLAB_LLM_DEADMAN_DURATION_S_MAX"]) > (
+        config.max_duration_s + 2 * config.bootstrap_timeout_s
+    )
+
     custom_env = eng.build_env(
         LaunchConfig(hf_repo="turboderp/GLM-5.3-Flash-exl3", hf_revision="sc_2.60bpw")
     )
@@ -431,8 +512,8 @@ def test_activity_tracking_proxy_relays_traffic_and_tracks_idle() -> None:
         )
         await proxy.start()
         try:
-            # Open a connection and hold it open past the idle timeout:
-            # active_connections > 0 must prevent idle expiration.
+            # Open a connection and hold it open, silent, past the idle timeout:
+            # an open socket is not traffic, so it must not prevent expiration.
             reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
             writer.write(b"hello colab-llm")
             await writer.drain()
@@ -441,7 +522,13 @@ def test_activity_tracking_proxy_relays_traffic_and_tracks_idle() -> None:
 
             fake_now[0] = 5000.0
             assert proxy.stats.active_connections == 1
-            assert proxy.stats.idle_seconds(fake_now[0]) == 0.0
+            assert proxy.stats.idle_s(fake_now[0]) == 4000.0
+            assert proxy.stats.is_idle_expired(1800, fake_now[0])
+
+            # Bytes moving through the proxy are traffic and reset the timer.
+            writer.write(b"again")
+            await writer.drain()
+            assert await reader.readexactly(5) == b"again"
             assert not proxy.stats.is_idle_expired(1800, fake_now[0])
 
             # Close connection; activity timestamp updates to 5000.0.
@@ -451,8 +538,8 @@ def test_activity_tracking_proxy_relays_traffic_and_tracks_idle() -> None:
 
             assert proxy.stats.active_connections == 0
             assert proxy.stats.total_connections == 1
-            assert proxy.stats.bytes_in == len(b"hello colab-llm")
-            assert proxy.stats.bytes_out == len(b"hello colab-llm")
+            assert proxy.stats.bytes_in == len(b"hello colab-llmagain")
+            assert proxy.stats.bytes_out == len(b"hello colab-llmagain")
             assert not proxy.stats.is_idle_expired(1800, 6799.0)
             assert proxy.stats.is_idle_expired(1800, 6800.0)
             assert proxy.stats.is_hard_cap_expired(14400, 15400.0)
@@ -460,6 +547,44 @@ def test_activity_tracking_proxy_relays_traffic_and_tracks_idle() -> None:
             await proxy.close()
             upstream.close()
             await upstream.wait_closed()
+
+    asyncio.run(_run())
+
+
+def test_proxy_close_returns_while_a_client_is_still_connected() -> None:
+    # Teardown of the billable runtime waits on close(), so a client that never
+    # disconnects must not be able to block it.
+    async def _run() -> None:
+        async def _echo_handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        ) -> None:
+            while data := await reader.read(4096):
+                writer.write(data)
+                await writer.drain()
+            writer.close()
+
+        upstream = await asyncio.start_server(_echo_handler, "127.0.0.1", 0)
+        upstream_port = upstream.sockets[0].getsockname()[1]
+        proxy = ActivityTrackingProxy(
+            bind_host="127.0.0.1",
+            listen_port=pick_free_loopback_port(),
+            upstream_port=upstream_port,
+        )
+        await proxy.start()
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy.listen_port)
+        writer.write(b"ping")
+        await writer.drain()
+        assert await reader.readexactly(4) == b"ping"
+        assert proxy.stats.active_connections == 1
+
+        await asyncio.wait_for(proxy.close(), timeout=3.0)
+        assert proxy.stats.active_connections == 0
+        # The held connection was dropped rather than waited for.
+        assert await asyncio.wait_for(reader.read(), timeout=3.0) == b""
+
+        writer.close()
+        upstream.close()
+        await upstream.wait_closed()
 
     asyncio.run(_run())
 
@@ -536,6 +661,59 @@ def test_deadman_trigger_logic() -> None:
     )
 
 
+def test_deadman_reports_failure_when_runtime_is_not_unassigned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Outside a Colab VM the unassign call cannot succeed. The watchdog must
+    # say so through its exit code instead of claiming the runtime was released.
+    deadman = _load_deadman_module()
+    monkeypatch.setattr(deadman.time, "sleep", lambda _seconds: None)
+    exit_code = deadman.main(
+        [
+            "--pid-file", str(tmp_path / "server.pid"),
+            "--pid-file", str(tmp_path / "bootstrap.pid"),
+            "--heartbeat-file", str(tmp_path / "heartbeat"),
+            "--max-duration", "1",
+            "--heartbeat-timeout", "1",
+            "--poll-interval", "1",
+        ]
+    )
+    assert exit_code == 1
+
+
+def test_stale_state_file_never_yields_a_pid_to_signal(tmp_path: Path) -> None:
+    # A state file outlives its supervisor and PIDs get recycled: neither a
+    # finished session nor an unrelated live process may be signalled.
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert cli._live_supervisor_pid({"phase": "ready", "pid": unrelated.pid}) is None
+        assert cli._live_supervisor_pid({"phase": "stopped", "pid": unrelated.pid}) is None
+        assert cli._live_supervisor_pid({"phase": "ready", "pid": os.getpid()}) is None
+        assert cli._live_supervisor_pid({"phase": "ready", "pid": "12"}) is None
+        assert cli._live_supervisor_pid(None) is None
+    finally:
+        unrelated.kill()
+        unrelated.wait()
+
+
+def test_control_socket_dir_must_be_a_real_private_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # pytest's tmp_path is too deep for a Unix socket path, so use a short one.
+    with tempfile.TemporaryDirectory(prefix="cl-", dir="/tmp") as runtime_dir:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", runtime_dir)
+        socket_path = cli._control_socket_path("colab-llm")
+        assert stat.S_IMODE(socket_path.parent.stat().st_mode) == 0o700
+
+        # A symlink planted where the directory should be is refused, not followed.
+        elsewhere = Path(runtime_dir) / "elsewhere"
+        elsewhere.mkdir()
+        socket_path.parent.rmdir()
+        socket_path.parent.symlink_to(elsewhere)
+        with pytest.raises(ColabError, match="not a directory"):
+            cli._control_socket_path("colab-llm")
+
+
 def test_atomic_state_and_jsonl_ledger_permissions(tmp_path: Path) -> None:
     state_file = tmp_path / "colab-llm.json"
     write_json_atomic(state_file, {"session": "colab-llm", "phase": "ready"})
@@ -549,6 +727,8 @@ def test_atomic_state_and_jsonl_ledger_permissions(tmp_path: Path) -> None:
     rows = read_jsonl_tail(ledger, limit=1)
     assert len(rows) == 1
     assert rows[0]["cu_delta"] == 0.50
+    assert read_jsonl_tail(ledger, limit=0) == []
+    assert len(read_jsonl_tail(ledger, limit=10)) == 2
 
 
 def test_cli_non_network_subcommands(capsys: pytest.CaptureFixture[str]) -> None:

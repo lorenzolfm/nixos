@@ -4,49 +4,32 @@
 # Never mounts Google Drive (preserves #455 backup isolation).
 set -euo pipefail
 
-# Non-login SSH sessions on Colab omit /usr/local/cuda/bin from PATH.
-export PATH="/usr/local/cuda/bin:/usr/local/bin:${PATH}"
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-WORK_DIR="/content/colab-llm"
 MAYA_DIR="${WORK_DIR}/project-maya"
 MODELS_DIR="${WORK_DIR}/models"
-LOG_FILE="${WORK_DIR}/server.log"
-PID_FILE="${WORK_DIR}/server.pid"
-DEADMAN_PID_FILE="${WORK_DIR}/deadman.pid"
-HEARTBEAT_FILE="${WORK_DIR}/heartbeat"
-HF_TOKEN_PATH="${WORK_DIR}/.hf_token"
 HF_VENV="${WORK_DIR}/.hf-venv"
 
-MAYA_REPO_URL="${MAYA_REPO_URL:-https://github.com/mw00/project-maya.git}"
-MAYA_PINNED_TAG="${MAYA_PINNED_TAG:-v1.1.82}"
-MAYA_PINNED_COMMIT="${MAYA_PINNED_COMMIT:-f84ec2db12bf96e7f2d106a2ebd91550903b859d}"
-MAYA_MODEL="${MAYA_MODEL:-EXL3-3.05bpw}"
-MAYA_DRAFT="${MAYA_DRAFT:-dflash2}"
-MAYA_PARALLEL="${MAYA_PARALLEL:-1}"
-MAYA_VISION="${MAYA_VISION:-1}"
-export MAYA_WEB_UI="${MAYA_WEB_UI:-0}"
+# `:?` requires a non-empty value; `?` only requires the variable to be set,
+# for the two that are legitimately empty when no HF prefetch applies.
+MAYA_REPO_URL="${MAYA_REPO_URL:?}"
+MAYA_PINNED_TAG="${MAYA_PINNED_TAG:?}"
+MAYA_PINNED_COMMIT="${MAYA_PINNED_COMMIT:?}"
+MAYA_MODEL="${MAYA_MODEL:?}"
+MAYA_DRAFT="${MAYA_DRAFT:?}"
+MAYA_PARALLEL="${MAYA_PARALLEL:?}"
+MAYA_VISION="${MAYA_VISION:?}"
+export MAYA_WEB_UI="${MAYA_WEB_UI:?}"
 export MAYA_UPDATE_CHECK=0
-MAYA_HF_REPO="${MAYA_HF_REPO:-}"
-MAYA_HF_REVISION="${MAYA_HF_REVISION:-}"
-MAYA_CUSTOM_MODEL_DIR="${MAYA_CUSTOM_MODEL_DIR:-0}"
+MAYA_HF_REPO="${MAYA_HF_REPO?}"
+MAYA_HF_REVISION="${MAYA_HF_REVISION?}"
+MAYA_CUSTOM_MODEL_DIR="${MAYA_CUSTOM_MODEL_DIR:?}"
+HF_HUB_PINNED_VERSION="${HF_HUB_PINNED_VERSION:?}"
+HF_TRANSFER_PINNED_VERSION="${HF_TRANSFER_PINNED_VERSION:?}"
 
-REMOTE_PORT="${COLAB_LLM_REMOTE_PORT:-18100}"
-CONTEXT_LENGTH="${COLAB_LLM_CONTEXT_LENGTH:-131072}"
-IDLE_TIMEOUT_S="${COLAB_LLM_IDLE_TIMEOUT_S:-1800}"
-MAX_DURATION_S="${COLAB_LLM_MAX_DURATION_S:-14400}"
-FAST_HF="${COLAB_LLM_FAST_HF:-1}"
-RECONFIGURE="${COLAB_LLM_RECONFIGURE:-0}"
-
-cleanup_secrets() {
-  rm -f "${HF_TOKEN_PATH}"
-}
-trap cleanup_secrets EXIT
-
-log() {
-  printf '[maya-bootstrap %s] %s\n' "$(date -u +%H:%M:%S)" "$*"
-}
-
-mkdir -p "${WORK_DIR}" "${MODELS_DIR}"
+bootstrap_begin
+mkdir -p "${MODELS_DIR}"
 
 log "Hardware summary:"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
@@ -55,31 +38,6 @@ printf '  CPUs: %s | RAM: %s | Disk /content: %s\n' \
   "$(free -h | awk '/^Mem:/ {print $2 " total, " $7 " avail"}')" \
   "$(df -h /content | awk 'NR==2 {print $4 " free / " $2}')"
 nvcc --version | tail -n 1 || true
-
-# Fast idempotent path: if Maya is already running and healthy, reuse it.
-if [[ "${RECONFIGURE}" != "1" ]] && [[ -f "${PID_FILE}" ]]; then
-  existing_pid="$(cat "${PID_FILE}")"
-  if kill -0 "${existing_pid}" 2>/dev/null; then
-    if curl -fsS --max-time 2 "http://127.0.0.1:${REMOTE_PORT}/health" >/dev/null 2>&1; then
-      log "Project Maya is already healthy on 127.0.0.1:${REMOTE_PORT} (pid ${existing_pid}); reusing."
-      date +%s > "${HEARTBEAT_FILE}"
-      exit 0
-    fi
-  fi
-fi
-
-# Stop any prior server/deadman before reconfiguring.
-for pf in "${PID_FILE}" "${DEADMAN_PID_FILE}"; do
-  if [[ -f "${pf}" ]]; then
-    old_pid="$(cat "${pf}")"
-    if [[ -n "${old_pid}" ]] && kill -0 "${old_pid}" 2>/dev/null; then
-      kill "${old_pid}" 2>/dev/null || true
-      sleep 2
-      kill -9 "${old_pid}" 2>/dev/null || true
-    fi
-    rm -f "${pf}"
-  fi
-done
 
 # Ensure minimal build toolchain exists.
 missing_pkgs=()
@@ -100,22 +58,8 @@ if (( ${#missing_pkgs[@]} > 0 )); then
 fi
 
 # Checkout pinned Project Maya commit (audited supply chain).
-if [[ ! -d "${MAYA_DIR}/.git" ]]; then
-  log "Cloning Project Maya (${MAYA_PINNED_TAG} @ ${MAYA_PINNED_COMMIT})..."
-  git clone --depth 1 --branch "${MAYA_PINNED_TAG}" "${MAYA_REPO_URL}" "${MAYA_DIR}"
-fi
-actual_commit="$(git -C "${MAYA_DIR}" rev-parse HEAD)"
-if [[ "${actual_commit}" != "${MAYA_PINNED_COMMIT}" ]]; then
-  log "Fetching pinned commit ${MAYA_PINNED_COMMIT}..."
-  git -C "${MAYA_DIR}" fetch --depth 1 origin "${MAYA_PINNED_COMMIT}"
-  git -C "${MAYA_DIR}" checkout --detach "${MAYA_PINNED_COMMIT}"
-  actual_commit="$(git -C "${MAYA_DIR}" rev-parse HEAD)"
-fi
-if [[ "${actual_commit}" != "${MAYA_PINNED_COMMIT}" ]]; then
-  echo "ERROR: Project Maya commit mismatch: got ${actual_commit}, expected ${MAYA_PINNED_COMMIT}" >&2
-  exit 1
-fi
-log "Verified Project Maya HEAD=${actual_commit}"
+checkout_pinned_commit \
+  "${MAYA_DIR}" "${MAYA_REPO_URL}" "${MAYA_PINNED_TAG}" "${MAYA_PINNED_COMMIT}"
 
 # Check for split CUDA 13 headers (cuda_profiler_api.h / nvtx3/nvToolsExt.h)
 # per Project Maya docs/SETUP.md.
@@ -147,12 +91,16 @@ if [[ -n "${MAYA_HF_REPO}" ]] && [[ "${FAST_HF}" == "1" || "${MAYA_CUSTOM_MODEL_
 
   if [[ ! -x "${HF_VENV}/bin/python" ]]; then
     log "Preparing fast Hugging Face downloader venv..."
+    hf_packages=(
+      "huggingface_hub[hf_xet]==${HF_HUB_PINNED_VERSION}"
+      "hf_transfer==${HF_TRANSFER_PINNED_VERSION}"
+    )
     if command -v uv >/dev/null 2>&1; then
       uv venv -q "${HF_VENV}"
-      uv pip install -q --python "${HF_VENV}/bin/python" "huggingface_hub[hf_xet]" hf_transfer
+      uv pip install -q --python "${HF_VENV}/bin/python" "${hf_packages[@]}"
     else
       python3 -m venv "${HF_VENV}"
-      "${HF_VENV}/bin/pip" install -q --no-input "huggingface_hub[hf_xet]" hf_transfer
+      "${HF_VENV}/bin/pip" install -q --no-input "${hf_packages[@]}"
     fi
   fi
 
@@ -218,8 +166,7 @@ case "${MAYA_DRAFT}" in
     setup_args+=(--drafting off)
     ;;
   *)
-    echo "ERROR: unsupported MAYA_DRAFT=${MAYA_DRAFT}" >&2
-    exit 1
+    die "unsupported MAYA_DRAFT=${MAYA_DRAFT}"
     ;;
 esac
 
@@ -248,6 +195,8 @@ log "Running Project Maya setup: ./maya.sh ${setup_args[*]}"
 )
 
 # Resolve the generated Maya config matching REMOTE_PORT (newest mtime wins).
+# A config for any other port is never used: the server would come up where the
+# tunnel is not looking, and the session would bill until the health timeout.
 CFG_PATH="$(
   MAYA_DIR="${MAYA_DIR}" REMOTE_PORT="${REMOTE_PORT}" python3 - <<'PY'
 import json
@@ -269,16 +218,12 @@ for path in candidates:
     if int(data.get("port", 0)) == want_port:
         print(path)
         raise SystemExit(0)
-if candidates:
-    print(candidates[0])
-    raise SystemExit(0)
-raise SystemExit("No maya-*.json config generated by setup")
+raise SystemExit(f"No maya-*.json config for port {want_port} among {len(candidates)} generated")
 PY
 )"
 
 log "Starting Project Maya server in background (config: ${CFG_PATH}, log: ${LOG_FILE})..."
 : > "${LOG_FILE}"
-date +%s > "${HEARTBEAT_FILE}"
 
 (
   cd "${MAYA_DIR}"
@@ -286,23 +231,4 @@ date +%s > "${HEARTBEAT_FILE}"
   echo $! > "${PID_FILE}"
 )
 
-# Start secondary remote deadman watchdog (guards against workstation power loss).
-deadman_hb_timeout=$(( IDLE_TIMEOUT_S + 600 ))
-deadman_max_dur=$(( MAX_DURATION_S + 300 ))
-nohup python3 "${WORK_DIR}/deadman.py" \
-  --pid-file "${PID_FILE}" \
-  --heartbeat-file "${HEARTBEAT_FILE}" \
-  --max-duration "${deadman_max_dur}" \
-  --heartbeat-timeout "${deadman_hb_timeout}" \
-  >> "${WORK_DIR}/deadman.log" 2>&1 < /dev/null &
-echo $! > "${DEADMAN_PID_FILE}"
-
-sleep 2
-server_pid="$(cat "${PID_FILE}")"
-if ! kill -0 "${server_pid}" 2>/dev/null; then
-  echo "ERROR: Project Maya exited immediately on startup. Last 40 lines of ${LOG_FILE}:" >&2
-  tail -n 40 "${LOG_FILE}" >&2 || true
-  exit 1
-fi
-
-log "Project Maya launched (pid=${server_pid}); local supervisor will poll /health over SSH tunnel."
+bootstrap_finish

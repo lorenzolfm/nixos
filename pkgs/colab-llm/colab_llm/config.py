@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 DEFAULT_SESSION = "colab-llm"
@@ -20,14 +21,28 @@ DEFAULT_LOCAL_PORT = 18100
 DEFAULT_REMOTE_PORT = 18100
 
 DEFAULT_IDLE_TIMEOUT_S = 1800  # 30 minutes
-MIN_IDLE_TIMEOUT_S = 60
-MAX_IDLE_TIMEOUT_S = 14400  # 4 hours
+IDLE_TIMEOUT_S_MIN = 60
+IDLE_TIMEOUT_S_MAX = 14400  # 4 hours
 
 DEFAULT_MAX_DURATION_S = 14400  # 4 hours hard cap
-MIN_MAX_DURATION_S = 300  # 5 minutes
-MAX_MAX_DURATION_S = 43200  # 12 hours
+DURATION_S_MIN = 300  # 5 minutes
+DURATION_S_MAX = 43200  # 12 hours
 
 DEFAULT_BOOTSTRAP_TIMEOUT_S = 1800  # 30 minutes (download + compile + load)
+BOOTSTRAP_TIMEOUT_S_MIN = 60
+BOOTSTRAP_TIMEOUT_S_MAX = 7200  # 2 hours
+
+# Heartbeats keep the remote deadman from firing while the workstation is alive.
+# The local supervisor sends one every HEARTBEAT_INTERVAL_S over the tunnel; the
+# bootstrap script sends its own every BOOTSTRAP_HEARTBEAT_INTERVAL_S because no
+# tunnel exists yet. The deadman tolerates idle_timeout_s + DEADMAN_HEARTBEAT_GRACE_S
+# of silence, so the grace must cover at least two missed supervisor heartbeats.
+HEARTBEAT_INTERVAL_S = 300
+BOOTSTRAP_HEARTBEAT_INTERVAL_S = 60
+DEADMAN_HEARTBEAT_GRACE_S = 600
+DEADMAN_DURATION_GRACE_S = 300
+assert HEARTBEAT_INTERVAL_S * 2 <= DEADMAN_HEARTBEAT_GRACE_S
+assert BOOTSTRAP_HEARTBEAT_INTERVAL_S <= HEARTBEAT_INTERVAL_S
 
 DEFAULT_ENGINE = "maya"
 ALLOWED_ENGINES = ("maya", "vllm", "llama-cpp", "sglang")
@@ -36,7 +51,20 @@ DEFAULT_MAYA_MODEL = "EXL3-3.05bpw"
 DEFAULT_MAYA_DRAFT = "dflash2"
 ALLOWED_MAYA_DRAFTS = ("dflash2", "mtp", "off")
 DEFAULT_CONTEXT_LENGTH = 131072
+CONTEXT_LENGTH_MIN = 4096
+CONTEXT_LENGTH_MAX = 1048576
 DEFAULT_PARALLEL = 1
+PARALLEL_MAX = 8
+
+# Model used when neither --model nor --hf-repo is given, per engine. Resolved at
+# config construction so a missing model can never surface after GPU allocation.
+DEFAULT_ENGINE_MODELS: dict[str, str] = {
+    "maya": DEFAULT_MAYA_MODEL,
+    "vllm": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "llama-cpp": "unsloth/GLM-5.3-Flash-GGUF:UD-IQ2_XXS",
+    "sglang": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+}
+assert set(DEFAULT_ENGINE_MODELS) == set(ALLOWED_ENGINES)
 
 # Pinned Project Maya upstream release (audited commit SHA).
 MAYA_REPO_URL = "https://github.com/mw00/project-maya.git"
@@ -56,6 +84,32 @@ KNOWN_MAYA_HF_PREFETCH: dict[str, tuple[str, str]] = {
         "2a30229e67012798ba9f0cd832bb78abf4c363d5",
     ),
 }
+
+# Pinned remote build inputs for the other engines. These run as root on the VM,
+# so they are pinned for the same reason Maya is. Transitive pip dependencies are
+# still resolved at install time.
+LLAMA_CPP_REPO_URL = "https://github.com/ggml-org/llama.cpp.git"
+LLAMA_CPP_PINNED_TAG = "b12826"
+LLAMA_CPP_PINNED_COMMIT = "8e23278c7c36f4429fb237467d50e2935a91e655"
+VLLM_PINNED_VERSION = "0.34.0"
+SGLANG_PINNED_VERSION = "0.5.23"
+HF_HUB_PINNED_VERSION = "2.5.0"
+HF_TRANSFER_PINNED_VERSION = "0.1.9"
+
+
+class StopReason(StrEnum):
+    """Why a supervised session ended. Recorded in the state file and ledger."""
+
+    ERROR = "error"
+    SIGNAL_SIGINT = "signal:SIGINT"
+    SIGNAL_SIGTERM = "signal:SIGTERM"
+    SIGNAL_SIGHUP = "signal:SIGHUP"
+    HEALTH_TIMEOUT = "startup_timeout"
+    REMOTE_PROCESS_EXITED = "remote_process_exited"
+    IDLE_TIMEOUT = "idle_timeout"
+    MAX_DURATION = "max_duration"
+    TUNNEL_DISCONNECTED = "tunnel_disconnected"
+
 
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _DURATION_TOKEN_RE = re.compile(r"(\d+)\s*([hms]?)", re.IGNORECASE)
@@ -97,15 +151,15 @@ def validate_port(port: int, label: str = "port") -> int:
 
 
 def validate_timeouts(idle_timeout_s: int, max_duration_s: int) -> tuple[int, int]:
-    if not (MIN_IDLE_TIMEOUT_S <= idle_timeout_s <= MAX_IDLE_TIMEOUT_S):
+    if not (IDLE_TIMEOUT_S_MIN <= idle_timeout_s <= IDLE_TIMEOUT_S_MAX):
         raise ValueError(
             f"idle_timeout_s={idle_timeout_s} out of bounds "
-            f"[{MIN_IDLE_TIMEOUT_S}, {MAX_IDLE_TIMEOUT_S}]"
+            f"[{IDLE_TIMEOUT_S_MIN}, {IDLE_TIMEOUT_S_MAX}]"
         )
-    if not (MIN_MAX_DURATION_S <= max_duration_s <= MAX_MAX_DURATION_S):
+    if not (DURATION_S_MIN <= max_duration_s <= DURATION_S_MAX):
         raise ValueError(
             f"max_duration_s={max_duration_s} out of bounds "
-            f"[{MIN_MAX_DURATION_S}, {MAX_MAX_DURATION_S}]"
+            f"[{DURATION_S_MIN}, {DURATION_S_MAX}]"
         )
     if idle_timeout_s > max_duration_s:
         raise ValueError(
@@ -120,8 +174,6 @@ def parse_duration(spec: str) -> int:
     text = spec.strip()
     if not text:
         raise ValueError("Duration cannot be empty")
-    if text.isdigit():
-        return int(text)
 
     total = 0
     pos = 0
@@ -133,9 +185,31 @@ def parse_duration(spec: str) -> int:
         unit = match.group(2).lower()
         total += amount * multipliers[unit]
         pos = match.end()
-    if pos != len(text) or total <= 0:
+    if pos != len(text):
         raise ValueError(f"Invalid duration syntax: {spec!r}")
+    if total <= 0:
+        raise ValueError(f"Duration must be positive: {spec!r}")
     return total
+
+
+def deadman_heartbeat_timeout_s(idle_timeout_s: int) -> int:
+    """Heartbeat silence the remote deadman tolerates before stopping the VM."""
+    assert idle_timeout_s >= IDLE_TIMEOUT_S_MIN
+    timeout_s = idle_timeout_s + DEADMAN_HEARTBEAT_GRACE_S
+    assert timeout_s > HEARTBEAT_INTERVAL_S
+    return timeout_s
+
+
+def deadman_duration_s_max(max_duration_s: int, bootstrap_timeout_s: int) -> int:
+    """Wall-clock cap for the remote deadman, which starts before the bootstrap.
+
+    The local hard cap only starts once the engine is ready, after up to one
+    bootstrap timeout of setup and one more of waiting for health. The remote
+    cap must outlast all three so it never fires before the local one.
+    """
+    assert max_duration_s >= DURATION_S_MIN
+    assert bootstrap_timeout_s >= BOOTSTRAP_TIMEOUT_S_MIN
+    return max_duration_s + 2 * bootstrap_timeout_s + DEADMAN_DURATION_GRACE_S
 
 
 def format_duration(seconds: float) -> str:
@@ -232,15 +306,17 @@ class LaunchConfig:
                 f"Unsupported draft mode {self.draft!r}: "
                 f"choose one of {', '.join(ALLOWED_MAYA_DRAFTS)}"
             )
-        if not (4096 <= self.context_length <= 1048576):
+        if not (CONTEXT_LENGTH_MIN <= self.context_length <= CONTEXT_LENGTH_MAX):
             raise ValueError(
-                f"context_length={self.context_length} out of bounds [4096, 1048576]"
+                f"context_length={self.context_length} out of bounds "
+                f"[{CONTEXT_LENGTH_MIN}, {CONTEXT_LENGTH_MAX}]"
             )
-        if not (1 <= self.parallel <= 8):
-            raise ValueError(f"parallel={self.parallel} out of bounds [1, 8]")
-        if not (60 <= self.bootstrap_timeout_s <= 7200):
+        if not (1 <= self.parallel <= PARALLEL_MAX):
+            raise ValueError(f"parallel={self.parallel} out of bounds [1, {PARALLEL_MAX}]")
+        if not (BOOTSTRAP_TIMEOUT_S_MIN <= self.bootstrap_timeout_s <= BOOTSTRAP_TIMEOUT_S_MAX):
             raise ValueError(
-                f"bootstrap_timeout_s={self.bootstrap_timeout_s} out of bounds [60, 7200]"
+                f"bootstrap_timeout_s={self.bootstrap_timeout_s} out of bounds "
+                f"[{BOOTSTRAP_TIMEOUT_S_MIN}, {BOOTSTRAP_TIMEOUT_S_MAX}]"
             )
         if self.model is not None and not _MODEL_NAME_RE.fullmatch(self.model):
             raise ValueError(f"Invalid model identifier: {self.model!r}")
@@ -255,10 +331,12 @@ class LaunchConfig:
 
     @property
     def effective_model(self) -> str:
+        """The model to serve. Total: every engine has a default, so this never raises."""
+        assert self.engine in DEFAULT_ENGINE_MODELS
         if self.model:
             return self.model
         if self.engine == "maya":
             return DEFAULT_MAYA_MODEL
         if self.hf_repo:
             return self.hf_repo
-        raise ValueError(f"Engine {self.engine!r} requires --model (or --hf-repo)")
+        return DEFAULT_ENGINE_MODELS[self.engine]
