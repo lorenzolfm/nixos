@@ -198,9 +198,7 @@ where
         command.env_clear();
         command.envs(env_pairs.iter().map(|(k, v)| (k, v)));
     }
-    if let Some(drop_cfg) = &options.privilege_drop {
-        sys::configure_privilege_drop(&mut command, drop_cfg);
-    }
+    sys::configure_child_pre_exec(&mut command, options.privilege_drop.as_ref());
 
     let mut child = match command.spawn() {
         Ok(proc_handle) => proc_handle,
@@ -590,6 +588,9 @@ fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitSta
 
 fn kill_and_reap(child: &mut Child) -> Option<ExitStatus> {
     assert!(child.id() > 0, "child PID must be positive");
+    if let Err(err) = sys::kill_process_group(child.id()) {
+        eprintln!("disk-cleanup: warning: failed to kill child process group: {err}");
+    }
     if let Err(err) = child.kill()
         && err.kind() != io::ErrorKind::InvalidInput
     {

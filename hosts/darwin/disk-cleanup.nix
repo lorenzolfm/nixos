@@ -37,15 +37,15 @@ in
   };
 
   # Pre-provision a reboot-persistent root-owned lockfile directory with a
-  # group-writable lockfile so root launchd runs and manual user runs contend
-  # on the exact same inode.
+  # group-readable lockfile so root launchd runs and manual user runs contend
+  # on the exact same inode via `flock(2)` without granting group write access.
   system.activationScripts.postActivation.text = lib.mkAfter ''
     install -d -m 0755 -o root -g wheel /var/db/disk-cleanup
     if [ ! -e /var/db/disk-cleanup/lock ]; then
-      install -m 0660 -o root -g staff /dev/null /var/db/disk-cleanup/lock
+      install -m 0640 -o root -g staff /dev/null /var/db/disk-cleanup/lock
     else
       chown root:staff /var/db/disk-cleanup/lock
-      chmod 0660 /var/db/disk-cleanup/lock
+      chmod 0640 /var/db/disk-cleanup/lock
     fi
   '';
 

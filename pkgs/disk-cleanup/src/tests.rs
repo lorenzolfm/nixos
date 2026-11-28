@@ -18,21 +18,21 @@ use crate::cleanup::{
 use crate::cli::{CliCommand, ParseOutcome, parse_args_with_user_resolver};
 use crate::constants::{
     AGE_DAYS_MAX, CACHEDIR_TAG_SIGNATURE_BYTES, CLI_ARGS_MAX, ERROR_MESSAGE_BYTES_MAX, ERRORS_MAX,
-    NANOS_PER_SECOND, SUBPROCESS_OUTPUT_BYTES_MAX, TARGET_MTIME_DEPTH_MAX,
+    NANOS_PER_SECOND, SUBPROCESS_OUTPUT_BYTES_MAX, TARGET_MTIME_DEPTH_MAX, USER_GROUPS_MAX,
 };
 use crate::ipc::{UserPhaseStats, encode_user_phase_stats_json, parse_user_phase_stats_json};
 use crate::process::{
-    CommandOptions, CommandOutcome, ProcessExit, StderrConfig, StdoutCapture, StdoutConfig,
-    run_command_streaming,
+    CommandOptions, CommandOutcome, PrivilegeDrop, ProcessExit, StderrConfig, StdoutCapture,
+    StdoutConfig, run_command_streaming,
 };
 use crate::scan::{
     DiskUsage, ProjectScanConfig, TreeFreshness, compute_disk_usage, default_lock_path,
-    inspect_tmp_tree, latest_target_mtime_ns, parse_nix_develop_pid, probe_cargo_target_lock,
-    scan_projects, scan_stale_nix_tmp_dirs,
+    inspect_tmp_tree, is_cargo_target_dir, latest_target_mtime_ns, parse_nix_develop_pid,
+    probe_cargo_target_lock, scan_projects, scan_stale_nix_tmp_dirs,
 };
 use crate::sys::{
-    self, AdvisoryLock, CargoLockProbe, FilesystemStat, RmtreeError, safe_rmtree,
-    safe_rmtree_with_batch_max,
+    self, AdvisoryLock, CargoLockProbe, FilesystemStat, NonRootPasswdEntry, RmtreeError,
+    safe_rmtree, safe_rmtree_with_batch_max,
 };
 use crate::types::{
     AbsPath, AgeDurationNs, BoundedErrors, CleanupMode, DiskPercent, EntryName, NixGcAgeDays,
@@ -1371,4 +1371,178 @@ fn validated_domain_types_reject_illegal_constructions() {
     assert!(EntryName::try_from_bytes(b".").is_err());
     assert!(EntryName::try_from_bytes(b"..").is_err());
     assert!(EntryName::try_from_bytes(b"a/b").is_err());
+}
+
+#[test]
+fn setgroups_cap_preserves_primary_gid_and_enforces_platform_limit() {
+    let max_groups = sys::platform_ngroups_max();
+    assert!((1..=USER_GROUPS_MAX).contains(&max_groups));
+
+    // Truncating a macOS-sized over-limit list (> 16 groups) preserves primary_gid at index 0.
+    let mut groups: Vec<u32> = (20..45).collect();
+    sys::cap_groups_for_setgroups(&mut groups, 16, 20);
+    assert_eq!(groups.len(), 16);
+    assert!(groups.contains(&20));
+
+    // When primary_gid lies past the cap, capping still guarantees primary_gid is retained.
+    let mut displaced: Vec<u32> = (100..125).collect();
+    sys::cap_groups_for_setgroups(&mut displaced, 16, 120);
+    assert_eq!(displaced.len(), 16);
+    assert!(displaced.contains(&120));
+
+    // Lists already within the cap are untouched.
+    let mut short = vec![20, 80, 12];
+    sys::cap_groups_for_setgroups(&mut short, 16, 20);
+    assert_eq!(short, vec![20, 80, 12]);
+
+    // `PrivilegeDrop::for_target` rejects group lists exceeding the platform limit.
+    let target = NonRootPasswdEntry {
+        name: tester_user(),
+        uid: NonZeroU32::new(1000).expect("1000 > 0"),
+        gid: 100,
+        home_dir: AbsPath::from_absolute(Path::new("/home/tester")).expect("valid home"),
+    };
+    let oversized = vec![100; max_groups + 1];
+    assert!(PrivilegeDrop::for_target(&target, oversized).is_err());
+    assert!(PrivilegeDrop::for_target(&target, vec![100]).is_ok());
+}
+
+#[test]
+fn subprocess_timeout_kills_entire_process_group() {
+    let lines_max = NonZeroU64::new(64).expect("64 > 0");
+    let mut grandchild_pid: Option<NonZeroU32> = None;
+
+    let opts = CommandOptions {
+        program: OsString::from("/bin/sh"),
+        args: os_args(&["-c", "sleep 30 >/dev/null 2>&1 & echo $!; wait"]),
+        timeout: Duration::from_millis(250),
+        env_override: None,
+        privilege_drop: None,
+        stream_lines_max: lines_max,
+    };
+    let outcome = run_command_streaming(
+        &opts,
+        StdoutConfig::StreamOnly {
+            on_line: Some(|line: &str| {
+                if let Ok(raw) = line.trim().parse::<u32>() {
+                    grandchild_pid = NonZeroU32::new(raw);
+                }
+            }),
+        },
+        StderrConfig::<fn(&str)>::Piped {
+            tail_bytes_max: 256,
+            on_line: None,
+        },
+    );
+    assert!(matches!(outcome, CommandOutcome::TimedOut { .. }));
+
+    let pid = grandchild_pid.expect("shell should have printed grandchild sleep PID");
+    // Give the kernel a brief window to reap/tear down the SIGKILLed grandchild.
+    let mut alive = true;
+    for _ in 0..50 {
+        if !sys::is_pid_alive(pid) {
+            alive = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !alive,
+        "grandchild process {pid} survived parent timeout instead of being killed with its process group"
+    );
+}
+
+#[test]
+fn fifos_non_regular_locks_readonly_lockfile_and_dirfd_tmp_inspection() {
+    let fx = TestFixture::new("fifo-dirfd-lock");
+
+    // 1. Existing read-only (`0440`) regular lockfile supports `flock` contention via `O_RDONLY`.
+    let ro_lock = fx
+        .root
+        .join_relative(Path::new("preprovisioned.lock"))
+        .expect("ro_lock");
+    fs::write(ro_lock.as_path(), "").expect("create preprovisioned lockfile");
+    chmod(ro_lock.as_path(), 0o440);
+    let first = AdvisoryLock::try_acquire(&ro_lock)
+        .expect("acquire 0440 lockfile")
+        .expect("lock should succeed");
+    assert!(
+        AdvisoryLock::try_acquire(&ro_lock)
+            .expect("contend 0440 lockfile")
+            .is_none(),
+        "second acquire must contend on the same 0440 inode"
+    );
+    drop(first);
+    assert!(
+        AdvisoryLock::try_acquire(&ro_lock)
+            .expect("re-acquire after drop")
+            .is_some()
+    );
+
+    // 2. FIFOs at `CACHEDIR.TAG`, `.cargo-lock`, or lockfile must fail fast without blocking.
+    let make_fifo = |path: &Path| {
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("no NUL");
+        // SAFETY: `c_path` is a valid NUL-terminated path.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed on {}", path.display());
+    };
+
+    let fifo_lock = fx
+        .root
+        .join_relative(Path::new("fifo.lock"))
+        .expect("fifo_lock");
+    make_fifo(fifo_lock.as_path());
+    assert!(AdvisoryLock::try_acquire(&fifo_lock).is_err());
+
+    let fifo_target = fx.make_cargo_project("repo-fifo", 72.0, None, true);
+    let fifo_tag = fifo_target.as_path().join("CACHEDIR.TAG");
+    make_fifo(&fifo_tag);
+    assert!(!is_cargo_target_dir(&fifo_target));
+
+    let fifo_cargo_lock = fifo_target.as_path().join(".cargo-lock");
+    make_fifo(&fifo_cargo_lock);
+    assert!(matches!(
+        probe_cargo_target_lock(&fifo_target),
+        CargoLockProbe::SymlinkOrUnreadable(_)
+    ));
+
+    // Directory named `.cargo-lock` must also fail closed as non-regular.
+    fs::remove_file(&fifo_cargo_lock).expect("remove fifo .cargo-lock");
+    fs::create_dir(&fifo_cargo_lock).expect("mkdir .cargo-lock");
+    assert!(matches!(
+        probe_cargo_target_lock(&fifo_target),
+        CargoLockProbe::SymlinkOrUnreadable(_)
+    ));
+
+    // 3. `inspect_tmp_tree` anchors with `O_NOFOLLOW`: refuses root symlinks and never follows nested symlinks.
+    let outside_fresh = fx.root.as_path().join("outside-fresh");
+    fs::create_dir_all(&outside_fresh).expect("mkdir outside_fresh");
+    let fresh_file = outside_fresh.join("recent.txt");
+    fs::write(&fresh_file, "fresh").expect("write fresh_file");
+
+    let root_symlink = fx
+        .root
+        .join_relative(Path::new("nix-shell.rootlink"))
+        .expect("root_symlink");
+    symlink(&outside_fresh, root_symlink.as_path()).expect("symlink root_symlink");
+    assert!(matches!(
+        inspect_tmp_tree(&root_symlink, fx.now_ns.as_i128()),
+        TreeFreshness::Unreadable(_)
+    ));
+
+    let stale_dir = fx
+        .root
+        .join_relative(Path::new("nix-shell.nestedlink"))
+        .expect("stale_dir");
+    fs::create_dir_all(stale_dir.as_path()).expect("mkdir stale_dir");
+    let nested_link = stale_dir.as_path().join("escape");
+    symlink(&outside_fresh, &nested_link).expect("symlink escape");
+    let old_mtime_ns = fx.now_ns.as_i128() - 48 * 3600 * NANOS_PER_SECOND;
+    set_mtime_ns(&nested_link, old_mtime_ns);
+    set_mtime_ns(stale_dir.as_path(), old_mtime_ns);
+    let cutoff_ns = fx.now_ns.as_i128() - 24 * 3600 * NANOS_PER_SECOND;
+    assert!(matches!(
+        inspect_tmp_tree(&stale_dir, cutoff_ns),
+        TreeFreshness::Stale(_)
+    ));
 }

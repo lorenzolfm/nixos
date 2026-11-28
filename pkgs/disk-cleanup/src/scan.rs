@@ -395,87 +395,124 @@ pub fn latest_target_mtime_ns(
     TreeFreshness::Stale(newest_ns)
 }
 
-/// Single-pass mtime + disk-usage inspection for a `/tmp/nix-*` tree.
+/// Single-pass `dirfd`-anchored mtime + disk-usage inspection for a `/tmp/nix-*` tree.
 ///
-/// Fails closed and distinguishes recent modifications from unreadable entries,
-/// type changes, and walk depth/entry limits.
+/// Opens the root and every subdirectory with `O_DIRECTORY | O_NOFOLLOW`, refuses
+/// mountpoint crossings, and distinguishes recent modifications from unreadable
+/// entries and walk depth/entry limits.
 pub fn inspect_tmp_tree(root: &NonRootAbsPath, cutoff_ns: i128) -> TreeFreshness<TmpTreeSummary> {
-    let root_meta = match fs::symlink_metadata(root.as_path()) {
-        Ok(meta) => meta,
+    let parent_abs = root.parent();
+    let root_name = root.file_name();
+    let (root_dir, root_stat) = match sys::open_dir_entry_nofollow(&parent_abs, &root_name) {
+        Ok(opened) => opened,
         Err(err) => return TreeFreshness::Unreadable(err),
     };
-    if !root_meta.file_type().is_dir() {
-        return TreeFreshness::Unreadable(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "entry is not a directory",
-        ));
-    }
-    let mut newest_ns = metadata_mtime_ns(&root_meta);
+    let mut newest_ns = root_stat.mtime_ns;
     if newest_ns > cutoff_ns {
         return TreeFreshness::Recent;
     }
 
-    let mut total_bytes: u64 = root_meta.blocks().saturating_mul(512);
+    let root_device_id = root_stat.device_id;
+    let mut total_bytes: u64 = root_stat.blocks.saturating_mul(512);
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     let mut entries_visited_count: usize = 0;
-    let mut stack: Vec<(PathBuf, usize)> = Vec::with_capacity(WALK_DEPTH_MAX);
-    stack.push((root.as_path().to_path_buf(), 0));
+    let mut iterations_count: usize = 0;
+    let iterations_max = TREE_WALK_ENTRIES_MAX.saturating_mul(2).saturating_add(1024);
 
-    let mut dirs_popped_count: usize = 0;
-    while let Some((current, depth)) = stack.pop() {
-        dirs_popped_count = dirs_popped_count.saturating_add(1);
-        if dirs_popped_count > TREE_WALK_ENTRIES_MAX {
+    let mut stack: Vec<(sys::OpenDir, usize)> = Vec::with_capacity(WALK_DEPTH_MAX);
+    stack.push((root_dir, 0));
+
+    while !stack.is_empty() {
+        iterations_count = iterations_count.saturating_add(1);
+        if iterations_count > iterations_max {
             return TreeFreshness::LimitExceeded;
         }
-        if depth >= WALK_DEPTH_MAX {
-            return TreeFreshness::LimitExceeded;
-        }
-        let read_dir = match fs::read_dir(&current) {
-            Ok(iter) => iter,
-            Err(err) => return TreeFreshness::Unreadable(err),
+        assert!(
+            stack.len() <= WALK_DEPTH_MAX,
+            "inspect_tmp_tree stack exceeded WALK_DEPTH_MAX"
+        );
+
+        let next_step = {
+            let (current_dir, depth) = stack.last_mut().expect("stack is non-empty");
+            (current_dir.next_entry(), *depth)
         };
-        for entry_result in read_dir {
-            entries_visited_count = entries_visited_count.saturating_add(1);
-            if entries_visited_count > TREE_WALK_ENTRIES_MAX {
+
+        let (entry_name, depth) = match next_step {
+            (Ok(Some(name)), depth) => (name, depth),
+            (Ok(None), _) => {
+                stack.pop();
+                continue;
+            }
+            (Err(err), _) => return TreeFreshness::Unreadable(err),
+        };
+
+        entries_visited_count = entries_visited_count.saturating_add(1);
+        if entries_visited_count > TREE_WALK_ENTRIES_MAX {
+            return TreeFreshness::LimitExceeded;
+        }
+
+        let entry_stat = {
+            let (current_dir, _) = stack.last().expect("stack is non-empty");
+            match current_dir.fstatat_nofollow(&entry_name) {
+                Ok(stat) => stat,
+                Err(err) => return TreeFreshness::Unreadable(err),
+            }
+        };
+        if entry_stat.mtime_ns > cutoff_ns {
+            return TreeFreshness::Recent;
+        }
+        if entry_stat.mtime_ns > newest_ns {
+            newest_ns = entry_stat.mtime_ns;
+        }
+
+        let count_blocks = if entry_stat.nlink > 1 {
+            let inode_key = (entry_stat.device_id, entry_stat.ino);
+            if seen_inodes.contains(&inode_key) {
+                false
+            } else {
+                if seen_inodes.len() < INODES_TRACKED_MAX {
+                    seen_inodes.insert(inode_key);
+                }
+                true
+            }
+        } else {
+            true
+        };
+        if count_blocks {
+            total_bytes = total_bytes.saturating_add(entry_stat.blocks.saturating_mul(512));
+        }
+
+        if entry_stat.is_dir {
+            if depth + 1 >= WALK_DEPTH_MAX {
                 return TreeFreshness::LimitExceeded;
             }
-            let entry = match entry_result {
-                Ok(val) => val,
+            if entry_stat.device_id != root_device_id {
+                return TreeFreshness::Unreadable(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing to cross mountpoint during inspect: {entry_name}"),
+                ));
+            }
+            let opened_sub = {
+                let (current_dir, _) = stack.last().expect("stack is non-empty");
+                current_dir.open_subdir_nofollow(&entry_name)
+            };
+            let (subdir, opened_stat) = match opened_sub {
+                Ok(pair) => pair,
                 Err(err) => return TreeFreshness::Unreadable(err),
             };
-            let entry_path = entry.path();
-            let entry_meta = match fs::symlink_metadata(&entry_path) {
-                Ok(meta) => meta,
-                Err(err) => return TreeFreshness::Unreadable(err),
-            };
-            let entry_mtime_ns = metadata_mtime_ns(&entry_meta);
-            if entry_mtime_ns > cutoff_ns {
+            if opened_stat.device_id != root_device_id {
+                return TreeFreshness::Unreadable(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("refusing to cross mountpoint during inspect: {entry_name}"),
+                ));
+            }
+            if opened_stat.mtime_ns > cutoff_ns {
                 return TreeFreshness::Recent;
             }
-            if entry_mtime_ns > newest_ns {
-                newest_ns = entry_mtime_ns;
+            if opened_stat.mtime_ns > newest_ns {
+                newest_ns = opened_stat.mtime_ns;
             }
-
-            let count_blocks = if entry_meta.nlink() > 1 {
-                let inode_key = (entry_meta.dev(), entry_meta.ino());
-                if seen_inodes.contains(&inode_key) {
-                    false
-                } else {
-                    if seen_inodes.len() < INODES_TRACKED_MAX {
-                        seen_inodes.insert(inode_key);
-                    }
-                    true
-                }
-            } else {
-                true
-            };
-            if count_blocks {
-                total_bytes = total_bytes.saturating_add(entry_meta.blocks().saturating_mul(512));
-            }
-
-            if entry_meta.file_type().is_dir() {
-                stack.push((entry_path, depth + 1));
-            }
+            stack.push((subdir, depth + 1));
         }
     }
 

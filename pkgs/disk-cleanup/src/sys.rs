@@ -114,9 +114,11 @@ pub struct PrivilegeDrop {
 
 impl PrivilegeDrop {
     pub fn for_target(target: &NonRootPasswdEntry, extra_groups: Vec<u32>) -> Result<Self, String> {
-        if extra_groups.len() > USER_GROUPS_MAX {
+        let max_groups = platform_ngroups_max();
+        if extra_groups.len() > max_groups {
             return Err(format!(
-                "extra_groups exceeded USER_GROUPS_MAX ({USER_GROUPS_MAX})"
+                "extra_groups ({}) exceeded platform limit ({max_groups})",
+                extra_groups.len()
             ));
         }
         Ok(Self {
@@ -125,6 +127,44 @@ impl PrivilegeDrop {
             extra_groups,
         })
     }
+}
+
+/// Platform maximum supplementary groups accepted by `setgroups(2)`, bounded by `USER_GROUPS_MAX`.
+///
+/// On macOS, XNU enforces `NGROUPS_MAX == 16` in `setgroups(2)` even though
+/// `getgrouplist(3)` can return more entries from Directory Services.
+pub fn platform_ngroups_max() -> usize {
+    #[cfg(target_os = "macos")]
+    const FALLBACK_MAX: usize = 16;
+    #[cfg(not(target_os = "macos"))]
+    const FALLBACK_MAX: usize = USER_GROUPS_MAX;
+
+    // SAFETY: `sysconf(_SC_NGROUPS_MAX)` has no preconditions and is thread-safe.
+    let raw = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+    let reported = usize::try_from(raw)
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(FALLBACK_MAX);
+    let capped = reported.clamp(1, USER_GROUPS_MAX);
+    assert!(capped >= 1);
+    assert!(capped <= USER_GROUPS_MAX);
+    capped
+}
+
+/// Bound `groups` to `max_groups` for `setgroups(2)` while preserving `primary_gid`.
+pub fn cap_groups_for_setgroups(groups: &mut Vec<u32>, max_groups: usize, primary_gid: u32) {
+    assert!(max_groups >= 1, "max_groups must be positive");
+    if groups.len() <= max_groups {
+        return;
+    }
+    groups.truncate(max_groups);
+    if !groups.contains(&primary_gid)
+        && let Some(last) = groups.last_mut()
+    {
+        *last = primary_gid;
+    }
+    assert!(groups.len() <= max_groups);
+    assert!(groups.contains(&primary_gid));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,12 +208,13 @@ pub struct AdvisoryLock {
 impl AdvisoryLock {
     /// Attempt to acquire a non-blocking exclusive advisory lock on `lock_path`.
     ///
-    /// Opens an existing pre-provisioned regular file first without `O_CREAT`
-    /// (allowing non-root group members to lock a file inside a root-owned
-    /// `0755` directory) and falls back to creating the lockfile only on `ENOENT`.
+    /// Opens an existing pre-provisioned regular file read-only first without `O_CREAT`
+    /// (`flock(2)` accepts `O_RDONLY` on Linux and macOS, allowing `0640` group-readable
+    /// lockfiles without granting write access) and falls back to creating the lockfile
+    /// only on `ENOENT`.
     pub fn try_acquire(lock_path: &NonRootAbsPath) -> io::Result<Option<Self>> {
         let c_path = lock_path.as_abs().to_cstring();
-        let existing_flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let existing_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
         // SAFETY: `c_path` is a valid NUL-terminated path and `O_CREAT` is not set.
         let mut raw_fd = unsafe { libc::open(c_path.as_ptr(), existing_flags) };
 
@@ -184,7 +225,11 @@ impl AdvisoryLock {
             }
             let parent = lock_path.parent();
             fs::create_dir_all(parent.as_path())?;
-            let create_flags = libc::O_CREAT | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let create_flags = libc::O_CREAT
+                | libc::O_RDWR
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK;
             let mode: libc::c_uint = 0o600;
             // SAFETY: `c_path` is NUL-terminated; `mode` is promoted `c_uint` for varargs.
             raw_fd = unsafe { libc::open(c_path.as_ptr(), create_flags, mode) };
@@ -279,7 +324,8 @@ pub enum CargoLockProbe {
 /// blocking any newly starting Cargo build on `.cargo-lock`.
 pub fn try_acquire_cargo_lock(lock_file: &NonRootAbsPath) -> CargoLockProbe {
     let c_path = lock_file.as_abs().to_cstring();
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // `O_NONBLOCK` prevents blocking indefinitely if `.cargo-lock` is replaced with a FIFO.
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
     // SAFETY: `c_path` is a valid NUL-terminated path and `O_CREAT` is not set.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), flags) };
     if raw_fd < 0 {
@@ -293,6 +339,16 @@ pub fn try_acquire_cargo_lock(lock_file: &NonRootAbsPath) -> CargoLockProbe {
 
     // SAFETY: `raw_fd` is a freshly opened owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let stat_buf = match fstat_fd(fd.as_raw_fd()) {
+        Ok(stat) => stat,
+        Err(err) => return CargoLockProbe::SymlinkOrUnreadable(err),
+    };
+    if (stat_buf.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return CargoLockProbe::SymlinkOrUnreadable(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cargo lock is not a regular file: {}", lock_file.display()),
+        ));
+    }
 
     // SAFETY: `fd` is open and valid.
     let rc = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -383,7 +439,8 @@ pub fn read_regular_prefix_nofollow(
     assert!(!buf.is_empty(), "read buffer must be non-empty");
 
     let c_path = path.as_abs().to_cstring();
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // `O_NONBLOCK` prevents blocking indefinitely on FIFOs before the `S_IFREG` check below.
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
     // SAFETY: `c_path` is NUL-terminated and `O_CREAT` is not set.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), flags) };
     if raw_fd < 0 {
@@ -393,6 +450,7 @@ pub fn read_regular_prefix_nofollow(
             || raw_errno == Some(libc::ELOOP)
             || raw_errno == Some(libc::EMLINK)
             || raw_errno == Some(libc::EISDIR)
+            || raw_errno == Some(libc::ENXIO)
         {
             return Ok(None);
         }
@@ -591,7 +649,9 @@ pub fn user_groups(user_name: &UserName, primary_gid: u32) -> io::Result<Vec<u32
                 #[cfg(not(target_os = "macos"))]
                 result.push(raw_gid);
             }
-            assert!(result.len() <= USER_GROUPS_MAX);
+            let max_groups = platform_ngroups_max();
+            cap_groups_for_setgroups(&mut result, max_groups, primary_gid);
+            assert!(result.len() <= max_groups);
             return Ok(result);
         }
 
@@ -604,39 +664,66 @@ pub fn user_groups(user_name: &UserName, primary_gid: u32) -> io::Result<Vec<u32
     )))
 }
 
-/// Configure a `Command` to drop privileges (`setgroups` -> `setgid` -> `setuid`)
-/// atomically in `pre_exec` before `execve`.
-pub fn configure_privilege_drop(cmd: &mut Command, privilege_drop: &PrivilegeDrop) {
-    let user_uid = privilege_drop.user_uid.get();
-    let group_gid = privilege_drop.group_gid;
-    let groups: Vec<libc::gid_t> = privilege_drop.extra_groups.clone();
+/// Configure a `Command`'s `pre_exec` hook to isolate the child in its own process
+/// group (`setpgid(0, 0)`) and, when requested, drop privileges (`setgroups` ->
+/// `setgid` -> `setuid`) atomically before `execve`.
+pub fn configure_child_pre_exec(cmd: &mut Command, privilege_drop: Option<&PrivilegeDrop>) {
+    let drop_spec =
+        privilege_drop.map(|cfg| (cfg.user_uid.get(), cfg.group_gid, cfg.extra_groups.clone()));
 
     // SAFETY: The closure calls only async-signal-safe POSIX functions
-    // (`setgroups`, `setgid`, `setuid`) and performs no heap allocations.
-    // All three execute in canonical privilege-drop order before `execve`.
+    // (`setpgid`, `setgroups`, `setgid`, `setuid`) and performs no heap allocations.
     unsafe {
         cmd.pre_exec(move || {
-            #[cfg(target_os = "macos")]
-            let groups_rc = {
-                let len_cint = libc::c_int::try_from(groups.len())
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-                libc::setgroups(len_cint, groups.as_ptr())
-            };
-            #[cfg(not(target_os = "macos"))]
-            let groups_rc = libc::setgroups(groups.len(), groups.as_ptr());
+            if libc::setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
 
-            if groups_rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::setgid(group_gid) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::setuid(user_uid) != 0 {
-                return Err(io::Error::last_os_error());
+            if let Some((user_uid, group_gid, ref groups)) = drop_spec {
+                #[cfg(target_os = "macos")]
+                let groups_rc = {
+                    let len_cint = libc::c_int::try_from(groups.len())
+                        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+                    libc::setgroups(len_cint, groups.as_ptr())
+                };
+                #[cfg(not(target_os = "macos"))]
+                let groups_rc = libc::setgroups(groups.len(), groups.as_ptr());
+
+                if groups_rc != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::setgid(group_gid) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::setuid(user_uid) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             Ok(())
         });
     }
+}
+
+/// Send `SIGKILL` to the process group led by `child_pid` (ignoring `ESRCH`).
+pub fn kill_process_group(child_pid: u32) -> io::Result<()> {
+    let Ok(pid_t) = libc::pid_t::try_from(child_pid) else {
+        return Ok(());
+    };
+    if pid_t <= 0 {
+        return Ok(());
+    }
+    let Some(neg_pid) = pid_t.checked_neg() else {
+        return Ok(());
+    };
+    // SAFETY: `neg_pid < 0` targets the dedicated process group created by `setpgid(0, 0)`.
+    let rc = unsafe { libc::kill(neg_pid, libc::SIGKILL) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 /// Query filesystem block statistics and device ID for `path`.
@@ -1004,6 +1091,135 @@ fn safe_rmtree_from_parent_fd(
     }
 
     Ok(())
+}
+
+/// Safe stat summary for `dirfd`-anchored read-only directory inspection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirEntryStat {
+    pub is_dir: bool,
+    pub mtime_ns: i128,
+    pub blocks: u64,
+    pub nlink: u64,
+    pub device_id: u64,
+    pub ino: u64,
+}
+
+fn stat_to_entry_stat(stat_buf: &libc::stat) -> DirEntryStat {
+    #[allow(clippy::useless_conversion)]
+    let nlink = u64::from(stat_buf.st_nlink);
+    #[allow(clippy::useless_conversion)]
+    let ino = u64::from(stat_buf.st_ino);
+    let blocks = u64::try_from(stat_buf.st_blocks).unwrap_or(0);
+    DirEntryStat {
+        is_dir: (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFDIR,
+        mtime_ns: stat_mtime_ns(stat_buf),
+        blocks,
+        nlink,
+        device_id: dev_to_u64(stat_buf.st_dev),
+        ino,
+    }
+}
+
+/// Safe RAII directory stream anchored to a `dirfd` opened with `O_DIRECTORY | O_NOFOLLOW`.
+pub struct OpenDir {
+    stream: DirStream,
+}
+
+impl OpenDir {
+    fn from_owned_fd(fd: OwnedFd) -> io::Result<Self> {
+        let transferred_fd = fd.into_raw_fd();
+        // SAFETY: `transferred_fd` transfers ownership into `fdopendir` on success.
+        let raw_dir = unsafe { libc::fdopendir(transferred_fd) };
+        if raw_dir.is_null() {
+            let err = io::Error::last_os_error();
+            // SAFETY: `fdopendir` failed, so we still own `transferred_fd`; drop via RAII.
+            let _reclaimed = unsafe { OwnedFd::from_raw_fd(transferred_fd) };
+            return Err(err);
+        }
+        Ok(Self {
+            stream: DirStream { ptr: raw_dir },
+        })
+    }
+
+    fn raw_fd(&self) -> io::Result<RawFd> {
+        // SAFETY: `self.stream.ptr` is an open `DIR*`.
+        let fd = unsafe { libc::dirfd(self.stream.ptr) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd)
+    }
+
+    /// Read the next entry name, skipping `.` and `..`.
+    pub fn next_entry(&mut self) -> io::Result<Option<EntryName>> {
+        // Bounded loop: skips at most `.` and `..` entries before returning a child name or EOF.
+        for _ in 0..8 {
+            clear_errno();
+            // SAFETY: `self.stream.ptr` is an open `DIR*`.
+            let entry_ptr = unsafe { libc::readdir(self.stream.ptr) };
+            if entry_ptr.is_null() {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error().unwrap_or(0) != 0 {
+                    return Err(err);
+                }
+                return Ok(None);
+            }
+            // SAFETY: `entry_ptr` is non-null and `d_name` is NUL-terminated.
+            let name_cstr = unsafe { CStr::from_ptr((*entry_ptr).d_name.as_ptr()) };
+            let name_bytes = name_cstr.to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            return Ok(Some(EntryName::try_from_cstr(name_cstr)?));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory stream yielded excessive dot entries",
+        ))
+    }
+
+    /// Inspect a direct child of this open directory without following symlinks.
+    pub fn fstatat_nofollow(&self, name: &EntryName) -> io::Result<DirEntryStat> {
+        let dir_fd = self.raw_fd()?;
+        let stat_buf = fstatat_nofollow(dir_fd, name)?;
+        Ok(stat_to_entry_stat(&stat_buf))
+    }
+
+    /// Open a direct child subdirectory with `O_DIRECTORY | O_NOFOLLOW` and `fstat` the opened fd.
+    pub fn open_subdir_nofollow(&self, name: &EntryName) -> io::Result<(Self, DirEntryStat)> {
+        let dir_fd = self.raw_fd()?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `dir_fd` is valid and `name` is a validated NUL-terminated component.
+        let raw_fd = unsafe { libc::openat(dir_fd, name.as_cstr().as_ptr(), flags) };
+        if raw_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw_fd` is a freshly opened owned directory descriptor.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let stat = stat_to_entry_stat(&fstat_fd(owned.as_raw_fd())?);
+        let dir = Self::from_owned_fd(owned)?;
+        Ok((dir, stat))
+    }
+}
+
+/// Open `parent/name` as a real directory without following symlinks on `name`,
+/// returning both the `OpenDir` stream and `fstat` metadata of the opened directory.
+pub fn open_dir_entry_nofollow(
+    parent: &AbsPath,
+    name: &EntryName,
+) -> io::Result<(OpenDir, DirEntryStat)> {
+    let parent_fd = open_dir_path(parent)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `parent_fd` is valid and `name` is a validated NUL-terminated component.
+    let raw_fd = unsafe { libc::openat(parent_fd.as_raw_fd(), name.as_cstr().as_ptr(), flags) };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw_fd` is a freshly opened owned directory descriptor.
+    let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let stat = stat_to_entry_stat(&fstat_fd(owned.as_raw_fd())?);
+    let dir = OpenDir::from_owned_fd(owned)?;
+    Ok((dir, stat))
 }
 
 /// RAII wrapper around POSIX `DIR*` returned by `fdopendir`.

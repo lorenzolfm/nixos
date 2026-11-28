@@ -29,6 +29,7 @@ options:
   --target-age-hours HOURS      Minimum idle time in hours before cleaning a Rust target/ dir (default: 24)
   --nix-gc-age-days DAYS        Delete Nix profile generations older than N days (default: 14)
   --tmp-age-hours HOURS         Minimum idle time in hours for /tmp/nix-* dirs on Linux (default: 24)
+  --lock-file PATH              Override advisory lockfile path (default: host lockfile)
   --dry-run                     Report what would be cleaned without deleting anything
   --force                       Run cleanup regardless of current disk usage percentage
   --no-notify                   Disable desktop notification

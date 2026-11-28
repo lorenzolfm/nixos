@@ -19,12 +19,12 @@ let
 in
 {
   systemd = {
-    # Pre-provision a persistent root-owned lockfile directory with a group-writable
+    # Pre-provision a persistent root-owned lockfile directory with a group-readable
     # lockfile so root systemd runs, manual `sudo disk-cleanup`, and manual user runs
-    # contend on the exact same inode.
+    # contend on the exact same inode via `flock(2)` without granting group write access.
     tmpfiles.rules = [
       "d /run/disk-cleanup 0755 root root -"
-      "f /run/disk-cleanup/lock 0660 root wheel -"
+      "f /run/disk-cleanup/lock 0640 root wheel -"
     ];
 
     services.disk-cleanup = {
