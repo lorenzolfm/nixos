@@ -1,9 +1,14 @@
 //! Bounded, streaming subprocess execution with strict wall-clock timeouts.
+//!
+//! Uses sum types for stream configuration (`StdoutConfig`, `StderrConfig`) and
+//! process outcomes (`CommandOutcome`, `ProcessExit`, `StdoutCapture`) so mutually
+//! exclusive states and signal/error collisions cannot be represented.
 
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsString;
 use std::io;
+use std::num::{NonZeroI32, NonZeroU64, NonZeroUsize};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
@@ -17,6 +22,7 @@ use crate::constants::{
     WAIT_ITERATIONS_MAX,
 };
 use crate::sys;
+use crate::types::{EntryName, ErrorMessage};
 
 pub use crate::sys::PrivilegeDrop;
 
@@ -27,45 +33,94 @@ pub struct CommandOptions {
     pub timeout: Duration,
     pub env_override: Option<Vec<(OsString, OsString)>>,
     pub privilege_drop: Option<PrivilegeDrop>,
-    pub stream_lines_max: u64,
-    pub capture_stdout_bytes_max: usize,
-    pub capture_stderr_bytes_max: usize,
-    pub inherit_stderr: bool,
+    pub stream_lines_max: NonZeroU64,
+}
+
+pub enum StdoutConfig<FOut> {
+    StreamOnly {
+        on_line: Option<FOut>,
+    },
+    Capture {
+        bytes_max: NonZeroUsize,
+        on_line: Option<FOut>,
+    },
+}
+
+pub enum StderrConfig<FErr> {
+    Inherit,
+    Piped {
+        tail_bytes_max: usize,
+        on_line: Option<FErr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessExit {
+    Success,
+    NonZero(NonZeroI32),
+    Signaled(NonZeroI32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandResult {
-    pub exit_code: i32,
-    pub timed_out: bool,
-    pub stdout_text: String,
-    pub stderr_tail: String,
-    pub stdout_lines_count: u64,
-    pub stdout_truncated: bool,
-    pub error_message: Option<String>,
+pub enum StdoutCapture {
+    NotCaptured { lines_count: u64 },
+    Complete { text: String, lines_count: u64 },
+    Truncated { text: String, lines_count: u64 },
 }
 
-impl CommandResult {
-    /// Format a spawn/IO error, timeout, or non-zero exit status, or `None` on success.
-    pub fn failure_detail(&self, timeout: Duration) -> Option<String> {
-        assert!(!timeout.is_zero(), "timeout must be positive");
-        if let Some(err_msg) = &self.error_message {
-            assert!(!err_msg.is_empty(), "error_message must be non-empty");
-            return Some(err_msg.clone());
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    Completed {
+        exit: ProcessExit,
+        stdout: StdoutCapture,
+        stderr_tail: String,
+    },
+    TimedOut {
+        timeout: Duration,
+        stderr_tail: String,
+    },
+    Failed {
+        message: ErrorMessage,
+    },
+}
+
+impl CommandOutcome {
+    /// Format a spawn/IO error, timeout, or non-zero/signaled exit status, or `None` on success.
+    pub fn failure_detail(&self) -> Option<String> {
+        match self {
+            Self::Failed { message } => Some(message.as_str().to_string()),
+            Self::TimedOut { timeout, .. } => {
+                Some(format!("timed out after {}s", timeout.as_secs()))
+            }
+            Self::Completed {
+                exit: ProcessExit::Success,
+                ..
+            } => None,
+            Self::Completed {
+                exit: ProcessExit::NonZero(code),
+                stderr_tail,
+                ..
+            } => {
+                let trimmed = stderr_tail.trim();
+                if trimmed.is_empty() {
+                    Some(format!("exit {code}"))
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Self::Completed {
+                exit: ProcessExit::Signaled(signal),
+                stderr_tail,
+                ..
+            } => {
+                let trimmed = stderr_tail.trim();
+                if trimmed.is_empty() {
+                    Some(format!("killed by signal {signal}"))
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
         }
-        if self.timed_out {
-            return Some(format!("timed out after {}s", timeout.as_secs()));
-        }
-        if self.exit_code != 0 {
-            let trimmed = self.stderr_tail.trim();
-            let detail = if trimmed.is_empty() {
-                format!("exit {}", self.exit_code)
-            } else {
-                trimmed.to_string()
-            };
-            return Some(detail);
-        }
-        assert_eq!(self.exit_code, 0);
-        None
     }
 }
 
@@ -75,17 +130,14 @@ enum StreamTag {
     Stderr,
 }
 
-/// Locate an executable by name using `PATH` (equivalent to `shutil.which`).
+/// Locate an executable by bare name using `PATH` (equivalent to `shutil.which`).
 pub fn find_executable_in_path(name: &str) -> Option<PathBuf> {
-    assert!(!name.is_empty(), "executable name must be non-empty");
-    assert!(
-        !name.contains('/'),
-        "find_executable_in_path expects a bare name"
-    );
+    let bare_name = EntryName::try_from_bytes(name.as_bytes())
+        .expect("find_executable_in_path expects a single non-empty bare executable name");
 
     let path_var = env::var_os("PATH")?;
     for dir in env::split_paths(&path_var).take(PATH_ENTRIES_MAX) {
-        let candidate = dir.join(name);
+        let candidate = dir.join(bare_name.as_os_str());
         if is_executable_file(&candidate) {
             return Some(candidate);
         }
@@ -94,36 +146,49 @@ pub fn find_executable_in_path(name: &str) -> Option<PathBuf> {
 }
 
 fn is_executable_file(path: &Path) -> bool {
-    assert!(!path.as_os_str().is_empty(), "path must be non-empty");
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
     metadata.is_file() && (metadata.permissions().mode() & 0o111) != 0
 }
 
+fn failed_outcome(raw: impl Into<String>) -> CommandOutcome {
+    let message =
+        ErrorMessage::from_truncated(raw.into()).expect("command failure message is non-empty");
+    CommandOutcome::Failed { message }
+}
+
 /// Run a subprocess with strict wall-clock timeout and bounded memory usage.
 pub fn run_command_streaming<FOut, FErr>(
     options: &CommandOptions,
-    mut on_stdout_line: Option<FOut>,
-    mut on_stderr_line: Option<FErr>,
-) -> CommandResult
+    stdout_config: StdoutConfig<FOut>,
+    stderr_config: StderrConfig<FErr>,
+) -> CommandOutcome
 where
     FOut: FnMut(&str),
     FErr: FnMut(&str),
 {
     assert!(!options.program.is_empty(), "program must be non-empty");
     assert!(!options.timeout.is_zero(), "timeout must be positive");
-    assert!(
-        options.stream_lines_max > 0,
-        "stream_lines_max must be positive"
-    );
+
+    let (capture_stdout_bytes_max, mut on_stdout_line) = match stdout_config {
+        StdoutConfig::StreamOnly { on_line } => (None, on_line),
+        StdoutConfig::Capture { bytes_max, on_line } => (Some(bytes_max), on_line),
+    };
+    let (inherit_stderr, capture_stderr_bytes_max, mut on_stderr_line) = match stderr_config {
+        StderrConfig::Inherit => (true, 0usize, None),
+        StderrConfig::Piped {
+            tail_bytes_max,
+            on_line,
+        } => (false, tail_bytes_max, on_line),
+    };
 
     let mut command = Command::new(&options.program);
     command
         .args(&options.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(if options.inherit_stderr {
+        .stderr(if inherit_stderr {
             Stdio::inherit()
         } else {
             Stdio::piped()
@@ -139,17 +204,7 @@ where
 
     let mut child = match command.spawn() {
         Ok(proc_handle) => proc_handle,
-        Err(err) => {
-            return CommandResult {
-                exit_code: -1,
-                timed_out: false,
-                stdout_text: String::new(),
-                stderr_tail: String::new(),
-                stdout_lines_count: 0,
-                stdout_truncated: false,
-                error_message: Some(err.to_string()),
-            };
-        }
+        Err(err) => return failed_outcome(err.to_string()),
     };
 
     let deadline = Instant::now() + options.timeout;
@@ -159,48 +214,38 @@ where
     if let Some(pipe) = &stdout_pipe
         && let Err(err) = sys::set_nonblocking(pipe.as_raw_fd())
     {
-        kill_and_reap(&mut child);
-        return CommandResult {
-            exit_code: -1,
-            timed_out: false,
-            stdout_text: String::new(),
-            stderr_tail: String::new(),
-            stdout_lines_count: 0,
-            stdout_truncated: false,
-            error_message: Some(format!("failed to set stdout nonblocking: {err}")),
-        };
+        let _ = kill_and_reap(&mut child);
+        return failed_outcome(format!("failed to set stdout nonblocking: {err}"));
     }
     if let Some(pipe) = &stderr_pipe
         && let Err(err) = sys::set_nonblocking(pipe.as_raw_fd())
     {
-        kill_and_reap(&mut child);
-        return CommandResult {
-            exit_code: -1,
-            timed_out: false,
-            stdout_text: String::new(),
-            stderr_tail: String::new(),
-            stdout_lines_count: 0,
-            stdout_truncated: false,
-            error_message: Some(format!("failed to set stderr nonblocking: {err}")),
-        };
+        let _ = kill_and_reap(&mut child);
+        return failed_outcome(format!("failed to set stderr nonblocking: {err}"));
     }
 
-    let mut stdout_capture = Vec::<u8>::with_capacity(options.capture_stdout_bytes_max.min(4096));
-    let mut stderr_tail = VecDeque::<u8>::with_capacity(options.capture_stderr_bytes_max);
+    let initial_cap = capture_stdout_bytes_max.map_or(0, |cap| cap.get().min(4096));
+    let mut stdout_capture = Vec::<u8>::with_capacity(initial_cap);
+    let mut stderr_tail = VecDeque::<u8>::with_capacity(capture_stderr_bytes_max);
     let mut stdout_line_buf = Vec::<u8>::new();
     let mut stderr_line_buf = Vec::<u8>::new();
     let mut stdout_lines_count: u64 = 0;
     let mut stderr_lines_count: u64 = 0;
     let mut stdout_truncated = false;
-    let mut timed_out = false;
-    let mut io_error_message: Option<String> = None;
     let mut read_buf = [0u8; PIPE_READ_BYTES];
 
+    enum LoopTermination {
+        Eof,
+        TimedOut,
+        IoError(String),
+    }
+
+    let mut loop_outcome = LoopTermination::Eof;
     let mut iterations_count: usize = 0;
     'poll_loop: while stdout_pipe.is_some() || stderr_pipe.is_some() {
         iterations_count = iterations_count.saturating_add(1);
         if iterations_count > SUBPROCESS_READ_ITERATIONS_MAX {
-            io_error_message = Some(format!(
+            loop_outcome = LoopTermination::IoError(format!(
                 "subprocess exceeded {SUBPROCESS_READ_ITERATIONS_MAX} read iterations"
             ));
             break;
@@ -208,7 +253,7 @@ where
 
         let now = Instant::now();
         if now >= deadline {
-            timed_out = true;
+            loop_outcome = LoopTermination::TimedOut;
             break;
         }
         let remaining = deadline.saturating_duration_since(now);
@@ -247,8 +292,7 @@ where
             }
             pollfds_count += 1;
         }
-        assert!(pollfds_count >= 1);
-        assert!(pollfds_count <= 2);
+        assert!((1..=2).contains(&pollfds_count));
 
         let poll_slice = pollfds
             .get_mut(..pollfds_count)
@@ -257,7 +301,7 @@ where
             Ok(count) => count,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => {
-                io_error_message = Some(format!("poll failed: {err}"));
+                loop_outcome = LoopTermination::IoError(format!("poll failed: {err}"));
                 break;
             }
         };
@@ -279,7 +323,8 @@ where
             };
 
             if (pfd.revents & libc::POLLNVAL) != 0 {
-                io_error_message = Some("invalid pipe descriptor in poll".to_string());
+                loop_outcome =
+                    LoopTermination::IoError("invalid pipe descriptor in poll".to_string());
                 break 'poll_loop;
             }
 
@@ -295,10 +340,8 @@ where
                         .expect("bytes_read <= buffer len");
                     match tag {
                         StreamTag::Stdout => {
-                            if options.capture_stdout_bytes_max > 0 {
-                                let space_left = options
-                                    .capture_stdout_bytes_max
-                                    .saturating_sub(stdout_capture.len());
+                            if let Some(cap) = capture_stdout_bytes_max {
+                                let space_left = cap.get().saturating_sub(stdout_capture.len());
                                 let take_len = chunk.len().min(space_left);
                                 if take_len > 0
                                     && let Some(prefix) = chunk.get(..take_len)
@@ -318,11 +361,11 @@ where
                             );
                         }
                         StreamTag::Stderr => {
-                            if options.capture_stderr_bytes_max > 0 {
+                            if capture_stderr_bytes_max > 0 {
                                 append_bounded_tail(
                                     &mut stderr_tail,
                                     chunk,
-                                    options.capture_stderr_bytes_max,
+                                    capture_stderr_bytes_max,
                                 );
                             }
                             stderr_lines_count = drain_stream_lines(
@@ -342,7 +385,7 @@ where
                     continue;
                 }
                 Err(err) => {
-                    io_error_message = Some(format!("pipe read failed: {err}"));
+                    loop_outcome = LoopTermination::IoError(format!("pipe read failed: {err}"));
                     break 'poll_loop;
                 }
             }
@@ -350,7 +393,7 @@ where
     }
 
     // Flush any trailing non-newline-terminated line.
-    if !stdout_line_buf.is_empty() && stdout_lines_count < options.stream_lines_max {
+    if !stdout_line_buf.is_empty() && stdout_lines_count < options.stream_lines_max.get() {
         stdout_lines_count += 1;
         if let Some(callback) = on_stdout_line.as_mut() {
             let text = String::from_utf8_lossy(&stdout_line_buf);
@@ -358,7 +401,7 @@ where
         }
     }
     if !stderr_line_buf.is_empty()
-        && stderr_lines_count < options.stream_lines_max
+        && stderr_lines_count < options.stream_lines_max.get()
         && let Some(callback) = on_stderr_line.as_mut()
     {
         let text = String::from_utf8_lossy(&stderr_line_buf);
@@ -368,42 +411,68 @@ where
     drop(stdout_pipe);
     drop(stderr_pipe);
 
-    let exit_status = if timed_out || io_error_message.is_some() {
-        kill_and_reap(&mut child)
-    } else {
-        match wait_until(&mut child, deadline) {
-            Ok(Some(status)) => Some(status),
-            Ok(None) => {
-                timed_out = true;
-                kill_and_reap(&mut child)
-            }
-            Err(err) => {
-                io_error_message = Some(format!("wait failed: {err}"));
-                kill_and_reap(&mut child)
+    assert!(stderr_tail.len() <= capture_stderr_bytes_max);
+    let stderr_text = String::from_utf8_lossy(stderr_tail.make_contiguous()).into_owned();
+
+    match loop_outcome {
+        LoopTermination::TimedOut => {
+            let _ = kill_and_reap(&mut child);
+            return CommandOutcome::TimedOut {
+                timeout: options.timeout,
+                stderr_tail: stderr_text,
+            };
+        }
+        LoopTermination::IoError(msg) => {
+            let _ = kill_and_reap(&mut child);
+            return failed_outcome(msg);
+        }
+        LoopTermination::Eof => {}
+    }
+
+    let exit_status = match wait_until(&mut child, deadline) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            let _ = kill_and_reap(&mut child);
+            return CommandOutcome::TimedOut {
+                timeout: options.timeout,
+                stderr_tail: stderr_text,
+            };
+        }
+        Err(err) => {
+            let _ = kill_and_reap(&mut child);
+            return failed_outcome(format!("wait failed: {err}"));
+        }
+    };
+
+    let Some(exit) = status_to_process_exit(exit_status) else {
+        return failed_outcome("child exited without exit code or signal");
+    };
+
+    let stdout = match capture_stdout_bytes_max {
+        None => StdoutCapture::NotCaptured {
+            lines_count: stdout_lines_count,
+        },
+        Some(cap) => {
+            assert!(stdout_capture.len() <= cap.get());
+            let text = String::from_utf8_lossy(&stdout_capture).into_owned();
+            if stdout_truncated {
+                StdoutCapture::Truncated {
+                    text,
+                    lines_count: stdout_lines_count,
+                }
+            } else {
+                StdoutCapture::Complete {
+                    text,
+                    lines_count: stdout_lines_count,
+                }
             }
         }
     };
 
-    let exit_code = match exit_status {
-        Some(status) => status_to_exit_code(status),
-        None => -1,
-    };
-
-    assert!(stdout_capture.len() <= options.capture_stdout_bytes_max);
-    assert!(stderr_tail.len() <= options.capture_stderr_bytes_max);
-    if timed_out {
-        assert!(io_error_message.is_none());
-    }
-
-    let stderr_slice = stderr_tail.make_contiguous();
-    CommandResult {
-        exit_code,
-        timed_out,
-        stdout_text: String::from_utf8_lossy(&stdout_capture).into_owned(),
-        stderr_tail: String::from_utf8_lossy(stderr_slice).into_owned(),
-        stdout_lines_count,
-        stdout_truncated,
-        error_message: io_error_message,
+    CommandOutcome::Completed {
+        exit,
+        stdout,
+        stderr_tail: stderr_text,
     }
 }
 
@@ -432,7 +501,7 @@ fn drain_stream_lines<F>(
     line_buffer: &mut Vec<u8>,
     chunk: &[u8],
     mut lines_count: u64,
-    lines_max: u64,
+    lines_max: NonZeroU64,
     mut callback: Option<&mut F>,
 ) -> u64
 where
@@ -442,7 +511,6 @@ where
         chunk.len() <= PIPE_READ_BYTES,
         "chunk exceeded PIPE_READ_BYTES"
     );
-    assert!(lines_max > 0, "lines_max must be positive");
     assert!(
         line_buffer.len() <= SUBPROCESS_LINE_BYTES_MAX,
         "line_buffer exceeded SUBPROCESS_LINE_BYTES_MAX"
@@ -466,7 +534,7 @@ where
             {
                 line_buffer.extend_from_slice(segment);
             }
-            if lines_count < lines_max {
+            if lines_count < lines_max.get() {
                 lines_count += 1;
                 if let Some(cb) = callback.as_deref_mut() {
                     let text = String::from_utf8_lossy(line_buffer);
@@ -488,7 +556,7 @@ where
     }
 
     assert!(line_buffer.len() <= SUBPROCESS_LINE_BYTES_MAX);
-    assert!(lines_count <= lines_max);
+    assert!(lines_count <= lines_max.get());
     lines_count
 }
 
@@ -537,13 +605,15 @@ fn kill_and_reap(child: &mut Child) -> Option<ExitStatus> {
     }
 }
 
-fn status_to_exit_code(status: ExitStatus) -> i32 {
+fn status_to_process_exit(status: ExitStatus) -> Option<ProcessExit> {
     if let Some(code) = status.code() {
-        return code;
+        return match NonZeroI32::new(code) {
+            None => Some(ProcessExit::Success),
+            Some(nonzero) => Some(ProcessExit::NonZero(nonzero)),
+        };
     }
     if let Some(signal) = status.signal() {
-        assert!(signal > 0, "termination signal must be positive");
-        return -signal;
+        return NonZeroI32::new(signal).map(ProcessExit::Signaled);
     }
-    -1
+    None
 }

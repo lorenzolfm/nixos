@@ -3,42 +3,134 @@
 //! All `unsafe` FFI interactions live in this module so the rest of the crate stays
 //! safe Rust with strongly typed boundaries.
 
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 
 use crate::constants::{
-    FORBIDDEN_DELETE_PATHS, PASSWD_BUFFER_BYTES_INITIAL, PASSWD_BUFFER_BYTES_MAX,
-    PATH_COMPONENTS_MAX, RMDIR_BATCH_MAX, TREE_WALK_ENTRIES_MAX, USER_GROUPS_MAX, WALK_DEPTH_MAX,
+    NANOS_PER_SECOND, PASSWD_BUFFER_BYTES_INITIAL, PASSWD_BUFFER_BYTES_MAX, RMDIR_BATCH_MAX,
+    TREE_WALK_ENTRIES_MAX, USER_GROUPS_MAX, WALK_DEPTH_MAX,
 };
+use crate::types::{AbsPath, EntryName, NonRootAbsPath, UserName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasswdEntry {
-    pub name: String,
+    pub name: UserName,
     pub uid: u32,
     pub gid: u32,
-    pub home_dir: PathBuf,
+    pub home_dir: AbsPath,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonRootPasswdEntry {
+    pub name: UserName,
+    pub uid: NonZeroU32,
+    pub gid: u32,
+    pub home_dir: AbsPath,
+}
+
+/// Authorized execution privilege state resolved once at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionPrivilege {
+    RootTargetingUser { target: NonRootPasswdEntry },
+    RootSelf { root: PasswdEntry },
+    UnprivilegedSelf { user: PasswdEntry },
+}
+
+impl ExecutionPrivilege {
+    pub fn resolve(target: PasswdEntry) -> Result<Self, String> {
+        let euid = effective_uid();
+        if euid == 0 {
+            match NonZeroU32::new(target.uid) {
+                Some(uid) => Ok(Self::RootTargetingUser {
+                    target: NonRootPasswdEntry {
+                        name: target.name,
+                        uid,
+                        gid: target.gid,
+                        home_dir: target.home_dir,
+                    },
+                }),
+                None => Ok(Self::RootSelf { root: target }),
+            }
+        } else if target.uid == euid {
+            Ok(Self::UnprivilegedSelf { user: target })
+        } else {
+            Err(format!("--user {} requires root privileges", target.name))
+        }
+    }
+
+    pub fn target_name(&self) -> &UserName {
+        match self {
+            Self::RootTargetingUser { target } => &target.name,
+            Self::RootSelf { root } => &root.name,
+            Self::UnprivilegedSelf { user } => &user.name,
+        }
+    }
+
+    pub fn target_home(&self) -> &AbsPath {
+        match self {
+            Self::RootTargetingUser { target } => &target.home_dir,
+            Self::RootSelf { root } => &root.home_dir,
+            Self::UnprivilegedSelf { user } => &user.home_dir,
+        }
+    }
+
+    pub fn target_uid(&self) -> u32 {
+        match self {
+            Self::RootTargetingUser { target } => target.uid.get(),
+            Self::RootSelf { root } => root.uid,
+            Self::UnprivilegedSelf { user } => user.uid,
+        }
+    }
+
+    pub fn is_root(&self) -> bool {
+        matches!(self, Self::RootTargetingUser { .. } | Self::RootSelf { .. })
+    }
+
+    pub fn drop_target(&self) -> Option<&NonRootPasswdEntry> {
+        match self {
+            Self::RootTargetingUser { target } => Some(target),
+            Self::RootSelf { .. } | Self::UnprivilegedSelf { .. } => None,
+        }
+    }
+}
+
+/// Validated privilege-drop target guaranteed to target a non-root UID with bounded groups.
 #[derive(Debug, Clone)]
 pub struct PrivilegeDrop {
-    pub user_uid: u32,
-    pub group_gid: u32,
-    pub extra_groups: Vec<u32>,
+    user_uid: NonZeroU32,
+    group_gid: u32,
+    extra_groups: Vec<u32>,
+}
+
+impl PrivilegeDrop {
+    pub fn for_target(target: &NonRootPasswdEntry, extra_groups: Vec<u32>) -> Result<Self, String> {
+        if extra_groups.len() > USER_GROUPS_MAX {
+            return Err(format!(
+                "extra_groups exceeded USER_GROUPS_MAX ({USER_GROUPS_MAX})"
+            ));
+        }
+        Ok(Self {
+            user_uid: target.uid,
+            group_gid: target.gid,
+            extra_groups,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FilesystemStat {
     pub device_id: u64,
-    pub fragment_size_bytes: u64,
+    pub fragment_size_bytes: NonZeroU64,
     pub blocks_total: u64,
     pub blocks_free: u64,
     pub blocks_available: u64,
@@ -70,41 +162,54 @@ impl From<io::Error> for RmtreeError {
 /// Unlocks and closes the underlying file descriptor automatically on drop.
 pub struct AdvisoryLock {
     fd: OwnedFd,
-    path: PathBuf,
+    path: NonRootAbsPath,
 }
 
 impl AdvisoryLock {
     /// Attempt to acquire a non-blocking exclusive advisory lock on `lock_path`.
     ///
-    /// Returns `Ok(Some(lock))` when acquired, `Ok(None)` when another process
-    /// holds the lock, or `Err(err)` if the lockfile cannot be created or locked.
-    pub fn try_acquire(lock_path: &Path) -> io::Result<Option<Self>> {
-        assert!(lock_path.is_absolute(), "lock_path must be absolute");
+    /// Opens an existing pre-provisioned regular file first without `O_CREAT`
+    /// (allowing non-root group members to lock a file inside a root-owned
+    /// `0755` directory) and falls back to creating the lockfile only on `ENOENT`.
+    pub fn try_acquire(lock_path: &NonRootAbsPath) -> io::Result<Option<Self>> {
+        let c_path = lock_path.as_abs().to_cstring();
+        let existing_flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `c_path` is a valid NUL-terminated path and `O_CREAT` is not set.
+        let mut raw_fd = unsafe { libc::open(c_path.as_ptr(), existing_flags) };
 
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let c_path = path_to_cstring(lock_path)?;
-        let flags = libc::O_CREAT | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let mode: libc::c_uint = 0o600;
-
-        // SAFETY: `c_path` is a valid NUL-terminated path; `mode` is promoted `c_uint` for varargs.
-        let raw_fd = unsafe { libc::open(c_path.as_ptr(), flags, mode) };
         if raw_fd < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(err);
+            }
+            let parent = lock_path.parent();
+            fs::create_dir_all(parent.as_path())?;
+            let create_flags = libc::O_CREAT | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let mode: libc::c_uint = 0o600;
+            // SAFETY: `c_path` is NUL-terminated; `mode` is promoted `c_uint` for varargs.
+            raw_fd = unsafe { libc::open(c_path.as_ptr(), create_flags, mode) };
+            if raw_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
         assert!(raw_fd >= 0, "open returned negative fd");
 
         // SAFETY: `raw_fd` is a freshly opened owned file descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let stat_buf = fstat_fd(fd.as_raw_fd())?;
+        if (stat_buf.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("lockfile is not a regular file: {}", lock_path.display()),
+            ));
+        }
 
         // SAFETY: `fd` is a valid open file descriptor.
         let lock_rc = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if lock_rc == 0 {
             return Ok(Some(Self {
                 fd,
-                path: lock_path.to_path_buf(),
+                path: lock_path.clone(),
             }));
         }
 
@@ -131,37 +236,58 @@ impl Drop for AdvisoryLock {
     }
 }
 
-/// Outcome of probing whether a file is held by an exclusive `flock`.
+/// Exclusive advisory `flock` held on a Cargo `.cargo-lock` file across re-check and deletion.
 #[derive(Debug)]
-pub enum LockProbe {
-    Unlocked,
+pub struct HeldCargoLock {
+    fd: OwnedFd,
+    path: NonRootAbsPath,
+}
+
+impl Drop for HeldCargoLock {
+    fn drop(&mut self) {
+        // SAFETY: `self.fd` is an open file descriptor owned exclusively by `self`.
+        let unlock_rc = unsafe { libc::flock(self.fd.as_raw_fd(), libc::LOCK_UN) };
+        if unlock_rc != 0 {
+            let err = io::Error::last_os_error();
+            eprintln!(
+                "disk-cleanup: warning: failed to unlock {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// Outcome of attempting to acquire an exclusive `flock` on Cargo's `.cargo-lock`.
+#[derive(Debug)]
+pub enum CargoLockProbe {
+    /// `.cargo-lock` does not exist inside the target directory.
+    NoLockFile,
+    /// Exclusive lock acquired and held until the guard is dropped.
+    Acquired(HeldCargoLock),
+    /// Another process (active Cargo build) holds the lock.
     Locked,
+    /// Opening `.cargo-lock` failed (`ELOOP` symlink, `EACCES` unreadable, etc.); fail closed.
+    SymlinkOrUnreadable(io::Error),
     /// Unexpected `flock` error (e.g., `ENOLCK`); caller logs warning and fails closed.
     UnexpectedError(io::Error),
 }
 
-/// Probe whether `lock_file` is locked via `flock(LOCK_EX | LOCK_NB)`.
+/// Acquire an exclusive non-blocking `flock` on `lock_file` without following symlinks.
 ///
-/// Missing files report `Unlocked`. Symlinks and unreadable files fail closed
-/// as `Locked`.
-pub fn probe_exclusive_flock(lock_file: &Path) -> LockProbe {
-    assert!(lock_file.is_absolute(), "lock_file must be absolute");
-
-    let c_path = match path_to_cstring(lock_file) {
-        Ok(value) => value,
-        Err(_) => return LockProbe::Locked,
-    };
-
+/// Unlike a drop-immediately probe, `CargoLockProbe::Acquired` keeps the lock held
+/// until dropped so callers can re-verify recency and delete `target/` while
+/// blocking any newly starting Cargo build on `.cargo-lock`.
+pub fn try_acquire_cargo_lock(lock_file: &NonRootAbsPath) -> CargoLockProbe {
+    let c_path = lock_file.as_abs().to_cstring();
     let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `c_path` is a valid NUL-terminated path and `O_CREAT` is not set.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), flags) };
     if raw_fd < 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::NotFound {
-            return LockProbe::Unlocked;
+            return CargoLockProbe::NoLockFile;
         }
-        // Symlink (ELOOP) or unreadable lock file: fail closed.
-        return LockProbe::Locked;
+        return CargoLockProbe::SymlinkOrUnreadable(err);
     }
     assert!(raw_fd >= 0, "open returned negative fd");
 
@@ -171,16 +297,10 @@ pub fn probe_exclusive_flock(lock_file: &Path) -> LockProbe {
     // SAFETY: `fd` is open and valid.
     let rc = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
-        // SAFETY: `fd` holds the exclusive lock we just acquired.
-        let unlock_rc = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_UN) };
-        if unlock_rc != 0 {
-            let err = io::Error::last_os_error();
-            eprintln!(
-                "disk-cleanup: warning: failed to unlock probe on {}: {err}",
-                lock_file.display()
-            );
-        }
-        return LockProbe::Unlocked;
+        return CargoLockProbe::Acquired(HeldCargoLock {
+            fd,
+            path: lock_file.clone(),
+        });
     }
 
     let err = io::Error::last_os_error();
@@ -189,20 +309,80 @@ pub fn probe_exclusive_flock(lock_file: &Path) -> LockProbe {
         || raw_errno == Some(libc::EWOULDBLOCK)
         || raw_errno == Some(libc::EACCES)
     {
-        return LockProbe::Locked;
+        return CargoLockProbe::Locked;
     }
-    LockProbe::UnexpectedError(err)
+    CargoLockProbe::UnexpectedError(err)
+}
+
+/// Outcome of `dirfd`-anchored verification and unlinking of a stale Nix `result*` symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlinkStaleLinkOutcome {
+    Removed { mtime_ns: i128 },
+    SkippedNotSymlink,
+    SkippedFresh,
+    SkippedNonNixTarget,
+}
+
+/// Re-verify symlink type, mtime, and `/nix/store/...` target relative to an
+/// `O_NOFOLLOW`-walked parent `dirfd`, then `unlinkat` the entry.
+pub fn verify_and_unlink_stale_nix_symlink(
+    projects_root: &AbsPath,
+    link_path: &NonRootAbsPath,
+    mtime_max_ns: i128,
+) -> io::Result<UnlinkStaleLinkOutcome> {
+    let parent_abs = link_path.parent();
+    let rel_parent = parent_abs
+        .as_path()
+        .strip_prefix(projects_root.as_path())
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "symlink {} is outside projects root {}",
+                    link_path.display(),
+                    projects_root.display()
+                ),
+            )
+        })?;
+
+    let parent_fd = open_dir_nofollow_from(projects_root, rel_parent)?;
+    let link_name = link_path.file_name();
+    let link_stat = fstatat_nofollow(parent_fd.as_raw_fd(), &link_name)?;
+    if (link_stat.st_mode & libc::S_IFMT) != libc::S_IFLNK {
+        return Ok(UnlinkStaleLinkOutcome::SkippedNotSymlink);
+    }
+
+    let refreshed_mtime_ns = stat_mtime_ns(&link_stat);
+    if refreshed_mtime_ns > mtime_max_ns {
+        return Ok(UnlinkStaleLinkOutcome::SkippedFresh);
+    }
+
+    let mut target_prefix_buf = [0u8; 64];
+    let target_len = readlinkat_prefix(parent_fd.as_raw_fd(), &link_name, &mut target_prefix_buf)?;
+    let target_prefix = target_prefix_buf
+        .get(..target_len)
+        .expect("target_len <= target_prefix_buf.len()");
+    if target_prefix.len() <= b"/nix/store/".len() || !target_prefix.starts_with(b"/nix/store/") {
+        return Ok(UnlinkStaleLinkOutcome::SkippedNonNixTarget);
+    }
+
+    unlinkat_entry(parent_fd.as_raw_fd(), &link_name, 0)?;
+    Ok(UnlinkStaleLinkOutcome::Removed {
+        mtime_ns: refreshed_mtime_ns,
+    })
 }
 
 /// Read up to `buf.len()` bytes from a regular file without following symlinks.
 ///
 /// Returns `Ok(None)` if the path does not exist, is a symlink, or is not a
 /// regular file.
-pub fn read_regular_prefix_nofollow(path: &Path, buf: &mut [u8]) -> io::Result<Option<usize>> {
-    assert!(path.is_absolute(), "path must be absolute");
+pub fn read_regular_prefix_nofollow(
+    path: &NonRootAbsPath,
+    buf: &mut [u8],
+) -> io::Result<Option<usize>> {
     assert!(!buf.is_empty(), "read buffer must be non-empty");
 
-    let c_path = path_to_cstring(path)?;
+    let c_path = path.as_abs().to_cstring();
     let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `c_path` is NUL-terminated and `O_CREAT` is not set.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), flags) };
@@ -227,8 +407,7 @@ pub fn read_regular_prefix_nofollow(path: &Path, buf: &mut [u8]) -> io::Result<O
     }
 
     let mut bytes_read_total: usize = 0;
-    // Bounded loop: at most `buf.len() * 2 + 1` iterations (each progress adds >= 1 byte,
-    // allowing bounded EINTR retries).
+    // Bounded loop: at most `buf.len() * 2 + 16` iterations (allowing bounded EINTR retries).
     let iterations_max = buf.len().saturating_mul(2).saturating_add(16);
     for _ in 0..iterations_max {
         if bytes_read_total >= buf.len() {
@@ -280,15 +459,8 @@ pub fn real_uid() -> u32 {
 }
 
 /// Look up a user account by name via reentrant `getpwnam_r`.
-pub fn passwd_by_name(user_name: &str) -> io::Result<Option<PasswdEntry>> {
-    assert!(!user_name.is_empty(), "user_name must be non-empty");
-    let c_name = CString::new(user_name).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "user name contains interior NUL byte",
-        )
-    })?;
-
+pub fn passwd_by_name(user_name: &UserName) -> io::Result<Option<PasswdEntry>> {
+    let c_name = user_name.to_cstring();
     lookup_passwd_with_retry(|pwd_ptr, buf_ptr, buf_len, result_ptr| {
         // SAFETY: `c_name` and all output pointers are valid with matching `buf_len`.
         unsafe { libc::getpwnam_r(c_name.as_ptr(), pwd_ptr, buf_ptr, buf_len, result_ptr) }
@@ -355,26 +527,18 @@ unsafe fn extract_passwd_entry(pwd: &libc::passwd) -> io::Result<PasswdEntry> {
     // SAFETY: Checked non-null; `getpwnam_r`/`getpwuid_r` populate NUL-terminated C strings.
     let name_bytes = unsafe { CStr::from_ptr(pwd.pw_name) }.to_bytes();
     let dir_bytes = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_bytes();
-    if name_bytes.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "passwd entry has empty username",
-        ));
-    }
-    if dir_bytes.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "passwd entry has empty home directory",
-        ));
-    }
-    let name = String::from_utf8(name_bytes.to_vec())
+    let raw_name = String::from_utf8(name_bytes.to_vec())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "passwd username is not UTF-8"))?;
-    let home_dir = PathBuf::from(OsString::from_vec(dir_bytes.to_vec()));
-    assert!(!name.is_empty(), "passwd name must be non-empty");
-    assert!(
-        !home_dir.as_os_str().is_empty(),
-        "passwd home_dir must be non-empty"
-    );
+    let name = UserName::try_new(raw_name)
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, format!("passwd: {msg}")))?;
+    let raw_home = PathBuf::from(OsString::from_vec(dir_bytes.to_vec()));
+    let home_dir = AbsPath::from_absolute(&raw_home).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("passwd entry has invalid home directory: {err}"),
+        )
+    })?;
+
     Ok(PasswdEntry {
         name,
         uid: pwd.pw_uid,
@@ -384,14 +548,8 @@ unsafe fn extract_passwd_entry(pwd: &libc::passwd) -> io::Result<PasswdEntry> {
 }
 
 /// Resolve supplementary group IDs for `user_name` via `getgrouplist`.
-pub fn user_groups(user_name: &str, primary_gid: u32) -> io::Result<Vec<u32>> {
-    assert!(!user_name.is_empty(), "user_name must be non-empty");
-    let c_name = CString::new(user_name).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "user name contains interior NUL byte",
-        )
-    })?;
+pub fn user_groups(user_name: &UserName, primary_gid: u32) -> io::Result<Vec<u32>> {
+    let c_name = user_name.to_cstring();
 
     #[cfg(target_os = "macos")]
     type GroupElem = libc::c_int;
@@ -449,8 +607,7 @@ pub fn user_groups(user_name: &str, primary_gid: u32) -> io::Result<Vec<u32>> {
 /// Configure a `Command` to drop privileges (`setgroups` -> `setgid` -> `setuid`)
 /// atomically in `pre_exec` before `execve`.
 pub fn configure_privilege_drop(cmd: &mut Command, privilege_drop: &PrivilegeDrop) {
-    assert!(privilege_drop.extra_groups.len() <= USER_GROUPS_MAX);
-    let user_uid = privilege_drop.user_uid;
+    let user_uid = privilege_drop.user_uid.get();
     let group_gid = privilege_drop.group_gid;
     let groups: Vec<libc::gid_t> = privilege_drop.extra_groups.clone();
 
@@ -483,13 +640,11 @@ pub fn configure_privilege_drop(cmd: &mut Command, privilege_drop: &PrivilegeDro
 }
 
 /// Query filesystem block statistics and device ID for `path`.
-pub fn statvfs_path(path: &Path) -> io::Result<FilesystemStat> {
-    assert!(path.is_absolute(), "statvfs_path requires an absolute path");
-
-    let metadata = fs::metadata(path)?;
+pub fn statvfs_path(path: &AbsPath) -> io::Result<FilesystemStat> {
+    let metadata = fs::metadata(path.as_path())?;
     let device_id = std::os::unix::fs::MetadataExt::dev(&metadata);
 
-    let c_path = path_to_cstring(path)?;
+    let c_path = path.to_cstring();
     let mut vfs = MaybeUninit::<libc::statvfs>::zeroed();
     // SAFETY: `c_path` is NUL-terminated and `vfs` is a valid out-pointer.
     let rc = unsafe { libc::statvfs(c_path.as_ptr(), vfs.as_mut_ptr()) };
@@ -504,16 +659,14 @@ pub fn statvfs_path(path: &Path) -> io::Result<FilesystemStat> {
     let raw_frsize = u64::from(vfs.f_frsize);
     #[allow(clippy::useless_conversion)]
     let raw_bsize = u64::from(vfs.f_bsize);
-    let fragment_size_bytes = if raw_frsize > 0 {
-        raw_frsize
-    } else if raw_bsize > 0 {
-        raw_bsize
-    } else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "statvfs returned zero block and fragment size",
-        ));
-    };
+    let fragment_size_bytes = NonZeroU64::new(raw_frsize)
+        .or_else(|| NonZeroU64::new(raw_bsize))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "statvfs returned zero block and fragment size",
+            )
+        })?;
     #[allow(clippy::useless_conversion)]
     let blocks_total = u64::from(vfs.f_blocks);
     #[allow(clippy::useless_conversion)]
@@ -521,7 +674,6 @@ pub fn statvfs_path(path: &Path) -> io::Result<FilesystemStat> {
     #[allow(clippy::useless_conversion)]
     let blocks_available = u64::from(vfs.f_bavail);
 
-    assert!(fragment_size_bytes > 0);
     Ok(FilesystemStat {
         device_id,
         fragment_size_bytes,
@@ -532,14 +684,11 @@ pub fn statvfs_path(path: &Path) -> io::Result<FilesystemStat> {
 }
 
 /// Check whether a process with `pid` is alive.
-pub fn is_pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
+pub fn is_pid_alive(pid: NonZeroU32) -> bool {
     if Path::new("/proc").is_dir() {
         return PathBuf::from(format!("/proc/{pid}")).exists();
     }
-    let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+    let Ok(pid_t) = libc::pid_t::try_from(pid.get()) else {
         return false;
     };
     assert!(pid_t > 0, "pid_t must be positive before kill(pid, 0)");
@@ -634,97 +783,108 @@ pub fn format_local_timestamp() -> String {
     )
 }
 
-/// Check whether `path` is one of the protected system roots.
-pub fn is_forbidden_delete_path(path: &Path) -> bool {
-    assert!(path.is_absolute(), "path must be absolute");
-    FORBIDDEN_DELETE_PATHS
-        .iter()
-        .any(|forbidden| path == Path::new(forbidden))
-}
+/// Delete a real directory tree under `anchor_root`, walking intermediate parent
+/// components from `anchor_root` with `O_NOFOLLOW` so parent-symlink swaps
+/// cannot redirect deletion outside the scanned root.
+pub fn safe_rmtree_under(
+    anchor_root: &AbsPath,
+    target: &NonRootAbsPath,
+) -> Result<(), RmtreeError> {
+    check_not_forbidden_delete(target)?;
 
-/// Lexically normalize `path` to an absolute path without resolving symlinks
-/// (equivalent to Python's `os.path.abspath`).
-pub fn absolutize_path(path: &Path) -> io::Result<PathBuf> {
-    assert!(!path.as_os_str().is_empty(), "path must not be empty");
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-
-    let mut normalized = PathBuf::new();
-    let mut components_count: usize = 0;
-    for component in joined.components() {
-        components_count = components_count.saturating_add(1);
-        if components_count > PATH_COMPONENTS_MAX {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("path exceeds maximum {PATH_COMPONENTS_MAX} components"),
-            ));
+    let parent_abs = target.parent();
+    let rel_parent = parent_abs
+        .as_path()
+        .strip_prefix(anchor_root.as_path())
+        .map_err(|_| {
+            RmtreeError::UnsafePath(format!(
+                "refusing to rmtree {} outside anchor {}",
+                target.display(),
+                anchor_root.display()
+            ))
+        })?;
+    let top_parent_fd = open_dir_nofollow_from(anchor_root, rel_parent).map_err(|err| {
+        if err.raw_os_error() == Some(libc::ELOOP) || err.raw_os_error() == Some(libc::ENOTDIR) {
+            RmtreeError::UnsafePath(format!(
+                "refusing to traverse symlinked parent of {}",
+                target.display()
+            ))
+        } else {
+            RmtreeError::Io(err)
         }
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(Component::RootDir.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
+    })?;
 
-    assert!(normalized.is_absolute(), "normalized path must be absolute");
-    Ok(normalized)
+    safe_rmtree_from_parent_fd(top_parent_fd, target.file_name(), target, RMDIR_BATCH_MAX)
 }
 
 /// Delete a real directory tree iteratively using `dirfd` and `O_NOFOLLOW`.
 ///
 /// Never follows symlinks, never crosses filesystem mountpoints, never chmods
 /// the parent directory of `root`, and bounds depth and total entry count.
-pub fn safe_rmtree(root: &Path) -> Result<(), RmtreeError> {
+#[cfg(test)]
+pub fn safe_rmtree(root: &NonRootAbsPath) -> Result<(), RmtreeError> {
     safe_rmtree_with_batch_max(root, RMDIR_BATCH_MAX)
 }
 
 struct RmDirFrame {
-    name: CString,
+    name: EntryName,
     dir_fd: OwnedFd,
     depth: usize,
     chmod_done: bool,
-    pending_subdirs: Vec<CString>,
+    pending_subdirs: Vec<EntryName>,
 }
 
 /// Same as `safe_rmtree` with an explicit per-scan batch cap (bounded by `RMDIR_BATCH_MAX`).
-pub fn safe_rmtree_with_batch_max(root: &Path, batch_max: usize) -> Result<(), RmtreeError> {
-    assert!(root.is_absolute(), "safe_rmtree requires an absolute path");
+#[cfg(test)]
+pub fn safe_rmtree_with_batch_max(
+    root: &NonRootAbsPath,
+    batch_max: usize,
+) -> Result<(), RmtreeError> {
     assert!(batch_max > 0, "batch_max must be positive");
     assert!(
         batch_max <= RMDIR_BATCH_MAX,
         "batch_max exceeds RMDIR_BATCH_MAX"
     );
 
-    let parent_path = root.parent().expect("root cannot be filesystem root");
-    assert_ne!(parent_path, root, "refusing to rmtree root directory");
-    let root_name_os = root
-        .file_name()
-        .expect("safe_rmtree requires a path with a final component");
-    assert!(
-        !is_forbidden_delete_path(root),
-        "refusing to rmtree system path: {}",
-        root.display()
-    );
+    check_not_forbidden_delete(root)?;
+    let parent_path = root.parent();
+    let top_parent_fd = open_dir_path(&parent_path)?;
+    safe_rmtree_from_parent_fd(top_parent_fd, root.file_name(), root, batch_max)
+}
 
-    if let Ok(resolved_parent) = fs::canonicalize(parent_path) {
-        let resolved_target = resolved_parent.join(root_name_os);
-        assert!(
-            !is_forbidden_delete_path(&resolved_target),
-            "refusing to rmtree resolved system path: {}",
-            resolved_target.display()
-        );
+fn check_not_forbidden_delete(target: &NonRootAbsPath) -> Result<(), RmtreeError> {
+    if target.as_abs().is_forbidden_delete_path() {
+        return Err(RmtreeError::UnsafePath(format!(
+            "refusing to rmtree system path: {}",
+            target.display()
+        )));
     }
+    let parent_path = target.parent();
+    if let Ok(resolved_parent) = fs::canonicalize(parent_path.as_path()) {
+        let resolved_target = resolved_parent.join(target.file_name().as_os_str());
+        if let Ok(resolved_abs) = AbsPath::from_absolute(&resolved_target)
+            && resolved_abs.is_forbidden_delete_path()
+        {
+            return Err(RmtreeError::UnsafePath(format!(
+                "refusing to rmtree resolved system path: {}",
+                resolved_abs.display()
+            )));
+        }
+    }
+    Ok(())
+}
 
-    let top_parent_fd = open_dir_path(parent_path)?;
-    let root_name = os_str_to_cstring(root_name_os)?;
-    let root_fd = open_subdir_nofollow(top_parent_fd.as_raw_fd(), &root_name, root)?;
+fn safe_rmtree_from_parent_fd(
+    top_parent_fd: OwnedFd,
+    root_name: EntryName,
+    display_root: &NonRootAbsPath,
+    batch_max: usize,
+) -> Result<(), RmtreeError> {
+    let root_fd = open_subdir_nofollow(
+        top_parent_fd.as_raw_fd(),
+        &root_name,
+        display_root.as_path(),
+    )?;
     let root_stat = fstat_fd(root_fd.as_raw_fd())?;
     let root_device_id = dev_to_u64(root_stat.st_dev);
 
@@ -746,7 +906,7 @@ pub fn safe_rmtree_with_batch_max(root: &Path, batch_max: usize) -> Result<(), R
         if iterations_count > iterations_max {
             return Err(RmtreeError::UnsafePath(format!(
                 "safe_rmtree exceeded iteration limit on {}",
-                root.display()
+                display_root.display()
             )));
         }
         assert!(
@@ -771,14 +931,14 @@ pub fn safe_rmtree_with_batch_max(root: &Path, batch_max: usize) -> Result<(), R
             if next_depth >= WALK_DEPTH_MAX {
                 return Err(RmtreeError::UnsafePath(format!(
                     "safe_rmtree exceeded max depth {WALK_DEPTH_MAX} inside {}",
-                    root.display()
+                    display_root.display()
                 )));
             }
 
             let subdir_fd = match open_subdir_nofollow(
                 parent_dir_fd,
                 &subdir_name,
-                Path::new(OsStr::from_bytes(subdir_name.as_bytes())),
+                Path::new(subdir_name.as_os_str()),
             ) {
                 Ok(fd) => fd,
                 Err(RmtreeError::Io(err)) if err.kind() == io::ErrorKind::NotFound => continue,
@@ -787,8 +947,7 @@ pub fn safe_rmtree_with_batch_max(root: &Path, batch_max: usize) -> Result<(), R
             let subdir_stat = fstat_fd(subdir_fd.as_raw_fd())?;
             if dev_to_u64(subdir_stat.st_dev) != root_device_id {
                 return Err(RmtreeError::UnsafePath(format!(
-                    "refusing to cross mountpoint during rmtree: {}",
-                    subdir_name.to_string_lossy()
+                    "refusing to cross mountpoint during rmtree: {subdir_name}"
                 )));
             }
 
@@ -812,7 +971,7 @@ pub fn safe_rmtree_with_batch_max(root: &Path, batch_max: usize) -> Result<(), R
             if entries_processed_count > TREE_WALK_ENTRIES_MAX {
                 return Err(RmtreeError::UnsafePath(format!(
                     "safe_rmtree exceeded {TREE_WALK_ENTRIES_MAX} entries limit on {}",
-                    root.display()
+                    display_root.display()
                 )));
             }
             unlinkat_entry(current_fd, file_name, 0)?;
@@ -833,7 +992,7 @@ pub fn safe_rmtree_with_batch_max(root: &Path, batch_max: usize) -> Result<(), R
             if entries_processed_count > TREE_WALK_ENTRIES_MAX {
                 return Err(RmtreeError::UnsafePath(format!(
                     "safe_rmtree exceeded {TREE_WALK_ENTRIES_MAX} entries limit on {}",
-                    root.display()
+                    display_root.display()
                 )));
             }
             let parent_fd = match stack.last() {
@@ -867,7 +1026,7 @@ fn read_dir_batch(
     dir_fd: RawFd,
     root_device_id: u64,
     batch_max: usize,
-) -> Result<(Vec<CString>, Vec<CString>), RmtreeError> {
+) -> Result<(Vec<EntryName>, Vec<EntryName>), RmtreeError> {
     assert!(dir_fd >= 0);
     assert!(batch_max > 0);
     assert!(batch_max <= RMDIR_BATCH_MAX);
@@ -922,8 +1081,9 @@ fn read_dir_batch(
         if name_bytes == b"." || name_bytes == b".." {
             continue;
         }
+        let entry_name = EntryName::try_from_cstr(name_cstr)?;
 
-        let child_stat = match fstatat_nofollow(dir_fd, name_cstr) {
+        let child_stat = match fstatat_nofollow(dir_fd, &entry_name) {
             Ok(stat_buf) => stat_buf,
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(RmtreeError::Io(err)),
@@ -932,13 +1092,12 @@ fn read_dir_batch(
         if (child_stat.st_mode & libc::S_IFMT) == libc::S_IFDIR {
             if dev_to_u64(child_stat.st_dev) != root_device_id {
                 return Err(RmtreeError::UnsafePath(format!(
-                    "refusing to cross mountpoint during rmtree: {}",
-                    name_cstr.to_string_lossy()
+                    "refusing to cross mountpoint during rmtree: {entry_name}"
                 )));
             }
-            batch_subdirs.push(name_cstr.to_owned());
+            batch_subdirs.push(entry_name);
         } else {
-            batch_files.push(name_cstr.to_owned());
+            batch_files.push(entry_name);
         }
     }
 
@@ -947,9 +1106,42 @@ fn read_dir_batch(
     Ok((batch_files, batch_subdirs))
 }
 
-fn open_dir_path(path: &Path) -> io::Result<OwnedFd> {
-    assert!(path.is_absolute());
-    let c_path = path_to_cstring(path)?;
+fn open_dir_nofollow_from(root: &AbsPath, rel_parent: &Path) -> io::Result<OwnedFd> {
+    let mut current_fd = open_dir_path(root)?;
+    let mut depth: usize = 0;
+    for component in rel_parent.components() {
+        depth = depth.saturating_add(1);
+        if depth > WALK_DEPTH_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("parent path exceeded WALK_DEPTH_MAX ({WALK_DEPTH_MAX})"),
+            ));
+        }
+        let part = match component {
+            Component::Normal(os_name) => EntryName::try_from_os_str(os_name)?,
+            Component::CurDir => continue,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unexpected non-normal path component during dirfd walk",
+                ));
+            }
+        };
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `current_fd` is valid and `part` is a validated NUL-terminated component.
+        let next_raw =
+            unsafe { libc::openat(current_fd.as_raw_fd(), part.as_cstr().as_ptr(), flags) };
+        if next_raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `next_raw` is a freshly opened owned descriptor.
+        current_fd = unsafe { OwnedFd::from_raw_fd(next_raw) };
+    }
+    Ok(current_fd)
+}
+
+fn open_dir_path(path: &AbsPath) -> io::Result<OwnedFd> {
+    let c_path = path.to_cstring();
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     // SAFETY: `c_path` is NUL-terminated and `O_CREAT` is not set.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), flags) };
@@ -963,18 +1155,13 @@ fn open_dir_path(path: &Path) -> io::Result<OwnedFd> {
 
 fn open_subdir_nofollow(
     parent_fd: RawFd,
-    name: &CStr,
+    name: &EntryName,
     display_path: &Path,
 ) -> Result<OwnedFd, RmtreeError> {
     assert!(parent_fd >= 0);
-    assert!(!name.to_bytes().is_empty(), "entry name must be non-empty");
-    assert!(
-        !name.to_bytes().contains(&b'/'),
-        "entry name must be a single path component"
-    );
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: `parent_fd` is valid and `name` is NUL-terminated.
-    let raw_fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+    // SAFETY: `parent_fd` is valid and `name` is a validated NUL-terminated component.
+    let raw_fd = unsafe { libc::openat(parent_fd, name.as_cstr().as_ptr(), flags) };
     if raw_fd < 0 {
         let err = io::Error::last_os_error();
         let raw_errno = err.raw_os_error();
@@ -1025,19 +1212,14 @@ fn fstat_fd(fd: RawFd) -> io::Result<libc::stat> {
     Ok(unsafe { stat_buf.assume_init() })
 }
 
-fn fstatat_nofollow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
+fn fstatat_nofollow(dir_fd: RawFd, name: &EntryName) -> io::Result<libc::stat> {
     assert!(dir_fd >= 0);
-    assert!(!name.to_bytes().is_empty(), "entry name must be non-empty");
-    assert!(
-        !name.to_bytes().contains(&b'/'),
-        "entry name must be a single path component"
-    );
     let mut stat_buf = MaybeUninit::<libc::stat>::zeroed();
     // SAFETY: `dir_fd` is open, `name` is NUL-terminated, and `stat_buf` is valid.
     let rc = unsafe {
         libc::fstatat(
             dir_fd,
-            name.as_ptr(),
+            name.as_cstr().as_ptr(),
             stat_buf.as_mut_ptr(),
             libc::AT_SYMLINK_NOFOLLOW,
         )
@@ -1049,15 +1231,39 @@ fn fstatat_nofollow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
     Ok(unsafe { stat_buf.assume_init() })
 }
 
-fn unlinkat_entry(dir_fd: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()> {
+fn readlinkat_prefix(dir_fd: RawFd, name: &EntryName, buf: &mut [u8]) -> io::Result<usize> {
     assert!(dir_fd >= 0);
-    assert!(!name.to_bytes().is_empty(), "entry name must be non-empty");
-    assert!(
-        !name.to_bytes().contains(&b'/'),
-        "entry name must be a single path component"
-    );
+    assert!(!buf.is_empty());
+    // SAFETY: `dir_fd` is valid, `name` is NUL-terminated, and `buf` is valid writable memory.
+    let rc = unsafe {
+        libc::readlinkat(
+            dir_fd,
+            name.as_cstr().as_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let Ok(len) = usize::try_from(rc) else {
+        panic!("non-negative readlinkat return fits usize");
+    };
+    assert!(len <= buf.len());
+    Ok(len)
+}
+
+fn stat_mtime_ns(stat_buf: &libc::stat) -> i128 {
+    let secs = i128::from(stat_buf.st_mtime);
+    let nsec = i128::from(stat_buf.st_mtime_nsec);
+    assert!((0..NANOS_PER_SECOND).contains(&nsec));
+    secs * NANOS_PER_SECOND + nsec
+}
+
+fn unlinkat_entry(dir_fd: RawFd, name: &EntryName, flags: libc::c_int) -> io::Result<()> {
+    assert!(dir_fd >= 0);
     // SAFETY: `dir_fd` is open and `name` is NUL-terminated.
-    let rc = unsafe { libc::unlinkat(dir_fd, name.as_ptr(), flags) };
+    let rc = unsafe { libc::unlinkat(dir_fd, name.as_cstr().as_ptr(), flags) };
     if rc != 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::NotFound {
@@ -1068,36 +1274,14 @@ fn unlinkat_entry(dir_fd: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<
     Ok(())
 }
 
-fn rmdirat_entry(dir_fd: RawFd, name: &CStr) -> io::Result<()> {
+fn rmdirat_entry(dir_fd: RawFd, name: &EntryName) -> io::Result<()> {
     assert!(dir_fd >= 0);
-    assert!(!name.to_bytes().is_empty(), "entry name must be non-empty");
-    assert!(
-        !name.to_bytes().contains(&b'/'),
-        "entry name must be a single path component"
-    );
     // SAFETY: `dir_fd` is open and `name` is NUL-terminated.
-    let rc = unsafe { libc::unlinkat(dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) };
+    let rc = unsafe { libc::unlinkat(dir_fd, name.as_cstr().as_ptr(), libc::AT_REMOVEDIR) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-fn path_to_cstring(path: &Path) -> io::Result<CString> {
-    assert!(!path.as_os_str().is_empty(), "path must be non-empty");
-    os_str_to_cstring(path.as_os_str())
-}
-
-fn os_str_to_cstring(value: &OsStr) -> io::Result<CString> {
-    assert!(!value.is_empty(), "CString input must be non-empty");
-    let cstr = CString::new(value.as_bytes()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "path contains interior NUL byte",
-        )
-    })?;
-    assert_eq!(cstr.as_bytes().len(), value.len());
-    Ok(cstr)
 }
 
 #[cfg(target_os = "macos")]

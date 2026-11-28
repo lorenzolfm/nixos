@@ -85,6 +85,38 @@ fn cli_help_and_invalid_args_exit_codes() {
         .output()
         .expect("run invalid");
     assert_eq!(bad.status.code(), Some(2));
+
+    // Cross-role flags must exit 2 cleanly (never panic).
+    let cross_role = Command::new(bin)
+        .args([
+            "--_user-phase",
+            "--force",
+            "--projects-dir",
+            "/tmp/nonexistent-projects",
+            "--_now-ns",
+            "1764322500123456789",
+        ])
+        .output()
+        .expect("run cross-role");
+    assert_eq!(cross_role.status.code(), Some(2));
+
+    // Non-root invoking `--_user-phase --user root` must exit 2 cleanly (never panic).
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        let unauthorized_worker = Command::new(bin)
+            .args([
+                "--_user-phase",
+                "--user",
+                "root",
+                "--projects-dir",
+                "/tmp/nonexistent-projects",
+                "--_now-ns",
+                "1764322500123456789",
+            ])
+            .output()
+            .expect("run unauthorized worker");
+        assert_eq!(unauthorized_worker.status.code(), Some(2));
+    }
 }
 
 #[test]
@@ -224,7 +256,9 @@ fn cli_dry_run_and_user_phase_json_end_to_end() {
     assert!(phase.status.success());
     let stdout = String::from_utf8_lossy(&phase.stdout);
     assert!(
-        stdout.trim().starts_with('{') && stdout.contains("\"targets_removed_count\":0"),
+        stdout.trim().starts_with('{')
+            && stdout.contains("\"mode\":\"dry_run\"")
+            && stdout.contains("\"targets_removed_count\":0"),
         "unexpected IPC stdout: {stdout}"
     );
 }

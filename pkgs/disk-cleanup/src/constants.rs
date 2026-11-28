@@ -18,12 +18,15 @@ pub const NANOS_PER_SECOND: i128 = 1_000_000_000;
 pub const NANOS_PER_SECOND_U128: u128 = 1_000_000_000;
 pub const SECONDS_PER_HOUR: f64 = 3600.0;
 pub const SECONDS_PER_DAY: f64 = 86_400.0;
+pub const SECONDS_PER_HOUR_U128: u128 = 3600;
+pub const SECONDS_PER_DAY_U128: u128 = 86_400;
 pub const NOW_NS_MAX: i128 = 10_000_000_000_000 * NANOS_PER_SECOND;
 
 // Fixed upper bounds on walks, collections, I/O, and wall-clock time.
 pub const NOTIFY_FREED_BYTES_MIN: u64 = 1024 * 1024; // 1 MiB
 pub const AGE_DAYS_MAX: u32 = 3650; // 10 years
 pub const AGE_HOURS_MAX: u32 = AGE_DAYS_MAX * 24;
+pub const AGE_DURATION_NS_MAX: u128 = 3650 * SECONDS_PER_DAY_U128 * NANOS_PER_SECOND_U128;
 pub const CLI_ARGS_MAX: usize = 128;
 pub const PATH_ENTRIES_MAX: usize = 256;
 pub const PATH_COMPONENTS_MAX: usize = 256;

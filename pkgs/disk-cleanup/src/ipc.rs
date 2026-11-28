@@ -1,74 +1,58 @@
-//! Paired JSON IPC encoding, decoding, and invariant validation for `--_user-phase`.
+//! Paired JSON IPC encoding and decoding for `--_user-phase`.
 //!
-//! Zero external dependencies and zero recursion: the schema is a flat object with
-//! six non-negative integers and a bounded array of bounded-length error strings.
+//! Zero external dependencies and zero recursion: every field is parsed directly
+//! into validated Layer 3 types (`CleanupMode`, `RemovedBatch`, `ErrorMessage`,
+//! `BoundedErrors`) so a corrupted unprivileged child cannot panic the root parent
+//! or construct an inconsistent state.
 
 use std::fmt::Write as _;
 
 use crate::constants::{ERROR_MESSAGE_BYTES_MAX, ERRORS_MAX, SUBPROCESS_OUTPUT_BYTES_MAX};
+use crate::types::{BoundedErrors, CleanupMode, ErrorMessage, RemovedBatch};
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserPhaseStats {
+    pub mode: CleanupMode,
     pub result_links_removed_count: u64,
-    pub targets_removed_count: u64,
-    pub targets_freed_bytes: u64,
+    pub targets_removed: RemovedBatch,
     pub targets_skipped_active_count: u64,
     pub targets_skipped_recent_count: u64,
+    pub targets_skipped_unreadable_count: u64,
     pub user_profiles_pruned_count: u64,
-    pub errors: Vec<String>,
+    pub errors: BoundedErrors,
 }
 
-/// Validate `UserPhaseStats` invariants across untrusted/cross-privilege boundaries.
-pub fn validate_user_phase_stats(stats: &UserPhaseStats) -> Result<(), String> {
-    if stats.targets_removed_count == 0 && stats.targets_freed_bytes != 0 {
-        return Err("targets_freed_bytes must be 0 when no targets were removed".to_string());
-    }
-    if stats.errors.len() > ERRORS_MAX {
-        return Err("errors list exceeded ERRORS_MAX".to_string());
-    }
-    for item in &stats.errors {
-        if item.len() > ERROR_MESSAGE_BYTES_MAX {
-            return Err("error message exceeded ERROR_MESSAGE_BYTES_MAX".to_string());
+impl UserPhaseStats {
+    pub fn new(mode: CleanupMode) -> Self {
+        Self {
+            mode,
+            result_links_removed_count: 0,
+            targets_removed: RemovedBatch::None,
+            targets_skipped_active_count: 0,
+            targets_skipped_recent_count: 0,
+            targets_skipped_unreadable_count: 0,
+            user_profiles_pruned_count: 0,
+            errors: BoundedErrors::new(),
         }
-    }
-    Ok(())
-}
-
-/// Assert `UserPhaseStats` programmer invariants on internal/in-process paths.
-pub fn assert_user_phase_stats_valid(stats: &UserPhaseStats) {
-    if stats.targets_removed_count == 0 {
-        assert_eq!(
-            stats.targets_freed_bytes, 0,
-            "targets_freed_bytes must be 0 when no targets were removed"
-        );
-    }
-    assert!(
-        stats.errors.len() <= ERRORS_MAX,
-        "errors list exceeded ERRORS_MAX"
-    );
-    for item in &stats.errors {
-        assert!(
-            item.len() <= ERROR_MESSAGE_BYTES_MAX,
-            "error message exceeded ERROR_MESSAGE_BYTES_MAX"
-        );
     }
 }
 
 /// Serialize `UserPhaseStats` to a compact RFC 8259 JSON object.
 pub fn encode_user_phase_stats_json(stats: &UserPhaseStats) -> String {
-    assert_user_phase_stats_valid(stats);
-
-    let mut out = String::with_capacity(256);
+    let mut out = String::with_capacity(320);
     out.push('{');
     write!(
         out,
-        "\"result_links_removed_count\":{},\"targets_removed_count\":{},\"targets_freed_bytes\":{},\"targets_skipped_active_count\":{},\"targets_skipped_recent_count\":{},\"user_profiles_pruned_count\":{},\"errors\":[",
+        "\"mode\":\"{}\",\"result_links_removed_count\":{},\"targets_removed_count\":{},\"targets_freed_bytes\":{},\"targets_skipped_active_count\":{},\"targets_skipped_recent_count\":{},\"targets_skipped_unreadable_count\":{},\"user_profiles_pruned_count\":{},\"errors_dropped_count\":{},\"errors\":[",
+        stats.mode.as_ipc_str(),
         stats.result_links_removed_count,
-        stats.targets_removed_count,
-        stats.targets_freed_bytes,
+        stats.targets_removed.count(),
+        stats.targets_removed.freed_bytes(),
         stats.targets_skipped_active_count,
         stats.targets_skipped_recent_count,
+        stats.targets_skipped_unreadable_count,
         stats.user_profiles_pruned_count,
+        stats.errors.dropped_count(),
     )
     .expect("writing to String is infallible");
 
@@ -89,9 +73,13 @@ pub fn encode_user_phase_stats_json(stats: &UserPhaseStats) -> String {
 
 /// Deserialize and validate `UserPhaseStats` from the privilege-dropped child.
 ///
-/// Both structural/type mismatches and semantic invariant violations return `Err`
-/// so a corrupted unprivileged child cannot panic the root parent before Phase 2.
-pub fn parse_user_phase_stats_json(raw_json: &str) -> Result<UserPhaseStats, String> {
+/// Structural mismatches, unknown/missing keys, mode mismatches, empty error
+/// strings, and semantic invariant violations all return `Err` so a corrupted
+/// unprivileged child cannot panic the root parent.
+pub fn parse_user_phase_stats_json(
+    raw_json: &str,
+    expected_mode: CleanupMode,
+) -> Result<UserPhaseStats, String> {
     if raw_json.len() > SUBPROCESS_OUTPUT_BYTES_MAX {
         return Err("user phase payload exceeded SUBPROCESS_OUTPUT_BYTES_MAX".to_string());
     }
@@ -100,17 +88,28 @@ pub fn parse_user_phase_stats_json(raw_json: &str) -> Result<UserPhaseStats, Str
     cursor.skip_whitespace();
     cursor.expect_byte(b'{', "user phase payload must be a JSON object")?;
 
-    let mut stats = UserPhaseStats::default();
-    let mut seen_keys_mask: u8 = 0;
-    const ALL_KEYS_MASK: u8 = (1 << 7) - 1;
+    let mut mode: Option<CleanupMode> = None;
+    let mut result_links_removed_count: u64 = 0;
+    let mut targets_removed_count: u64 = 0;
+    let mut targets_freed_bytes: u64 = 0;
+    let mut targets_skipped_active_count: u64 = 0;
+    let mut targets_skipped_recent_count: u64 = 0;
+    let mut targets_skipped_unreadable_count: u64 = 0;
+    let mut user_profiles_pruned_count: u64 = 0;
+    let mut errors_dropped_count: u64 = 0;
+    let mut error_items: Vec<ErrorMessage> = Vec::new();
+
+    const EXPECTED_KEYS_COUNT: usize = 10;
+    const ALL_KEYS_MASK: u16 = (1 << EXPECTED_KEYS_COUNT) - 1;
+    let mut seen_keys_mask: u16 = 0;
 
     cursor.skip_whitespace();
     if cursor.peek() == Some(b'}') {
         cursor.advance();
     } else {
-        // Bounded loop: exactly 7 expected keys; anything beyond is invalid.
-        for field_index in 0..8 {
-            if field_index >= 7 {
+        // Bounded loop: exactly 10 expected keys; anything beyond is invalid.
+        for field_index in 0..=EXPECTED_KEYS_COUNT {
+            if field_index >= EXPECTED_KEYS_COUNT {
                 return Err("user phase payload has too many keys".to_string());
             }
             cursor.skip_whitespace();
@@ -120,38 +119,51 @@ pub fn parse_user_phase_stats_json(raw_json: &str) -> Result<UserPhaseStats, Str
             cursor.skip_whitespace();
 
             let bit_index: u8 = match key.as_str() {
-                "result_links_removed_count" => {
-                    stats.result_links_removed_count = cursor.parse_u64(&key)?;
+                "mode" => {
+                    let raw_mode = cursor.parse_string()?;
+                    mode = Some(CleanupMode::from_ipc_str(&raw_mode)?);
                     0
                 }
-                "targets_removed_count" => {
-                    stats.targets_removed_count = cursor.parse_u64(&key)?;
+                "result_links_removed_count" => {
+                    result_links_removed_count = cursor.parse_u64(&key)?;
                     1
                 }
-                "targets_freed_bytes" => {
-                    stats.targets_freed_bytes = cursor.parse_u64(&key)?;
+                "targets_removed_count" => {
+                    targets_removed_count = cursor.parse_u64(&key)?;
                     2
                 }
-                "targets_skipped_active_count" => {
-                    stats.targets_skipped_active_count = cursor.parse_u64(&key)?;
+                "targets_freed_bytes" => {
+                    targets_freed_bytes = cursor.parse_u64(&key)?;
                     3
                 }
-                "targets_skipped_recent_count" => {
-                    stats.targets_skipped_recent_count = cursor.parse_u64(&key)?;
+                "targets_skipped_active_count" => {
+                    targets_skipped_active_count = cursor.parse_u64(&key)?;
                     4
                 }
-                "user_profiles_pruned_count" => {
-                    stats.user_profiles_pruned_count = cursor.parse_u64(&key)?;
+                "targets_skipped_recent_count" => {
+                    targets_skipped_recent_count = cursor.parse_u64(&key)?;
                     5
                 }
-                "errors" => {
-                    stats.errors = cursor.parse_string_array()?;
+                "targets_skipped_unreadable_count" => {
+                    targets_skipped_unreadable_count = cursor.parse_u64(&key)?;
                     6
+                }
+                "user_profiles_pruned_count" => {
+                    user_profiles_pruned_count = cursor.parse_u64(&key)?;
+                    7
+                }
+                "errors_dropped_count" => {
+                    errors_dropped_count = cursor.parse_u64(&key)?;
+                    8
+                }
+                "errors" => {
+                    error_items = cursor.parse_error_array()?;
+                    9
                 }
                 _ => return Err(format!("unexpected user phase payload key: {key:?}")),
             };
 
-            let bit = 1u8 << bit_index;
+            let bit = 1u16 << bit_index;
             if (seen_keys_mask & bit) != 0 {
                 return Err(format!("duplicate user phase payload key: {key:?}"));
             }
@@ -177,16 +189,33 @@ pub fn parse_user_phase_stats_json(raw_json: &str) -> Result<UserPhaseStats, Str
         return Err("missing required key(s) in user phase payload".to_string());
     }
 
-    validate_user_phase_stats(&stats)?;
-    assert_user_phase_stats_valid(&stats);
-    Ok(stats)
+    let parsed_mode = mode.expect("mode key verified present by ALL_KEYS_MASK");
+    if parsed_mode != expected_mode {
+        return Err(format!(
+            "user phase mode mismatch: expected {:?}, got {:?}",
+            expected_mode.as_ipc_str(),
+            parsed_mode.as_ipc_str(),
+        ));
+    }
+
+    let targets_removed = RemovedBatch::from_parts(targets_removed_count, targets_freed_bytes)
+        .map_err(|_| "targets_freed_bytes must be 0 when no targets were removed".to_string())?;
+    let errors = BoundedErrors::from_parts(error_items, errors_dropped_count)?;
+
+    Ok(UserPhaseStats {
+        mode: parsed_mode,
+        result_links_removed_count,
+        targets_removed,
+        targets_skipped_active_count,
+        targets_skipped_recent_count,
+        targets_skipped_unreadable_count,
+        user_profiles_pruned_count,
+        errors,
+    })
 }
 
-fn write_json_escaped_string(out: &mut String, text: &str) {
-    assert!(
-        text.len() <= ERROR_MESSAGE_BYTES_MAX,
-        "text exceeded ERROR_MESSAGE_BYTES_MAX"
-    );
+fn write_json_escaped_string(out: &mut String, message: &ErrorMessage) {
+    let text = message.as_str();
     let len_before = out.len();
     out.push('"');
     for ch in text.chars() {
@@ -294,7 +323,7 @@ impl<'a> JsonCursor<'a> {
             .map_err(|_| format!("integer overflow in field {field_name:?}"))
     }
 
-    fn parse_string_array(&mut self) -> Result<Vec<String>, String> {
+    fn parse_error_array(&mut self) -> Result<Vec<ErrorMessage>, String> {
         self.expect_byte(b'[', "invalid errors field in user phase payload")?;
         self.skip_whitespace();
         let mut items = Vec::new();
@@ -308,17 +337,14 @@ impl<'a> JsonCursor<'a> {
             if items.len() >= ERRORS_MAX {
                 return Err("errors field exceeded ERRORS_MAX".to_string());
             }
-            let item = self.parse_string()?;
-            if item.len() > ERROR_MESSAGE_BYTES_MAX {
-                return Err("error message exceeded ERROR_MESSAGE_BYTES_MAX".to_string());
-            }
-            items.push(item);
+            let raw_item = self.parse_string()?;
+            let message = ErrorMessage::try_new(raw_item)?;
+            items.push(message);
             self.skip_whitespace();
             match self.peek() {
                 Some(b',') => self.advance(),
                 Some(b']') => {
                     self.advance();
-                    assert!(items.len() <= ERRORS_MAX);
                     return Ok(items);
                 }
                 _ => return Err("expected ',' or ']' in errors array".to_string()),

@@ -2,76 +2,67 @@
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::io;
+use std::num::NonZeroU32;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::cleanup::{append_error, log};
+use crate::cleanup::log;
 use crate::constants::{
-    AGE_DAYS_MAX, AGE_HOURS_MAX, CACHEDIR_TAG_SIGNATURE_BYTES, CANDIDATES_MAX, ERRORS_MAX,
-    INODES_TRACKED_MAX, NANOS_PER_SECOND, NIX_TMP_PREFIXES, PROJECTS_WALK_ENTRIES_MAX,
-    SECONDS_PER_DAY, SECONDS_PER_HOUR, SKIP_WALK_DIRS, TARGET_MTIME_DEPTH_MAX,
+    CACHEDIR_TAG_SIGNATURE_BYTES, CANDIDATES_MAX, ERRORS_MAX, INODES_TRACKED_MAX, NANOS_PER_SECOND,
+    NIX_TMP_PREFIXES, PROJECTS_WALK_ENTRIES_MAX, SKIP_WALK_DIRS, TARGET_MTIME_DEPTH_MAX,
     TARGET_SKIP_MTIME_CHILDREN, TMP_DIR_ENTRIES_MAX, TREE_WALK_ENTRIES_MAX, WALK_DEPTH_MAX,
     WATCH_PATHS_MAX,
 };
-use crate::sys::{self, FilesystemStat, LockProbe};
+use crate::sys::{self, CargoLockProbe, FilesystemStat};
+use crate::types::{
+    AbsPath, AgeDurationNs, BoundedErrors, DiskPercent, EntryName, NonRootAbsPath, SafeProjectsDir,
+    TimestampNs, UserName,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskUsage {
-    pub path: PathBuf,
+    pub path: AbsPath,
     pub device_id: u64,
     pub used_bytes: u64,
     pub available_bytes: u64,
-    pub used_percent: u8,
+    pub used_percent: DiskPercent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectScanConfig {
-    pub now_ns: i128,
-    pub result_age_days: f64,
-    pub target_age_hours: f64,
+    pub now_ns: TimestampNs,
+    pub result_age: AgeDurationNs,
+    pub target_age: AgeDurationNs,
 }
 
 impl ProjectScanConfig {
-    pub fn assert_valid(&self) {
-        assert!(self.now_ns > 0, "now_ns must be positive");
-        assert!(self.result_age_days.is_finite());
-        assert!(self.result_age_days >= 0.0);
-        assert!(self.result_age_days <= f64::from(AGE_DAYS_MAX));
-        assert!(self.target_age_hours.is_finite());
-        assert!(self.target_age_hours >= 0.0);
-        assert!(self.target_age_hours <= f64::from(AGE_HOURS_MAX));
-    }
-
     pub fn result_mtime_max_ns(&self) -> i128 {
-        self.assert_valid();
-        self.now_ns - non_negative_seconds_to_ns(self.result_age_days * SECONDS_PER_DAY)
+        self.result_age.cutoff_before(self.now_ns)
     }
 
     pub fn target_mtime_max_ns(&self) -> i128 {
-        self.assert_valid();
-        self.now_ns - non_negative_seconds_to_ns(self.target_age_hours * SECONDS_PER_HOUR)
+        self.target_age.cutoff_before(self.now_ns)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetCandidate {
-    pub path: PathBuf,
+    pub path: NonRootAbsPath,
     pub mtime_latest_ns: i128,
     pub size_bytes: u64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ProjectScanResult {
-    pub stale_results: Vec<(PathBuf, i128)>,
+    pub stale_results: Vec<(NonRootAbsPath, i128)>,
     pub target_candidates: Vec<TargetCandidate>,
     pub targets_skipped_active_count: u64,
     pub targets_skipped_recent_count: u64,
-    pub errors: Vec<String>,
+    pub targets_skipped_unreadable_count: u64,
+    pub errors: BoundedErrors,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,38 +73,24 @@ pub struct TmpTreeSummary {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TmpScanResult {
-    pub stale_dirs: Vec<(PathBuf, u64)>,
+    pub stale_dirs: Vec<(NonRootAbsPath, u64)>,
     pub dirs_skipped_active_count: u64,
     pub dirs_skipped_recent_count: u64,
-    pub errors: Vec<String>,
+    pub dirs_skipped_unreadable_count: u64,
+    pub errors: BoundedErrors,
 }
 
-/// Convert a finite non-negative number of seconds to exact nanoseconds.
-pub fn non_negative_seconds_to_ns(seconds: f64) -> i128 {
-    assert!(seconds.is_finite(), "seconds must be finite");
-    assert!(seconds >= 0.0, "seconds must be non-negative");
-    assert!(seconds <= 1.0e13, "seconds exceeds safe conversion bound");
-
-    let whole_seconds = seconds.trunc();
-    let frac_seconds = seconds - whole_seconds;
-    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-    let whole_i128 = whole_seconds as i128;
-    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-    let frac_ns = (frac_seconds * 1_000_000_000.0).round() as i128;
-
-    let result = whole_i128 * NANOS_PER_SECOND + frac_ns;
-    assert!(result >= 0, "converted nanoseconds must be non-negative");
-    result
-}
-
-/// Current wall-clock Unix time in nanoseconds.
-pub fn current_time_ns() -> i128 {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock must be after UNIX_EPOCH");
-    let nanos = i128::try_from(duration.as_nanos()).expect("system time fits i128");
-    assert!(nanos > 0, "current_time_ns must be positive");
-    nanos
+/// Distinct fail-closed outcomes for inspecting a directory tree against a recency cutoff.
+#[derive(Debug)]
+pub enum TreeFreshness<T> {
+    /// Every entry in the inspected tree is at or older than `cutoff_ns`.
+    Stale(T),
+    /// At least one entry was modified more recently than `cutoff_ns`.
+    Recent,
+    /// An entry or subdirectory could not be read/stat-ed (or changed type).
+    Unreadable(io::Error),
+    /// The walk hit `WALK_DEPTH_MAX` or `TREE_WALK_ENTRIES_MAX`.
+    LimitExceeded,
 }
 
 /// Extract exact modification timestamp in nanoseconds since Unix epoch.
@@ -125,69 +102,40 @@ pub fn metadata_mtime_ns(metadata: &fs::Metadata) -> i128 {
     secs * NANOS_PER_SECOND + nsec
 }
 
-/// Compute default lockfile location for root vs non-root invocations.
-pub fn default_lock_path(user_home: &Path) -> PathBuf {
-    assert!(user_home.is_absolute(), "user_home must be absolute");
-    let result = if sys::effective_uid() == 0 {
-        if cfg!(target_os = "linux") {
-            let run_dir = Path::new("/run/disk-cleanup");
-            if run_dir.is_dir() {
-                run_dir.join("lock")
-            } else {
-                PathBuf::from("/run/disk-cleanup.lock")
-            }
-        } else {
-            PathBuf::from("/var/run/disk-cleanup.lock")
-        }
-    } else if let Some(xdg_runtime) = env::var_os("XDG_RUNTIME_DIR")
-        .filter(|val| !val.is_empty())
-        .and_then(|val| sys::absolutize_path(Path::new(&val)).ok())
-    {
-        xdg_runtime.join("disk-cleanup.lock")
-    } else {
-        user_home.join(".cache").join("disk-cleanup.lock")
-    };
+/// Return the single canonical host lockfile path shared by root daemons and manual runs.
+pub fn default_lock_path() -> NonRootAbsPath {
+    #[cfg(target_os = "linux")]
+    let raw = Path::new("/run/disk-cleanup/lock");
+    #[cfg(not(target_os = "linux"))]
+    let raw = Path::new("/var/db/disk-cleanup/lock");
 
-    assert!(
-        result.is_absolute(),
-        "default_lock_path must return an absolute path"
-    );
-    result
+    NonRootAbsPath::from_absolute(raw).expect("canonical default lockfile path is valid")
 }
 
 /// Pure calculation of filesystem usage matching `df`'s non-root usable percentage.
 ///
 /// Uses exact `u128` ceiling division (`div_ceil`) so large block counts (`> 2^53`)
 /// never suffer floating-point precision loss or integer overflow.
-pub fn compute_disk_usage(path: &Path, fs_stat: FilesystemStat) -> DiskUsage {
-    assert!(path.is_absolute(), "path must be absolute");
-    assert!(
-        fs_stat.fragment_size_bytes > 0,
-        "f_frsize must be positive: {}",
-        fs_stat.fragment_size_bytes
-    );
-
+pub fn compute_disk_usage(path: &AbsPath, fs_stat: FilesystemStat) -> DiskUsage {
     let used_blocks = fs_stat.blocks_total.saturating_sub(fs_stat.blocks_free);
     let available_blocks = fs_stat.blocks_available;
     let usable_blocks_total = used_blocks.saturating_add(available_blocks);
 
-    let used_percent: u8 = if usable_blocks_total == 0 {
-        100
+    let used_percent = if usable_blocks_total == 0 {
+        DiskPercent::FULL
     } else {
         let numerator = u128::from(used_blocks) * 100;
         let ceiling_percent = numerator.div_ceil(u128::from(usable_blocks_total)).min(100);
-        u8::try_from(ceiling_percent).expect("clamped percentage in 0..=100 fits u8")
+        let pct_u8 = u8::try_from(ceiling_percent).expect("clamped percentage in 0..=100 fits u8");
+        DiskPercent::try_new(pct_u8).expect("clamped percentage fits DiskPercent")
     };
 
-    let used_bytes = used_blocks.saturating_mul(fs_stat.fragment_size_bytes);
-    let available_bytes = available_blocks.saturating_mul(fs_stat.fragment_size_bytes);
-    assert!(
-        used_percent <= 100,
-        "used_percent out of range: {used_percent}"
-    );
+    let frag_bytes = fs_stat.fragment_size_bytes.get();
+    let used_bytes = used_blocks.saturating_mul(frag_bytes);
+    let available_bytes = available_blocks.saturating_mul(frag_bytes);
 
     DiskUsage {
-        path: path.to_path_buf(),
+        path: path.clone(),
         device_id: fs_stat.device_id,
         used_bytes,
         available_bytes,
@@ -196,16 +144,13 @@ pub fn compute_disk_usage(path: &Path, fs_stat: FilesystemStat) -> DiskUsage {
 }
 
 /// Query filesystem usage via `statvfs` + `stat`.
-pub fn stat_filesystem(path: &Path) -> io::Result<DiskUsage> {
-    assert!(path.is_absolute(), "path must be absolute");
+pub fn stat_filesystem(path: &AbsPath) -> io::Result<DiskUsage> {
     let fs_stat = sys::statvfs_path(path)?;
-    let usage = compute_disk_usage(path, fs_stat);
-    assert!(usage.used_percent <= 100);
-    Ok(usage)
+    Ok(compute_disk_usage(path, fs_stat))
 }
 
 /// Return the highest-usage filesystem among existing candidate paths.
-pub fn worst_disk_usage(paths: &[PathBuf]) -> io::Result<DiskUsage> {
+pub fn worst_disk_usage(paths: &[AbsPath]) -> io::Result<DiskUsage> {
     assert!(
         paths.len() <= WATCH_PATHS_MAX,
         "watch paths count {} exceeds WATCH_PATHS_MAX ({WATCH_PATHS_MAX})",
@@ -216,7 +161,7 @@ pub fn worst_disk_usage(paths: &[PathBuf]) -> io::Result<DiskUsage> {
     let mut usages = Vec::with_capacity(paths.len());
 
     for path in paths {
-        if !path.exists() {
+        if !path.as_path().exists() {
             continue;
         }
         let usage = match stat_filesystem(path) {
@@ -235,28 +180,24 @@ pub fn worst_disk_usage(paths: &[PathBuf]) -> io::Result<DiskUsage> {
         usages.push(usage);
     }
 
-    let worst = match usages
+    match usages
         .into_iter()
         .max_by_key(|usage| (usage.used_percent, Reverse(usage.available_bytes)))
     {
-        Some(val) => val,
-        None => stat_filesystem(Path::new("/"))?,
-    };
-    assert!(worst.used_percent <= 100, "worst.used_percent out of range");
-    Ok(worst)
+        Some(val) => Ok(val),
+        None => stat_filesystem(&AbsPath::root()),
+    }
 }
 
 /// Measure allocated disk bytes of a directory tree without following links.
-pub fn dir_disk_usage(root: &Path) -> u64 {
-    assert!(root.is_absolute(), "dir_disk_usage requires absolute path");
-
-    let mut total_bytes: u64 = fs::symlink_metadata(root)
+pub fn dir_disk_usage(root: &NonRootAbsPath) -> u64 {
+    let mut total_bytes: u64 = fs::symlink_metadata(root.as_path())
         .map(|meta| meta.blocks().saturating_mul(512))
         .unwrap_or(0);
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     let mut entries_visited_count: usize = 0;
     let mut stack: Vec<(PathBuf, usize)> = Vec::with_capacity(WALK_DEPTH_MAX);
-    stack.push((root.to_path_buf(), 0));
+    stack.push((root.as_path().to_path_buf(), 0));
 
     let mut dirs_popped_count: usize = 0;
     while let Some((current, depth)) = stack.pop() {
@@ -305,24 +246,17 @@ pub fn dir_disk_usage(root: &Path) -> u64 {
 }
 
 /// Verify `target_dir` is genuinely a Cargo build output directory.
-pub fn is_cargo_target_dir(target_dir: &Path) -> bool {
-    assert!(target_dir.is_absolute(), "target_dir must be absolute");
-    let Some(parent_dir) = target_dir.parent() else {
-        panic!("target_dir cannot be filesystem root");
-    };
-    assert_ne!(
-        parent_dir, target_dir,
-        "target_dir cannot be filesystem root"
-    );
+pub fn is_cargo_target_dir(target_dir: &NonRootAbsPath) -> bool {
+    let parent_dir = target_dir.parent();
 
-    let Ok(dir_meta) = fs::symlink_metadata(target_dir) else {
+    let Ok(dir_meta) = fs::symlink_metadata(target_dir.as_path()) else {
         return false;
     };
     if !dir_meta.file_type().is_dir() {
         return false;
     }
 
-    let cargo_toml = parent_dir.join("Cargo.toml");
+    let cargo_toml = parent_dir.as_path().join("Cargo.toml");
     let Ok(cargo_meta) = fs::symlink_metadata(&cargo_toml) else {
         return false;
     };
@@ -330,17 +264,19 @@ pub fn is_cargo_target_dir(target_dir: &Path) -> bool {
         return false;
     }
 
-    let cachedir_tag = target_dir.join("CACHEDIR.TAG");
-    let mut header_buf = [0u8; CACHEDIR_TAG_SIGNATURE_BYTES.len()];
-    if let Ok(Some(bytes_read)) = sys::read_regular_prefix_nofollow(&cachedir_tag, &mut header_buf)
-        && bytes_read == CACHEDIR_TAG_SIGNATURE_BYTES.len()
-        && header_buf == CACHEDIR_TAG_SIGNATURE_BYTES
-    {
-        return true;
+    if let Ok(cachedir_tag) = target_dir.join_relative(Path::new("CACHEDIR.TAG")) {
+        let mut header_buf = [0u8; CACHEDIR_TAG_SIGNATURE_BYTES.len()];
+        if let Ok(Some(bytes_read)) =
+            sys::read_regular_prefix_nofollow(&cachedir_tag, &mut header_buf)
+            && bytes_read == CACHEDIR_TAG_SIGNATURE_BYTES.len()
+            && header_buf == CACHEDIR_TAG_SIGNATURE_BYTES
+        {
+            return true;
+        }
     }
 
     for marker in [".cargo-lock", ".rustc_info.json"] {
-        if let Ok(marker_meta) = fs::symlink_metadata(target_dir.join(marker))
+        if let Ok(marker_meta) = fs::symlink_metadata(target_dir.as_path().join(marker))
             && marker_meta.file_type().is_file()
         {
             return true;
@@ -350,84 +286,95 @@ pub fn is_cargo_target_dir(target_dir: &Path) -> bool {
     false
 }
 
-/// Return `true` if Cargo holds an exclusive `flock` on `.cargo-lock` (fails closed).
-pub fn is_cargo_target_locked(target_dir: &Path) -> bool {
-    assert!(target_dir.is_absolute(), "target_dir must be absolute");
-    assert!(
-        target_dir.parent().is_some(),
-        "target_dir cannot be filesystem root"
-    );
-    let lock_file = target_dir.join(".cargo-lock");
-    match sys::probe_exclusive_flock(&lock_file) {
-        LockProbe::Unlocked => false,
-        LockProbe::Locked => true,
-        LockProbe::UnexpectedError(err) => {
+/// Attempt to acquire Cargo's `.cargo-lock` for `target_dir`, returning the full
+/// probe state so callers can hold the lock across re-verification and deletion
+/// and log warnings on symlink/unreadable/unexpected errors.
+pub fn probe_cargo_target_lock(target_dir: &NonRootAbsPath) -> CargoLockProbe {
+    let lock_file = match target_dir.join_relative(Path::new(".cargo-lock")) {
+        Ok(path) => path,
+        Err(err) => return CargoLockProbe::SymlinkOrUnreadable(err),
+    };
+    let probe = sys::try_acquire_cargo_lock(&lock_file);
+    match &probe {
+        CargoLockProbe::SymlinkOrUnreadable(err) => {
             log(&format!(
-                "warning: flock check failed on {}: {err}; treating as locked",
+                "warning: cannot safely open {}: {err}; treating target as locked",
                 lock_file.display()
             ));
-            // Fail closed on any unexpected flock error so active builds are never deleted.
-            true
         }
+        CargoLockProbe::UnexpectedError(err) => {
+            log(&format!(
+                "warning: flock check failed on {}: {err}; treating target as locked",
+                lock_file.display()
+            ));
+        }
+        CargoLockProbe::NoLockFile | CargoLockProbe::Acquired(_) | CargoLockProbe::Locked => {}
     }
+    probe
 }
 
 /// Find the most recent mtime inside a Cargo `target/` directory (fails closed).
 ///
 /// Skips recursing into `deps/` and `examples/` while still stat-ing those
-/// directories themselves. Returns `None` if any entry is unreadable, if walk
-/// bounds are exceeded, or if `cutoff_ns` is given and any entry is newer.
+/// directories themselves. Distinguishes recent modifications from unreadable
+/// entries and walk-limit overflows so failures are never miscounted as recent.
 pub fn latest_target_mtime_ns(
-    target_dir: &Path,
-    cutoff_ns: Option<i128>,
+    target_dir: &NonRootAbsPath,
+    cutoff_ns: i128,
     depth_max: usize,
-) -> Option<i128> {
-    assert!(target_dir.is_absolute(), "target_dir must be absolute");
+) -> TreeFreshness<i128> {
     assert!(depth_max >= 1, "depth_max must be at least 1");
     assert!(
         depth_max <= WALK_DEPTH_MAX,
         "depth_max exceeds WALK_DEPTH_MAX"
     );
 
-    let root_meta = fs::symlink_metadata(target_dir).ok()?;
+    let root_meta = match fs::symlink_metadata(target_dir.as_path()) {
+        Ok(meta) => meta,
+        Err(err) => return TreeFreshness::Unreadable(err),
+    };
     let mut newest_ns = metadata_mtime_ns(&root_meta);
-
-    if let Some(limit) = cutoff_ns
-        && newest_ns > limit
-    {
-        return None;
+    if newest_ns > cutoff_ns {
+        return TreeFreshness::Recent;
     }
 
     let mut entries_visited_count: usize = 0;
     let mut stack: Vec<(PathBuf, usize)> = Vec::with_capacity(depth_max);
-    stack.push((target_dir.to_path_buf(), 0));
+    stack.push((target_dir.as_path().to_path_buf(), 0));
 
     let mut dirs_popped_count: usize = 0;
     while let Some((current, depth)) = stack.pop() {
         dirs_popped_count = dirs_popped_count.saturating_add(1);
         if dirs_popped_count > TREE_WALK_ENTRIES_MAX {
-            return None;
+            return TreeFreshness::LimitExceeded;
         }
         if depth >= depth_max {
             continue;
         }
         // Fail closed on unreadable subdirectory inside `target/`.
-        let read_dir = fs::read_dir(&current).ok()?;
+        let read_dir = match fs::read_dir(&current) {
+            Ok(iter) => iter,
+            Err(err) => return TreeFreshness::Unreadable(err),
+        };
         for entry_result in read_dir {
             entries_visited_count = entries_visited_count.saturating_add(1);
             if entries_visited_count > TREE_WALK_ENTRIES_MAX {
-                return None;
+                return TreeFreshness::LimitExceeded;
             }
             // Fail closed: disappearing/unreadable child could belong to an active build.
-            let entry = entry_result.ok()?;
+            let entry = match entry_result {
+                Ok(val) => val,
+                Err(err) => return TreeFreshness::Unreadable(err),
+            };
             let entry_path = entry.path();
-            let entry_meta = fs::symlink_metadata(&entry_path).ok()?;
+            let entry_meta = match fs::symlink_metadata(&entry_path) {
+                Ok(meta) => meta,
+                Err(err) => return TreeFreshness::Unreadable(err),
+            };
             let entry_mtime_ns = metadata_mtime_ns(&entry_meta);
 
-            if let Some(limit) = cutoff_ns
-                && entry_mtime_ns > limit
-            {
-                return None;
+            if entry_mtime_ns > cutoff_ns {
+                return TreeFreshness::Recent;
             }
             if entry_mtime_ns > newest_ns {
                 newest_ns = entry_mtime_ns;
@@ -444,55 +391,66 @@ pub fn latest_target_mtime_ns(
         }
     }
 
-    if let Some(limit) = cutoff_ns {
-        assert!(newest_ns <= limit, "returned mtime must satisfy cutoff");
-    }
-    Some(newest_ns)
+    assert!(newest_ns <= cutoff_ns, "returned mtime must satisfy cutoff");
+    TreeFreshness::Stale(newest_ns)
 }
 
 /// Single-pass mtime + disk-usage inspection for a `/tmp/nix-*` tree.
 ///
-/// Returns `None` (fail closed / skip) if any entry is newer than `cutoff_ns`,
-/// if any subdirectory/entry cannot be stat-ed, or if walk bounds are exceeded.
-pub fn inspect_tmp_tree(root: &Path, cutoff_ns: i128) -> Option<TmpTreeSummary> {
-    assert!(root.is_absolute(), "root must be absolute");
-
-    let root_meta = fs::symlink_metadata(root).ok()?;
+/// Fails closed and distinguishes recent modifications from unreadable entries,
+/// type changes, and walk depth/entry limits.
+pub fn inspect_tmp_tree(root: &NonRootAbsPath, cutoff_ns: i128) -> TreeFreshness<TmpTreeSummary> {
+    let root_meta = match fs::symlink_metadata(root.as_path()) {
+        Ok(meta) => meta,
+        Err(err) => return TreeFreshness::Unreadable(err),
+    };
     if !root_meta.file_type().is_dir() {
-        return None;
+        return TreeFreshness::Unreadable(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "entry is not a directory",
+        ));
     }
     let mut newest_ns = metadata_mtime_ns(&root_meta);
     if newest_ns > cutoff_ns {
-        return None;
+        return TreeFreshness::Recent;
     }
 
     let mut total_bytes: u64 = root_meta.blocks().saturating_mul(512);
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     let mut entries_visited_count: usize = 0;
     let mut stack: Vec<(PathBuf, usize)> = Vec::with_capacity(WALK_DEPTH_MAX);
-    stack.push((root.to_path_buf(), 0));
+    stack.push((root.as_path().to_path_buf(), 0));
 
     let mut dirs_popped_count: usize = 0;
     while let Some((current, depth)) = stack.pop() {
         dirs_popped_count = dirs_popped_count.saturating_add(1);
         if dirs_popped_count > TREE_WALK_ENTRIES_MAX {
-            return None;
+            return TreeFreshness::LimitExceeded;
         }
         if depth >= WALK_DEPTH_MAX {
-            return None;
+            return TreeFreshness::LimitExceeded;
         }
-        let read_dir = fs::read_dir(&current).ok()?;
+        let read_dir = match fs::read_dir(&current) {
+            Ok(iter) => iter,
+            Err(err) => return TreeFreshness::Unreadable(err),
+        };
         for entry_result in read_dir {
             entries_visited_count = entries_visited_count.saturating_add(1);
             if entries_visited_count > TREE_WALK_ENTRIES_MAX {
-                return None;
+                return TreeFreshness::LimitExceeded;
             }
-            let entry = entry_result.ok()?;
+            let entry = match entry_result {
+                Ok(val) => val,
+                Err(err) => return TreeFreshness::Unreadable(err),
+            };
             let entry_path = entry.path();
-            let entry_meta = fs::symlink_metadata(&entry_path).ok()?;
+            let entry_meta = match fs::symlink_metadata(&entry_path) {
+                Ok(meta) => meta,
+                Err(err) => return TreeFreshness::Unreadable(err),
+            };
             let entry_mtime_ns = metadata_mtime_ns(&entry_meta);
             if entry_mtime_ns > cutoff_ns {
-                return None;
+                return TreeFreshness::Recent;
             }
             if entry_mtime_ns > newest_ns {
                 newest_ns = entry_mtime_ns;
@@ -525,23 +483,19 @@ pub fn inspect_tmp_tree(root: &Path, cutoff_ns: i128) -> Option<TmpTreeSummary> 
         newest_ns <= cutoff_ns,
         "returned tmp tree must satisfy cutoff"
     );
-    Some(TmpTreeSummary {
+    TreeFreshness::Stale(TmpTreeSummary {
         mtime_latest_ns: newest_ns,
         size_bytes: total_bytes,
     })
 }
 
 /// Walk `projects_dir` once to discover stale Nix `result*` links and Rust `target/` dirs.
-pub fn scan_projects(projects_dir: &Path, config: &ProjectScanConfig) -> ProjectScanResult {
-    assert!(projects_dir.is_absolute(), "projects_dir must be absolute");
-    assert!(
-        !sys::is_forbidden_delete_path(projects_dir),
-        "projects_dir cannot be a system root"
-    );
-    config.assert_valid();
-
+pub fn scan_projects(
+    projects_dir: &SafeProjectsDir,
+    config: &ProjectScanConfig,
+) -> ProjectScanResult {
     let mut result = ProjectScanResult::default();
-    if !projects_dir.is_dir() {
+    if !projects_dir.as_path().is_dir() {
         return result;
     }
 
@@ -550,27 +504,24 @@ pub fn scan_projects(projects_dir: &Path, config: &ProjectScanConfig) -> Project
 
     let mut entries_visited_count: usize = 0;
     let mut candidates_limit_reported = false;
-    let mut stack: Vec<(PathBuf, usize)> = Vec::with_capacity(WALK_DEPTH_MAX);
-    stack.push((projects_dir.to_path_buf(), 0));
+    let mut stack: Vec<(AbsPath, usize)> = Vec::with_capacity(WALK_DEPTH_MAX);
+    stack.push((projects_dir.as_abs().clone(), 0));
 
     let mut dirs_popped_count: usize = 0;
     while let Some((current, depth)) = stack.pop() {
         dirs_popped_count = dirs_popped_count.saturating_add(1);
         if dirs_popped_count > PROJECTS_WALK_ENTRIES_MAX {
-            append_error(
-                &mut result.errors,
-                format!(
-                    "scan {}: exceeded {PROJECTS_WALK_ENTRIES_MAX} entries limit",
-                    projects_dir.display()
-                ),
-            );
+            result.errors.push_truncated(format!(
+                "scan {}: exceeded {PROJECTS_WALK_ENTRIES_MAX} entries limit",
+                projects_dir.display()
+            ));
             break;
         }
         if depth >= WALK_DEPTH_MAX {
             continue;
         }
 
-        let read_dir = match fs::read_dir(&current) {
+        let read_dir = match fs::read_dir(current.as_path()) {
             Ok(iter) => iter,
             Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
                 // Unreadable subtrees (e.g. Docker bind-mounted data dirs) are not
@@ -578,10 +529,9 @@ pub fn scan_projects(projects_dir: &Path, config: &ProjectScanConfig) -> Project
                 continue;
             }
             Err(err) => {
-                append_error(
-                    &mut result.errors,
-                    format!("scan {}: {err}", current.display()),
-                );
+                result
+                    .errors
+                    .push_truncated(format!("scan {}: {err}", current.display()));
                 continue;
             }
         };
@@ -589,13 +539,10 @@ pub fn scan_projects(projects_dir: &Path, config: &ProjectScanConfig) -> Project
         for entry_result in read_dir {
             entries_visited_count = entries_visited_count.saturating_add(1);
             if entries_visited_count > PROJECTS_WALK_ENTRIES_MAX {
-                append_error(
-                    &mut result.errors,
-                    format!(
-                        "scan {}: exceeded {PROJECTS_WALK_ENTRIES_MAX} entries limit",
-                        projects_dir.display()
-                    ),
-                );
+                result.errors.push_truncated(format!(
+                    "scan {}: exceeded {PROJECTS_WALK_ENTRIES_MAX} entries limit",
+                    projects_dir.display()
+                ));
                 stack.clear();
                 break;
             }
@@ -603,36 +550,37 @@ pub fn scan_projects(projects_dir: &Path, config: &ProjectScanConfig) -> Project
             let Ok(entry) = entry_result else {
                 continue;
             };
-            let entry_path = entry.path();
-            let Ok(entry_meta) = fs::symlink_metadata(&entry_path) else {
+            let file_name_os = entry.file_name();
+            let Ok(entry_name) = EntryName::try_from_os_str(&file_name_os) else {
                 continue;
             };
-            let file_name_os = entry.file_name();
+            let Ok(entry_path) = current.join_entry(&entry_name) else {
+                continue;
+            };
+            let Ok(entry_meta) = fs::symlink_metadata(entry_path.as_path()) else {
+                continue;
+            };
             let file_name_lossy = file_name_os.to_string_lossy();
             let file_type = entry_meta.file_type();
 
             if file_type.is_symlink() {
                 if (file_name_lossy == "result" || file_name_lossy.starts_with("result-"))
-                    && let Ok(link_target) = fs::read_link(&entry_path)
+                    && let Ok(link_target) = fs::read_link(entry_path.as_path())
                 {
                     let mtime_ns = metadata_mtime_ns(&entry_meta);
-                    let is_stale_nix_link = link_target
-                        .as_os_str()
-                        .as_bytes()
-                        .starts_with(b"/nix/store/")
+                    let target_bytes = link_target.as_os_str().as_bytes();
+                    let is_stale_nix_link = target_bytes.len() > b"/nix/store/".len()
+                        && target_bytes.starts_with(b"/nix/store/")
                         && mtime_ns <= result_mtime_max_ns;
                     if is_stale_nix_link {
                         if result.stale_results.len() < CANDIDATES_MAX {
                             result.stale_results.push((entry_path, mtime_ns));
                         } else if !candidates_limit_reported {
                             candidates_limit_reported = true;
-                            append_error(
-                                &mut result.errors,
-                                format!(
-                                    "scan {}: exceeded {CANDIDATES_MAX} candidate limit",
-                                    projects_dir.display()
-                                ),
-                            );
+                            result.errors.push_truncated(format!(
+                                "scan {}: exceeded {CANDIDATES_MAX} candidate limit",
+                                projects_dir.display()
+                            ));
                         }
                     }
                 }
@@ -651,35 +599,52 @@ pub fn scan_projects(projects_dir: &Path, config: &ProjectScanConfig) -> Project
 
             if file_name_lossy == "target" {
                 if is_cargo_target_dir(&entry_path) {
-                    if is_cargo_target_locked(&entry_path) {
-                        result.targets_skipped_active_count += 1;
-                    } else {
-                        let newest_ns = latest_target_mtime_ns(
-                            &entry_path,
-                            Some(target_mtime_max_ns),
-                            TARGET_MTIME_DEPTH_MAX,
-                        );
-                        if let Some(mtime_latest_ns) = newest_ns {
-                            assert!(mtime_latest_ns <= target_mtime_max_ns);
-                            if result.target_candidates.len() < CANDIDATES_MAX {
-                                let size_bytes = dir_disk_usage(&entry_path);
-                                result.target_candidates.push(TargetCandidate {
-                                    path: entry_path,
-                                    mtime_latest_ns,
-                                    size_bytes,
-                                });
-                            } else if !candidates_limit_reported {
-                                candidates_limit_reported = true;
-                                append_error(
-                                    &mut result.errors,
-                                    format!(
-                                        "scan {}: exceeded {CANDIDATES_MAX} candidate limit",
-                                        projects_dir.display()
-                                    ),
-                                );
+                    match probe_cargo_target_lock(&entry_path) {
+                        CargoLockProbe::NoLockFile | CargoLockProbe::Acquired(_) => {
+                            match latest_target_mtime_ns(
+                                &entry_path,
+                                target_mtime_max_ns,
+                                TARGET_MTIME_DEPTH_MAX,
+                            ) {
+                                TreeFreshness::Stale(mtime_latest_ns) => {
+                                    if result.target_candidates.len() < CANDIDATES_MAX {
+                                        let size_bytes = dir_disk_usage(&entry_path);
+                                        result.target_candidates.push(TargetCandidate {
+                                            path: entry_path,
+                                            mtime_latest_ns,
+                                            size_bytes,
+                                        });
+                                    } else if !candidates_limit_reported {
+                                        candidates_limit_reported = true;
+                                        result.errors.push_truncated(format!(
+                                            "scan {}: exceeded {CANDIDATES_MAX} candidate limit",
+                                            projects_dir.display()
+                                        ));
+                                    }
+                                }
+                                TreeFreshness::Recent => {
+                                    result.targets_skipped_recent_count += 1;
+                                }
+                                TreeFreshness::Unreadable(err) => {
+                                    result.targets_skipped_unreadable_count += 1;
+                                    log(&format!(
+                                        "warning: skipped Rust target/ (unreadable): {} ({err})",
+                                        entry_path.display()
+                                    ));
+                                }
+                                TreeFreshness::LimitExceeded => {
+                                    result.targets_skipped_unreadable_count += 1;
+                                    log(&format!(
+                                        "warning: skipped Rust target/ (walk limit exceeded): {}",
+                                        entry_path.display()
+                                    ));
+                                }
                             }
-                        } else {
-                            result.targets_skipped_recent_count += 1;
+                        }
+                        CargoLockProbe::Locked
+                        | CargoLockProbe::SymlinkOrUnreadable(_)
+                        | CargoLockProbe::UnexpectedError(_) => {
+                            result.targets_skipped_active_count += 1;
                         }
                     }
                 }
@@ -688,7 +653,7 @@ pub fn scan_projects(projects_dir: &Path, config: &ProjectScanConfig) -> Project
             }
 
             if depth + 1 < WALK_DEPTH_MAX {
-                stack.push((entry_path, depth + 1));
+                stack.push((entry_path.as_abs().clone(), depth + 1));
             }
         }
     }
@@ -698,42 +663,32 @@ pub fn scan_projects(projects_dir: &Path, config: &ProjectScanConfig) -> Project
         .target_candidates
         .sort_by_key(|candidate| candidate.mtime_latest_ns);
 
-    assert!(
-        result.stale_results.len() <= CANDIDATES_MAX,
-        "stale_results exceeded CANDIDATES_MAX"
-    );
-    assert!(
-        result.target_candidates.len() <= CANDIDATES_MAX,
-        "target_candidates exceeded CANDIDATES_MAX"
-    );
+    assert!(result.stale_results.len() <= CANDIDATES_MAX);
+    assert!(result.target_candidates.len() <= CANDIDATES_MAX);
     assert!(result.errors.len() <= ERRORS_MAX);
     result
 }
 
 /// Pure discovery of stale `/tmp/nix-*` directories using single-pass inspection.
-pub fn scan_stale_nix_tmp_dirs(tmp_dir: &Path, tmp_age_hours: f64, now_ns: i128) -> TmpScanResult {
-    assert!(tmp_dir.is_absolute(), "tmp_dir must be absolute");
-    assert_ne!(tmp_dir, Path::new("/"), "tmp_dir must not be /");
-    assert!(now_ns > 0, "now_ns must be positive");
-    assert!(tmp_age_hours.is_finite());
-    assert!(tmp_age_hours >= 0.0);
-    assert!(tmp_age_hours <= f64::from(AGE_HOURS_MAX));
-
+pub fn scan_stale_nix_tmp_dirs(
+    tmp_dir: &NonRootAbsPath,
+    tmp_age: AgeDurationNs,
+    now_ns: TimestampNs,
+    owner_filter_uid: Option<u32>,
+) -> TmpScanResult {
     let mut result = TmpScanResult::default();
-    if !tmp_dir.is_dir() {
+    if !tmp_dir.as_path().is_dir() {
         return result;
     }
 
-    let cutoff_ns = now_ns - non_negative_seconds_to_ns(tmp_age_hours * SECONDS_PER_HOUR);
-    let euid = sys::effective_uid();
+    let cutoff_ns = tmp_age.cutoff_before(now_ns);
 
-    let read_dir = match fs::read_dir(tmp_dir) {
+    let read_dir = match fs::read_dir(tmp_dir.as_path()) {
         Ok(iter) => iter,
         Err(err) => {
-            append_error(
-                &mut result.errors,
-                format!("scan {}: {err}", tmp_dir.display()),
-            );
+            result
+                .errors
+                .push_truncated(format!("scan {}: {err}", tmp_dir.display()));
             return result;
         }
     };
@@ -742,29 +697,27 @@ pub fn scan_stale_nix_tmp_dirs(tmp_dir: &Path, tmp_age_hours: f64, now_ns: i128)
     for entry_result in read_dir {
         entries_seen_count = entries_seen_count.saturating_add(1);
         if entries_seen_count > TMP_DIR_ENTRIES_MAX {
-            append_error(
-                &mut result.errors,
-                format!(
-                    "scan {}: exceeded {TMP_DIR_ENTRIES_MAX} entries limit",
-                    tmp_dir.display()
-                ),
-            );
+            result.errors.push_truncated(format!(
+                "scan {}: exceeded {TMP_DIR_ENTRIES_MAX} entries limit",
+                tmp_dir.display()
+            ));
             break;
         }
 
         let Ok(entry) = entry_result else {
             continue;
         };
-        let name_os = entry.file_name();
-        let Some(name_str) = name_os.to_str() else {
+        let Ok(entry_name) = EntryName::try_from_os_str(&entry.file_name()) else {
             continue;
         };
-        if !is_nix_tmp_dir_name(name_str) {
+        if !is_nix_tmp_dir_name(&entry_name) {
             continue;
         }
 
-        let entry_path = entry.path();
-        let Ok(entry_meta) = fs::symlink_metadata(&entry_path) else {
+        let Ok(entry_path) = tmp_dir.join_entry(&entry_name) else {
+            continue;
+        };
+        let Ok(entry_meta) = fs::symlink_metadata(entry_path.as_path()) else {
             continue;
         };
         if !entry_meta.file_type().is_dir() {
@@ -774,33 +727,48 @@ pub fn scan_stale_nix_tmp_dirs(tmp_dir: &Path, tmp_age_hours: f64, now_ns: i128)
             !entry_meta.file_type().is_symlink(),
             "is_dir on symlink_metadata must exclude symlinks"
         );
-        if euid != 0 && entry_meta.uid() != euid {
+        if let Some(required_uid) = owner_filter_uid
+            && entry_meta.uid() != required_uid
+        {
             continue;
         }
 
-        if let Some(pid) = parse_nix_develop_pid(name_str)
+        if let Some(pid) = parse_nix_develop_pid(&entry_name)
             && sys::is_pid_alive(pid)
         {
             result.dirs_skipped_active_count += 1;
             continue;
         }
 
-        let Some(tree) = inspect_tmp_tree(&entry_path, cutoff_ns) else {
-            result.dirs_skipped_recent_count += 1;
-            continue;
-        };
-
-        if result.stale_dirs.len() >= CANDIDATES_MAX {
-            append_error(
-                &mut result.errors,
-                format!(
-                    "scan {}: exceeded {CANDIDATES_MAX} candidate limit",
-                    tmp_dir.display()
-                ),
-            );
-            break;
+        match inspect_tmp_tree(&entry_path, cutoff_ns) {
+            TreeFreshness::Stale(tree) => {
+                if result.stale_dirs.len() >= CANDIDATES_MAX {
+                    result.errors.push_truncated(format!(
+                        "scan {}: exceeded {CANDIDATES_MAX} candidate limit",
+                        tmp_dir.display()
+                    ));
+                    break;
+                }
+                result.stale_dirs.push((entry_path, tree.size_bytes));
+            }
+            TreeFreshness::Recent => {
+                result.dirs_skipped_recent_count += 1;
+            }
+            TreeFreshness::Unreadable(err) => {
+                result.dirs_skipped_unreadable_count += 1;
+                log(&format!(
+                    "warning: skipped {} (unreadable): {err}",
+                    entry_path.display()
+                ));
+            }
+            TreeFreshness::LimitExceeded => {
+                result.dirs_skipped_unreadable_count += 1;
+                log(&format!(
+                    "warning: skipped {} (walk depth or entry limit exceeded)",
+                    entry_path.display()
+                ));
+            }
         }
-        result.stale_dirs.push((entry_path, tree.size_bytes));
     }
 
     assert!(result.stale_dirs.len() <= CANDIDATES_MAX);
@@ -809,72 +777,60 @@ pub fn scan_stale_nix_tmp_dirs(tmp_dir: &Path, tmp_age_hours: f64, now_ns: i128)
 }
 
 /// Return existing per-user Nix profile paths to prune generations on.
-pub fn user_nix_profiles(user_name: &str, user_home: &Path) -> Vec<PathBuf> {
-    assert!(!user_name.is_empty(), "user_name must be non-empty");
-    assert!(user_home.is_absolute(), "user_home must be absolute");
-
-    let candidates = [
-        user_home
-            .join(".local")
-            .join("state")
-            .join("nix")
-            .join("profiles")
-            .join("profile"),
-        Path::new("/nix/var/nix/profiles/per-user")
-            .join(user_name)
-            .join("profile"),
-    ];
+pub fn user_nix_profiles(user_name: &UserName, user_home: &AbsPath) -> Vec<NonRootAbsPath> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Ok(xdg_profile) = user_home.join_relative(Path::new(".local/state/nix/profiles/profile"))
+        && let Ok(non_root) = NonRootAbsPath::try_from_abs(xdg_profile)
+    {
+        candidates.push(non_root);
+    }
+    let per_user_raw = Path::new("/nix/var/nix/profiles/per-user")
+        .join(user_name.as_str())
+        .join("profile");
+    if let Ok(non_root) = NonRootAbsPath::from_absolute(&per_user_raw) {
+        candidates.push(non_root);
+    }
 
     let mut profiles = Vec::with_capacity(candidates.len());
     let mut seen: HashSet<PathBuf> = HashSet::with_capacity(candidates.len());
 
-    for path in &candidates {
+    for path in candidates {
         // `symlink_metadata` succeeds for both existing targets and dangling symlinks.
-        if fs::symlink_metadata(path).is_err() {
+        if fs::symlink_metadata(path.as_path()).is_err() {
             continue;
         }
-        let resolved = match (
-            path.parent().and_then(|p| fs::canonicalize(p).ok()),
-            path.file_name(),
-        ) {
-            (Some(canon_parent), Some(name)) => canon_parent.join(name),
-            _ => path.clone(),
+        let parent = path.parent();
+        let file_name = path.file_name();
+        let resolved = match fs::canonicalize(parent.as_path()) {
+            Ok(canon_parent) => canon_parent.join(file_name.as_os_str()),
+            Err(_) => path.as_path().to_path_buf(),
         };
         if seen.insert(resolved) {
-            profiles.push(path.clone());
+            profiles.push(path);
         }
     }
 
-    assert!(profiles.len() <= candidates.len());
     profiles
 }
 
-pub fn is_nix_tmp_dir_name(name: &str) -> bool {
-    assert!(
-        !name.contains('/'),
-        "directory entry name must not contain '/'"
-    );
+pub fn is_nix_tmp_dir_name(name: &EntryName) -> bool {
+    let Some(text) = name.to_str() else {
+        return false;
+    };
     NIX_TMP_PREFIXES
         .iter()
-        .any(|prefix| name.starts_with(prefix))
+        .any(|prefix| text.starts_with(prefix))
 }
 
-/// Extract PID from `nix-develop-<pid>-...` directory names.
-pub fn parse_nix_develop_pid(name: &str) -> Option<u32> {
-    assert!(
-        !name.contains('/'),
-        "directory entry name must not contain '/'"
-    );
-    let rest = name.strip_prefix("nix-develop-")?;
+/// Extract non-zero PID from `nix-develop-<pid>-...` directory names.
+pub fn parse_nix_develop_pid(name: &EntryName) -> Option<NonZeroU32> {
+    let text = name.to_str()?;
+    let rest = text.strip_prefix("nix-develop-")?;
     let dash_index = rest.find('-')?;
     let digits = rest.get(..dash_index)?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let pid = digits.parse::<u32>().ok()?;
-    if pid == 0 {
-        return None;
-    }
-    assert!(pid > 0);
-    Some(pid)
+    NonZeroU32::new(pid)
 }
