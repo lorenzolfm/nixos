@@ -6,6 +6,7 @@
     ../common/attic.nix
     ./hardware-configuration.nix
     ./backup.nix
+    ./disk-cleanup.nix
     ./scb-repo.nix
     ./claude-tray.nix
     ./claude-nav.nix

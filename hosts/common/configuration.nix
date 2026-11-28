@@ -9,6 +9,7 @@
 {
   imports = [
     ./claude-ps.nix
+    ./disk-cleanup.nix
     ./lune.nix
   ];
 
