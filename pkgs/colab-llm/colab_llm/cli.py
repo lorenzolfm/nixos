@@ -23,6 +23,7 @@ from colab_llm.colab import (
     Adopt,
     ColabClient,
     ColabError,
+    ColabSessionInfo,
     Create,
     Reuse,
     SessionPlan,
@@ -194,6 +195,7 @@ def _upload_and_bootstrap(
     client: ColabClient,
     config: LaunchConfig,
     identity: Path,
+    hf_token: str | None,
 ) -> None:
     engine = get_engine(config.engine.kind)
     uploads = {"bootstrap.sh": engine.script_path().read_bytes()}
@@ -216,7 +218,6 @@ def _upload_and_bootstrap(
             timeout=120,
         )
 
-    hf_token = resolve_hf_token(config.hf_token_file)
     if hf_token is not None:
         # Maya only needs the token for its prefetch. The other engines download
         # inside the server process, so the token stays in that process's
@@ -261,9 +262,16 @@ def _raise_terminated(signum: int, _frame: object) -> None:
 
 
 def _teardown_runtime(
-    client: ColabClient, session: SessionName, stop_reason: StopReason
+    client: ColabClient,
+    session: SessionName,
+    stop_reason: StopReason,
+    interrupted_create: Create | None,
 ) -> bool:
     """Stop the billable runtime. Returns whether the stop was verified.
+
+    `interrupted_create` is the plan of an allocation that did not complete.
+    It may have left a runtime without a name, which the stop by name cannot
+    see, so that one is looked for and stopped as well.
 
     Signals are ignored for the duration: the child `colab stop` shares our
     process group, so a second Ctrl+C would otherwise abort the stop itself.
@@ -279,6 +287,10 @@ def _teardown_runtime(
         for attempt in range(1, TEARDOWN_ATTEMPTS_MAX + 1):
             try:
                 client.teardown_session(session)
+                if interrupted_create is not None:
+                    client.stop_orphans_of_interrupted_create(
+                        session=session, plan=interrupted_create
+                    )
                 return True
             except ColabError as exc:
                 _say(
@@ -290,7 +302,8 @@ def _teardown_runtime(
                 time.sleep(TEARDOWN_RETRY_PAUSE_S)
         _say(
             f"[colab-llm] WARNING: session {session!r} may still be running and billing.\n"
-            f"  Run manually: colab stop -s {session}",
+            f"  Run manually: colab stop -s {session}\n"
+            "  Then check `colab sessions` for an unnamed `[?]` runtime.",
             error=True,
         )
         return False
@@ -376,6 +389,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
     engine = get_engine(config.engine.kind)
     engine.script_path()
     support_script_paths()
+    hf_token = resolve_hf_token(config.hf_token_file)
     control_path = _control_socket_path(config.session)
 
     # One supervisor per session, and the user-facing port is ours, from here
@@ -396,6 +410,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
                 identity=identity,
                 control_path=control_path,
                 listener=listener,
+                hf_token=hf_token,
             )
         finally:
             listener.close()
@@ -422,6 +437,7 @@ def _run_session(
     identity: Path,
     control_path: Path,
     listener: socket.socket,
+    hf_token: str | None,
 ) -> int:
     engine = get_engine(config.engine.kind)
     state = StateWriter(
@@ -468,6 +484,8 @@ def _run_session(
     started_mono = time.monotonic()
     stop_reason = StopReason.ERROR
     connections_total = 0
+    # Stays None until the runtime is known by name: see the teardown below.
+    info: ColabSessionInfo | None = None
     state.write(Allocating())
     # From the first statement of this `try` a billable runtime may exist, and
     # the `finally` is the only way out: no step sits between the two.
@@ -478,7 +496,7 @@ def _run_session(
             f"Hardware={info.hardware} Shape={info.shape}"
         )
         state.write(Bootstrapping())
-        _upload_and_bootstrap(client, config, identity)
+        _upload_and_bootstrap(client, config, identity, hf_token)
 
         def _check_remote_pid() -> bool:
             # Only multiplex over the active ControlMaster socket; never open a
@@ -516,17 +534,22 @@ def _run_session(
                 identity=identity,
                 on_ready=lambda h: _print_ready_banner(config, h),
                 check_remote_alive=_check_remote_pid,
+                session_listed=lambda: any(
+                    item.name == config.session for item in client.list_sessions()
+                ),
             )
         )
         stop_reason = outcome.stop_reason
         connections_total = outcome.total_connections
-        if is_failed_start(stop_reason):
+        if is_failed_start(stop_reason) or stop_reason is StopReason.ENGINE_EXITED:
             print(
-                f"[colab-llm] Engine did not reach ready state ({stop_reason}). "
+                f"[colab-llm] Engine is not serving ({stop_reason}). "
                 "Last 40 lines of remote server.log:",
                 file=sys.stderr,
             )
             try:
+                # The tunnel is closed, so this is a fresh `colab ssh`.
+                client.require_session(config.session)
                 client.ssh_exec(
                     session=config.session,
                     identity=identity,
@@ -542,7 +565,12 @@ def _run_session(
     except KeyboardInterrupt:
         stop_reason = StopReason.SIGNAL_SIGINT
     finally:
-        runtime_stopped = _teardown_runtime(client, config.session, stop_reason)
+        # An allocation that never returned may have left a runtime Colab
+        # knows but the session name does not.
+        interrupted_create = plan if isinstance(plan, Create) and info is None else None
+        runtime_stopped = _teardown_runtime(
+            client, config.session, stop_reason, interrupted_create
+        )
         try:
             # Written only now: "stopped" must say whether the runtime really is.
             state.write(Stopped(stop_reason=stop_reason, runtime_stopped=runtime_stopped))
@@ -829,6 +857,8 @@ def _cmd_logs(args: argparse.Namespace) -> int:
     identity = resolve_ssh_identity(args.identity)
     client = ColabClient(colab_config=args.colab_config)
     control_path = _control_socket_path(args.session)
+    if not control_path.exists():
+        client.require_session(args.session)
     line_count: int = args.lines
     tail_cmd = (
         f"tail -n {line_count} -f {REMOTE_WORK_DIR}/server.log"
@@ -847,6 +877,8 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
     identity = resolve_ssh_identity(args.identity)
     client = ColabClient(colab_config=args.colab_config)
     control_path = _control_socket_path(args.session)
+    if not control_path.exists():
+        client.require_session(args.session)
     cmd = list(args.cmd) if args.cmd else None
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]

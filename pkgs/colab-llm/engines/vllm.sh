@@ -13,7 +13,9 @@ VLLM_PINNED_VERSION="${VLLM_PINNED_VERSION:?}"
 
 bootstrap_begin
 
-if [[ ! -x "${VENV_DIR}/bin/vllm" ]]; then
+INSTALL_MARKER="${VENV_DIR}/.colab-llm-installed"
+if ! install_marker_matches "${INSTALL_MARKER}" "${VLLM_PINNED_VERSION}"; then
+  rm -rf "${VENV_DIR}"
   log "Installing vLLM ${VLLM_PINNED_VERSION} in ${VENV_DIR}..."
   packages=("vllm==${VLLM_PINNED_VERSION}" "huggingface_hub[hf_xet]" hf_transfer)
   if command -v uv >/dev/null 2>&1; then
@@ -23,6 +25,7 @@ if [[ ! -x "${VENV_DIR}/bin/vllm" ]]; then
     python3 -m venv "${VENV_DIR}"
     "${VENV_DIR}/bin/pip" install -q --no-input "${packages[@]}"
   fi
+  printf '%s\n' "${VLLM_PINNED_VERSION}" > "${INSTALL_MARKER}"
 fi
 
 serve_args=(

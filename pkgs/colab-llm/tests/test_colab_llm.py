@@ -28,6 +28,7 @@ from colab_llm.colab import (
     Create,
     Reuse,
     build_proxy_command,
+    build_ssh_mux_args,
     build_ssh_tunnel_args,
     parse_sessions_output,
     parse_usage_output,
@@ -354,7 +355,7 @@ def test_a_failed_allocation_leaves_through_the_one_shielded_teardown(
     monkeypatch.setattr(client, "_run_colab", _fake_run)
     monkeypatch.setattr(client, "list_sessions", list)
     with pytest.raises(ColabError, match="did not appear"):
-        client.realise_session(validate_session_name("colab-llm"), Create(Gpu.G4, False))
+        client.realise_session(validate_session_name("colab-llm"), Create(Gpu.G4, False, frozenset()))
     assert commands == [["new", "-s", "colab-llm", "--gpu", "G4"]]  # no stop of its own
 
     commands.clear()
@@ -377,6 +378,7 @@ def test_a_failed_allocation_leaves_through_the_one_shielded_teardown(
                 identity=tmp_path / "id_ed25519",
                 control_path=tmp_path / "ctl.sock",
                 listener=listener,
+                hf_token=None,
             )
     finally:
         listener.close()
@@ -505,9 +507,9 @@ def test_a_missing_session_is_planned_then_created(
     monkeypatch.setattr(client, "_run_colab", _fake_run)
 
     plan = client.plan_session(session=session, gpu=Gpu.A100, high_mem=True)
-    assert plan == Create(gpu=Gpu.A100, high_mem=True)
+    assert plan == Create(gpu=Gpu.A100, high_mem=True, endpoints_before=frozenset())
     assert seen_args == []
-    info = client.realise_session(session, Create(gpu=Gpu.G4, high_mem=False))
+    info = client.realise_session(session, Create(gpu=Gpu.G4, high_mem=False, endpoints_before=frozenset()))
     assert info.hardware == "G4"
     assert seen_args == [["new", "-s", "colab-llm", "--gpu", "G4"]]
 
@@ -591,7 +593,12 @@ def test_stop_all_also_terminates_unnamed_server_sessions(
     attached: list[str] = []
     stopped: list[str] = []
 
-    monkeypatch.setattr(client, "_run_colab", lambda args, **_kw: calls.append(list(args)))
+
+    def _fake_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(client, "_run_colab", _fake_run)
     monkeypatch.setattr(
         client,
         "list_sessions",
@@ -1273,3 +1280,247 @@ def test_termination_signals_still_reach_teardown_after_the_supervised_session(
         for sig, handler in before.items():
             signal.signal(sig, handler)
     assert json.loads(state_file.read_text(encoding="utf-8"))["phase"] == "stopping"
+
+
+# ------------------------------------------------- runtimes nobody would stop
+
+
+def _unnamed(endpoint: str, hardware: str = "G4") -> ColabSessionInfo:
+    return ColabSessionInfo(
+        name=None, endpoint=endpoint, hardware=hardware, shape="Standard", variant="GPU"
+    )
+
+
+def test_a_runtime_left_unnamed_by_an_interrupted_allocation_is_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `colab new` killed between the server assignment and its local record
+    # leaves a `[?]` runtime. The stop by name cannot see it, and used to
+    # report the teardown as verified while that runtime kept billing.
+    client = ColabClient(colab_bin="/bin/true", ssh_bin="/bin/true")
+    session = validate_session_name("colab-llm")
+    listing = [_unnamed("m-s-web-ui"), _unnamed("m-s-orphan"), _unnamed("m-s-t4", "T4")]
+    adopted: list[str] = []
+    stopped: list[str] = []
+    monkeypatch.setattr(client, "list_sessions", lambda: listing)
+    monkeypatch.setattr(
+        client, "adopt_session", lambda *, session, target: adopted.append(target.endpoint)
+    )
+    monkeypatch.setattr(client, "teardown_session", stopped.append)
+
+    plan = client.plan_session(session=session, gpu=Gpu.G4)
+    assert isinstance(plan, Create)
+    assert plan.endpoints_before == {"m-s-web-ui", "m-s-orphan", "m-s-t4"}
+    # Everything listed existed before the plan: none of it is ours to stop.
+    client.stop_orphans_of_interrupted_create(session=session, plan=plan)
+    assert adopted == []
+
+    # Only the new, unnamed runtime on the requested GPU is the orphan.
+    listing.extend([_unnamed("m-s-new-g4"), _unnamed("m-s-new-t4", "T4"), _session("other")])
+    client.stop_orphans_of_interrupted_create(session=session, plan=plan)
+    assert adopted == ["m-s-new-g4"]
+    assert stopped == ["colab-llm"]
+
+
+def test_teardown_looks_for_an_orphan_only_after_an_interrupted_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ColabClient(colab_bin="/bin/true", ssh_bin="/bin/true")
+    session = validate_session_name("colab-llm")
+    searched: list[Create] = []
+    monkeypatch.setattr(client, "teardown_session", lambda _session: None)
+    monkeypatch.setattr(
+        client,
+        "stop_orphans_of_interrupted_create",
+        lambda *, session, plan: searched.append(plan),
+    )
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    plan = Create(Gpu.G4, False, frozenset())
+
+    assert cli._teardown_runtime(client, session, StopReason.ERROR, None) is True
+    assert searched == []
+    assert cli._teardown_runtime(client, session, StopReason.SIGNAL_SIGINT, plan) is True
+    assert searched == [plan]
+
+    # An orphan that cannot be stopped means the stop is not verified.
+    def _fails(*, session: str, plan: Create) -> None:
+        raise ColabError("still listed")
+
+    monkeypatch.setattr(client, "stop_orphans_of_interrupted_create", _fails)
+    assert cli._teardown_runtime(client, session, StopReason.SIGNAL_SIGINT, plan) is False
+
+
+def test_logs_and_ssh_refuse_a_session_colab_does_not_list(
+    state_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `colab ssh --proxy-mode -s NAME` allocates a runtime for an unknown NAME,
+    # so asking for the logs of an ended session used to start one silently.
+    key = tmp_path / "id_ed25519"
+    key.write_text("private", encoding="utf-8")
+    Path(f"{key}.pub").write_text("ssh-ed25519 AAAA test", encoding="utf-8")
+    connections: list[str] = []
+    monkeypatch.setenv("COLAB_LLM_COLAB_BIN", sys.executable)
+    monkeypatch.setenv("COLAB_LLM_SSH_BIN", sys.executable)
+    monkeypatch.setattr(ColabClient, "list_sessions", lambda self: [_session("other")])
+    monkeypatch.setattr(
+        ColabClient, "ssh_interactive", lambda self, **kw: connections.append("ssh") or 0
+    )
+    with tempfile.TemporaryDirectory(prefix="cl-", dir="/tmp") as runtime_dir:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", runtime_dir)
+        assert cli_main(["logs", "-i", str(key)]) == 2
+        assert cli_main(["ssh", "-i", str(key)]) == 2
+        assert connections == []
+        assert cli_main(["logs", "-i", str(key), "-s", "other"]) == 0
+        assert connections == ["ssh"]
+
+
+def test_an_unreadable_hf_token_fails_before_any_gpu_is_allocated(
+    state_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = tmp_path / "id_ed25519"
+    key.write_text("private", encoding="utf-8")
+    Path(f"{key}.pub").write_text("ssh-ed25519 AAAA test", encoding="utf-8")
+    commands: list[list[str]] = []
+    monkeypatch.setenv("COLAB_LLM_COLAB_BIN", sys.executable)
+    monkeypatch.setenv("COLAB_LLM_SSH_BIN", sys.executable)
+    monkeypatch.setattr(
+        ColabClient, "_run_colab", lambda self, args, **_kw: commands.append(list(args))
+    )
+    missing = tmp_path / "no-such-token"
+    assert cli_main(["start", "-i", str(key), "--hf-token-file", str(missing)]) == 2
+    assert commands == []
+
+
+def test_attach_by_endpoint_refuses_a_runtime_another_session_tracks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = ColabClient(colab_bin="/bin/true", ssh_bin="/bin/true")
+    monkeypatch.setattr(client, "list_sessions", lambda: [_session("other")])
+    with pytest.raises(ColabError, match="already tracked as session 'other'"):
+        client.plan_session(
+            session=validate_session_name("colab-llm"), gpu=Gpu.G4, attach=Attach("m-s-1")
+        )
+
+
+def test_stop_all_goes_on_after_a_failure_and_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ColabClient(
+        colab_bin="/bin/true", ssh_bin="/bin/true", colab_config=tmp_path / "sessions.json"
+    )
+    stopped: list[str] = []
+
+    def _teardown(session: str) -> None:
+        if session == "stubborn":
+            raise ColabError("still listed")
+        stopped.append(session)
+
+    monkeypatch.setattr(
+        client,
+        "_run_colab",
+        lambda args, **_kw: subprocess.CompletedProcess(args, 1, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        client,
+        "list_sessions",
+        lambda: [_session("stubborn"), _session("not a name"), _session("last")],
+    )
+    monkeypatch.setattr(client, "teardown_session", _teardown)
+    with pytest.raises(ColabError, match="may still be running") as raised:
+        client.stop_all()
+    assert stopped == ["last"]
+    assert "stop --all" in str(raised.value)
+    assert "still listed" in str(raised.value)
+    assert "Invalid session name" in str(raised.value)
+
+
+def test_a_multiplexed_command_never_falls_back_to_a_direct_connection(
+    tmp_path: Path,
+) -> None:
+    args = build_ssh_mux_args(ssh_bin="/usr/bin/ssh", control_path=tmp_path / "ctl.sock")
+    assert "ProxyCommand=false" in args
+    assert args[-1] == "root@colab-runtime"
+
+
+def test_the_tunnel_is_not_reconnected_once_colab_no_longer_lists_the_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Reconnecting would let `colab ssh` allocate a fresh, empty runtime under
+    # the same name, and the tunnel to it would look healthy.
+    fake_ssh = tmp_path / "ssh"
+    launches = tmp_path / "launches"
+    fake_ssh.write_text(f"#!/bin/sh\necho x >> {launches}\nexit 255\n", encoding="utf-8")
+    fake_ssh.chmod(0o700)
+    monkeypatch.setattr("colab_llm.proxy.TUNNEL_BACKOFF_S_MIN", 0.01)
+
+    async def _run() -> None:
+        tunnel = TunnelSupervisor(
+            colab_bin="/bin/true",
+            ssh_bin=str(fake_ssh),
+            session=validate_session_name("colab-llm"),
+            tunnel_port=pick_free_loopback_port(),
+            remote_port=18100,
+            identity=tmp_path / "id_ed25519",
+            control_path=tmp_path / "ctl.sock",
+            session_listed=lambda: False,
+        )
+        await tunnel.start()
+        for _ in range(500):
+            if tunnel.ended:
+                break
+            await asyncio.sleep(0.01)
+        assert tunnel.ended is True
+        assert tunnel.end_error() is None
+        await tunnel.stop()
+
+    asyncio.run(_run())
+    assert launches.read_text(encoding="utf-8").count("x") == 1
+
+
+def test_deadman_finds_the_runtime_service_in_another_process_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A process started over SSH does not inherit the kernel's environment,
+    # which is where Colab puts the address of its runtime service.
+    deadman = _load_deadman_module()
+    monkeypatch.delenv("TBE_RUNTIME_ADDR", raising=False)
+    (tmp_path / "10").mkdir()
+    (tmp_path / "10" / "environ").write_bytes(b"PATH=/usr/bin\0HOME=/root\0")
+    assert deadman._find_runtime_addr(tmp_path) is None
+    (tmp_path / "20").mkdir()
+    (tmp_path / "20" / "environ").write_bytes(b"A=1\0TBE_RUNTIME_ADDR=172.28.0.1:8011\0B=2\0")
+    assert deadman._find_runtime_addr(tmp_path) == "172.28.0.1:8011"
+    # Never interpolated into a URL unless it is a plain host[:port].
+    assert deadman.runtime_addr_from_environ(b"TBE_RUNTIME_ADDR=evil/path?x=1\0") is None
+    monkeypatch.setenv("TBE_RUNTIME_ADDR", "10.0.0.1:9000")
+    assert deadman._find_runtime_addr(tmp_path) == "10.0.0.1:9000"
+
+
+def test_deadman_posts_the_unassign_request_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    deadman = _load_deadman_module()
+    seen: list[tuple[str, str]] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            seen.append((self.command, self.path))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("TBE_RUNTIME_ADDR", f"127.0.0.1:{server.server_address[1]}")
+        assert deadman._try_unassign_colab_runtime() is True
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert seen == [("POST", "/unassign")]
+
+
+def test_an_engine_that_died_after_ready_is_a_failing_exit_but_not_a_failed_start() -> None:
+    assert exit_code_for(StopReason.ENGINE_EXITED) == 1
+    assert not is_failed_start(StopReason.ENGINE_EXITED)

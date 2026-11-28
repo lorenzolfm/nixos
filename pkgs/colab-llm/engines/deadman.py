@@ -17,12 +17,21 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import signal
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 TERMINATE_GRACE_S = 5
+UNASSIGN_TIMEOUT_S = 30
+
+# Where Colab's runtime management service listens. The kernel has it in its
+# environment; a process started over SSH, like this one, usually does not.
+_RUNTIME_ADDR_VAR = "TBE_RUNTIME_ADDR"
+_RUNTIME_ADDR_RE = re.compile(r"^[A-Za-z0-9.\-]+(:[0-9]{1,5})?$")
 
 
 def _log(msg: str) -> None:
@@ -51,8 +60,66 @@ def _terminate_pid(pid_file: Path) -> None:
         _log(f"Could not signal pid {pid} from {pid_file}: {exc}")
 
 
+def runtime_addr_from_environ(raw: bytes) -> str | None:
+    """The runtime management address in a NUL-separated environment block."""
+    prefix = f"{_RUNTIME_ADDR_VAR}=".encode("ascii")
+    for entry in raw.split(b"\0"):
+        if entry.startswith(prefix):
+            addr = entry[len(prefix) :].decode("ascii", errors="replace").strip()
+            if _RUNTIME_ADDR_RE.fullmatch(addr):
+                return addr
+    return None
+
+
+def _find_runtime_addr(proc_dir: Path = Path("/proc")) -> str | None:
+    """Our own environment first, then that of any process on the VM.
+
+    Bounded by the number of processes. We run as root on the VM, so the
+    kernel's environment is readable.
+    """
+    own = os.environ.get(_RUNTIME_ADDR_VAR, "").strip()
+    if _RUNTIME_ADDR_RE.fullmatch(own):
+        return own
+    for environ_path in sorted(proc_dir.glob("[0-9]*/environ")):
+        try:
+            addr = runtime_addr_from_environ(environ_path.read_bytes())
+        except OSError:
+            # The process exited, or is not ours to read.
+            continue
+        if addr is not None:
+            return addr
+    return None
+
+
+def _post_unassign(addr: str) -> bool:
+    """The request `google.colab.runtime.unassign()` makes, without its kernel part."""
+    request = urllib.request.Request(f"http://{addr}/unassign", data=b"", method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=UNASSIGN_TIMEOUT_S) as response:
+            status = int(response.status)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        _log(f"POST http://{addr}/unassign failed: {exc!r}")
+        return False
+    if status != 200:
+        _log(f"POST http://{addr}/unassign answered HTTP {status}")
+        return False
+    return True
+
+
 def _try_unassign_colab_runtime() -> bool:
-    """Ask Colab to release this VM. Returns whether the request went through."""
+    """Ask Colab to release this VM. Returns whether the request went through.
+
+    The library call needs the kernel's environment and ends by talking to a
+    notebook frontend, neither of which exists in a process started over SSH.
+    So the same request is sent directly, and the library is only a fallback.
+    """
+    addr = _find_runtime_addr()
+    if addr is not None:
+        _log(f"Requesting unassignment from the runtime service at {addr}...")
+        if _post_unassign(addr):
+            return True
+    else:
+        _log(f"No {_RUNTIME_ADDR_VAR} found in any process environment.")
     try:
         from google.colab import runtime  # type: ignore[import-not-found]
 

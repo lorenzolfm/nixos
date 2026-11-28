@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, assert_never
 
 from colab_llm.colab import (
+    ColabError,
     build_proxy_command,
     build_ssh_mux_args,
     build_ssh_tunnel_args,
@@ -55,6 +56,8 @@ HEALTH_PROBE_INTERVAL_S = 3.0
 HEALTH_LOG_INTERVAL_S = 15.0
 WATCHDOG_TICK_S = 5.0
 STATE_WRITE_INTERVAL_S = 10.0
+# How often a ready engine's process is checked on the VM.
+ENGINE_ALIVE_CHECK_INTERVAL_S = 60.0
 STATUS_LOG_INTERVAL_S = 300.0
 
 
@@ -369,7 +372,12 @@ class TunnelSupervisor:
         control_path: Path,
         rm_on_disconnect: bool = False,
         colab_config: Path | None = None,
+        session_listed: Callable[[], bool] | None = None,
     ) -> None:
+        # Whether Colab still lists the session. Asked before every reconnect:
+        # `colab ssh --proxy-mode` allocates a new runtime under a name it no
+        # longer knows, and a tunnel to that empty VM would look healthy.
+        self._session_listed = session_listed
         self.colab_bin = colab_bin
         self.ssh_bin = ssh_bin
         self.session = session
@@ -427,37 +435,63 @@ class TunnelSupervisor:
         # A stale socket would make the next `ssh -M` refuse to start.
         self.control_path.unlink(missing_ok=True)
 
+    async def _session_still_listed(self) -> bool | None:
+        """True or False as Colab reports it; None when the listing failed."""
+        if self._session_listed is None:
+            return True
+        try:
+            return await asyncio.to_thread(self._session_listed)
+        except ColabError:
+            return None
+
     async def _supervise_loop(self) -> None:
         backoff_s = TUNNEL_BACKOFF_S_MIN
         failures_consecutive = 0
+        reconnecting = False
         # Bounded by TUNNEL_FAILURES_CONSECUTIVE_MAX failures in a row; a tunnel
         # that keeps working runs until `stop()`, which the hard cap guarantees.
         while not self._stopping:
-            self._remove_control_socket()
-            # Pass --force so a just-closed bootstrap SSH session slot on Colab
-            # (which enforces a 1-session limit on some tiers) never causes a
-            # spurious HTTP 429 when bringing up the ControlMaster tunnel.
-            cmd = self._build_cmd(force=True)
             started = time.monotonic()
-            self._proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr_bytes = await self._proc.communicate()
-            exit_code = self._proc.returncode
-            self._proc = None
+            # The first connection follows the bootstrap, which just used the
+            # session. Later ones must not assume it still exists.
+            listed = await self._session_still_listed() if reconnecting else True
             if self._stopping:
                 break
-            err_msg = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
-            if self.rm_on_disconnect:
+            if listed is False:
                 print(
-                    f"[colab-llm] SSH tunnel exited (rc={exit_code}) "
-                    "with --rm-on-disconnect enabled.",
+                    f"[colab-llm] Session {self.session!r} is no longer listed on Colab; "
+                    "not reconnecting the SSH tunnel.",
                     file=sys.stderr,
                 )
                 break
+            exit_code: int | None = None
+            err_msg = "could not confirm that the session is still listed on Colab"
+            if listed is True:
+                reconnecting = True
+                self._remove_control_socket()
+                # Pass --force so a just-closed bootstrap SSH session slot on Colab
+                # (which enforces a 1-session limit on some tiers) never causes a
+                # spurious HTTP 429 when bringing up the ControlMaster tunnel.
+                cmd = self._build_cmd(force=True)
+                self._proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr_bytes = await self._proc.communicate()
+                exit_code = self._proc.returncode
+                self._proc = None
+                if self._stopping:
+                    break
+                err_msg = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()
+                if self.rm_on_disconnect:
+                    print(
+                        f"[colab-llm] SSH tunnel exited (rc={exit_code}) "
+                        "with --rm-on-disconnect enabled.",
+                        file=sys.stderr,
+                    )
+                    break
 
             if time.monotonic() - started >= TUNNEL_STABLE_S:
                 failures_consecutive = 0
@@ -544,6 +578,7 @@ async def run_supervised_session(
     identity: Path,
     on_ready: Callable[[dict[str, Any]], None] | None = None,
     check_remote_alive: Callable[[], bool] | None = None,
+    session_listed: Callable[[], bool] | None = None,
 ) -> SessionOutcome:
     """Run the SSH tunnel, loopback activity proxy, health check, and idle/cap watchdog.
 
@@ -571,6 +606,7 @@ async def run_supervised_session(
         control_path=control_path,
         rm_on_disconnect=config.rm_on_disconnect,
         colab_config=config.colab_config,
+        session_listed=session_listed,
     )
     proxy = ActivityTrackingProxy(listener=listener, upstream_port=tunnel_port)
 
@@ -699,9 +735,13 @@ async def run_supervised_session(
             assert stop_event.is_set()
             return _outcome()
 
-        # Reset idle timer at the moment the endpoint becomes ready so long model
-        # loads never count as idle time.
-        proxy.stats.last_activity_monotonic = time.monotonic()
+        # Both clocks start at the moment the endpoint becomes ready, so a long
+        # model load counts neither as idle time nor against the hard cap. The
+        # remote deadman's cap already allows for the load (see
+        # `deadman_duration_s_max`).
+        ready_at = time.monotonic()
+        proxy.stats.last_activity_monotonic = ready_at
+        proxy.stats.started_monotonic = ready_at
         state.write(Ready(traffic=_traffic(), health=health_info))
         if on_ready is not None:
             on_ready(health_info)
@@ -710,6 +750,7 @@ async def run_supervised_session(
         # Bounded by the hard cap, which is checked first on every tick.
         last_state_write = 0.0
         last_status_log = time.monotonic()
+        last_alive_check = time.monotonic()
         while not stop_event.is_set():
             now = time.monotonic()
             if proxy.stats.is_hard_cap_expired(max_duration_s, now):
@@ -736,6 +777,23 @@ async def run_supervised_session(
                 last_state_write = now
 
             await _heartbeat_if_due(now, tunnel_expected=True)
+
+            # A dead engine serves nothing, yet a client that keeps retrying
+            # would keep the idle timer from ever expiring.
+            if (
+                check_remote_alive is not None
+                and now - last_alive_check >= ENGINE_ALIVE_CHECK_INTERVAL_S
+                and control_path.exists()
+            ):
+                last_alive_check = now
+                if not await asyncio.to_thread(check_remote_alive):
+                    print(
+                        f"[colab-llm] The {engine} process on the VM has exited. "
+                        "Stopping Colab runtime.",
+                        file=sys.stderr,
+                    )
+                    _request_stop(StopReason.ENGINE_EXITED)
+                    break
 
             if now - last_status_log >= STATUS_LOG_INTERVAL_S:
                 idle_left_s = max(0.0, idle_timeout_s - proxy.stats.idle_s(now))

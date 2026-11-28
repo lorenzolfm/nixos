@@ -145,6 +145,8 @@ class StopReason(StrEnum):
     MAX_DURATION = "max_duration"
     # The tunnel gave up while a ready engine was being served.
     TUNNEL_DISCONNECTED = "tunnel_disconnected"
+    # The engine process died after it had been ready.
+    ENGINE_EXITED = "engine_exited"
 
 
 SIGNAL_STOP_REASONS: dict[signal.Signals, StopReason] = {
@@ -171,6 +173,7 @@ def is_failed_start(stop_reason: StopReason) -> bool:
             | StopReason.IDLE_TIMEOUT
             | StopReason.MAX_DURATION
             | StopReason.TUNNEL_DISCONNECTED
+            | StopReason.ENGINE_EXITED
         ):
             return False
         case _:
@@ -188,6 +191,7 @@ def exit_code_for(stop_reason: StopReason) -> int:
             StopReason.HEALTH_TIMEOUT
             | StopReason.REMOTE_PROCESS_EXITED
             | StopReason.TUNNEL_FAILED
+            | StopReason.ENGINE_EXITED
             | StopReason.ERROR
         ):
             return 1

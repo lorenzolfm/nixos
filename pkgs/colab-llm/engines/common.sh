@@ -166,6 +166,15 @@ bootstrap_begin() {
   BOOTSTRAP_HEARTBEAT_PID=$!
 }
 
+# Whether an install finished and is the pinned one. The marker is written only
+# after the install succeeds, so a venv left behind by a failed or interrupted
+# install is rebuilt instead of reused.
+install_marker_matches() {
+  local marker="$1"
+  local wanted="$2"
+  [[ -f "${marker}" ]] && [[ "$(cat "${marker}")" == "${wanted}" ]]
+}
+
 # Check out exactly the pinned commit, or fail.
 checkout_pinned_commit() {
   local repo_dir="$1"

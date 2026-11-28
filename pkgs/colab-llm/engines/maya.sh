@@ -104,8 +104,11 @@ if [[ -n "${MAYA_HF_REPO}" ]] && [[ "${FAST_HF}" == "1" || "${MAYA_CUSTOM_MODEL_
   fi
   mkdir -p "${target_dir}"
 
-  if [[ ! -x "${HF_VENV}/bin/python" ]]; then
+  hf_install_marker="${HF_VENV}/.colab-llm-installed"
+  hf_install_wanted="${HF_HUB_PINNED_VERSION}+${HF_TRANSFER_PINNED_VERSION}"
+  if ! install_marker_matches "${hf_install_marker}" "${hf_install_wanted}"; then
     log "Preparing fast Hugging Face downloader venv..."
+    rm -rf "${HF_VENV}"
     hf_packages=(
       "huggingface_hub[hf_xet]==${HF_HUB_PINNED_VERSION}"
       "hf_transfer==${HF_TRANSFER_PINNED_VERSION}"
@@ -117,6 +120,7 @@ if [[ -n "${MAYA_HF_REPO}" ]] && [[ "${FAST_HF}" == "1" || "${MAYA_CUSTOM_MODEL_
       python3 -m venv "${HF_VENV}"
       "${HF_VENV}/bin/pip" install -q --no-input "${hf_packages[@]}"
     fi
+    printf '%s\n' "${hf_install_wanted}" > "${hf_install_marker}"
   fi
 
   log "Prefetching ${MAYA_HF_REPO}${MAYA_HF_REVISION:+ @ ${MAYA_HF_REVISION}} into ${target_dir} via HF Xet..."

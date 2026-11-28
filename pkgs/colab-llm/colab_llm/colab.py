@@ -82,10 +82,16 @@ class Adopt:
 
 @dataclass(frozen=True)
 class Create:
-    """Allocate a new runtime."""
+    """Allocate a new runtime.
+
+    `endpoints_before` is every assignment that existed when the plan was made.
+    If the allocation is interrupted, an unnamed runtime that is not in it is
+    the one this run left behind.
+    """
 
     gpu: Gpu
     high_mem: bool
+    endpoints_before: frozenset[str]
 
 
 SessionPlan = Reuse | Adopt | Create
@@ -259,7 +265,10 @@ def build_ssh_mux_args(
     connect_timeout_s: int | None = None,
 ) -> list[str]:
     """Arguments that reuse the live ControlMaster socket (no new Colab SSH session)."""
-    options = ["LogLevel=ERROR"]
+    # With a dead socket, `ssh -S` falls back to a direct connection to the
+    # literal host name. A ProxyCommand that fails makes that fallback fail at
+    # once instead of looking the name up; a live socket never runs it.
+    options = ["LogLevel=ERROR", "ProxyCommand=false"]
     if batch_mode:
         options.insert(0, "BatchMode=yes")
     if connect_timeout_s is not None:
@@ -353,6 +362,8 @@ def render_ssh_config_block(
         colab_config=colab_config,
     )
     lines = [
+        "# `colab ssh --proxy-mode` allocates a new (CPU) runtime when the session",
+        "# does not exist. Connect only while `colab-llm status` lists it.",
         f"Host {session}",
         "    HostName colab-runtime",
         "    User root",
@@ -365,7 +376,7 @@ def render_ssh_config_block(
         "    ServerAliveCountMax 3",
     ]
     if identity is not None:
-        lines.insert(4, f"    IdentityFile {identity}")
+        lines.insert(lines.index("    User root") + 1, f"    IdentityFile {identity}")
     return "\n".join(lines) + "\n"
 
 
@@ -376,6 +387,13 @@ def _attach_target(
     if endpoint is not None:
         for item in listed:
             if item.endpoint == endpoint:
+                if item.name is not None:
+                    # Adopting it would put two names on one runtime, and the
+                    # teardown of this run would stop the other session's VM.
+                    raise ColabError(
+                        f"Endpoint {endpoint!r} is already tracked as session "
+                        f"{item.name!r}; --attach only adopts an unnamed runtime."
+                    )
                 if item.hardware != gpu.value:
                     raise ColabError(
                         f"Endpoint {endpoint!r} has hardware {item.hardware!r}, "
@@ -494,7 +512,11 @@ class ColabClient:
                 return Reuse(info=item)
         if attach is None:
             # `LaunchConfig` already refuses --high-mem on single-shape GPUs.
-            return Create(gpu=gpu, high_mem=high_mem)
+            return Create(
+                gpu=gpu,
+                high_mem=high_mem,
+                endpoints_before=frozenset(item.endpoint for item in listed),
+            )
         return Adopt(target=_attach_target(listed, gpu=gpu, endpoint=attach.endpoint))
 
     def realise_session(self, session: SessionName, plan: SessionPlan) -> ColabSessionInfo:
@@ -523,10 +545,12 @@ class ColabClient:
         refresh the live runtime proxy token/URL via official `list_assignments()`.
 
         Known weakness: sessions.json belongs to google-colab-cli, which has no
-        attach command and no lock. This read-modify-replace can lose an update
-        the CLI makes at the same moment, so do not run `colab` concurrently
-        with an attach. A file that is not the expected JSON object is left
-        untouched and reported.
+        attach command. The CLI guards the file with its own lock
+        (`sessions.json.lock`, via the `filelock` package), which this
+        dependency-free launcher does not take. This read-modify-replace can
+        therefore lose an update the CLI makes at the same moment, so do not
+        run `colab` concurrently with an attach. A file that is not the
+        expected JSON object is left untouched and reported.
         """
         sessions_path = self._sessions_file_path()
         sessions_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -631,18 +655,68 @@ class ColabClient:
                 f"(exit {stop.returncode})" + (f":\n{detail}" if detail else "")
             )
 
+    def require_session(self, session: SessionName) -> None:
+        """Refuse to go on unless `session` is listed on Colab.
+
+        `colab ssh --proxy-mode -s NAME` allocates a new (CPU) runtime when it
+        does not know NAME. Call this before opening a connection that is not
+        multiplexed over a live tunnel, so that asking for logs or a shell of a
+        session that has ended can never start a runtime nobody supervises.
+        """
+        if not any(item.name == session for item in self.list_sessions()):
+            raise ColabError(
+                f"Session {session!r} is not active on Colab; refusing to connect, "
+                "because `colab ssh` would allocate a new runtime under that name. "
+                "Start one with `colab-llm start`."
+            )
+
+    def stop_orphans_of_interrupted_create(self, *, session: SessionName, plan: Create) -> None:
+        """Stop a runtime that an interrupted `colab new` left without a name.
+
+        `colab new` records the session name only after the server has
+        assigned the runtime. Killed in between (Ctrl+C, a timeout), it leaves
+        a runtime that `colab stop -s <session>` cannot find and that
+        `teardown_session` does not see. Such a runtime is unnamed, has the
+        requested GPU, and did not exist when the plan was made. Each one is
+        adopted under `session` and stopped the usual, verified way.
+
+        Call only when the allocation did not complete, and after
+        `teardown_session`, so the name is free.
+        """
+        for orphan in self.list_sessions():
+            if (
+                orphan.name is None
+                and orphan.hardware == plan.gpu.value
+                and orphan.endpoint not in plan.endpoints_before
+            ):
+                self.adopt_session(session=session, target=orphan)
+                self.teardown_session(session)
+
     def stop_all(self) -> None:
-        self._run_colab(["stop", "--all"], capture=False, timeout=180)
+        """Stop every assignment of the account. One failure never spares the rest."""
+        errors: list[str] = []
+        stop = self._run_colab(["stop", "--all"], check=False, capture=False, timeout=180)
+        if stop.returncode != 0:
+            errors.append(f"`colab stop --all` failed (exit {stop.returncode})")
         # `colab stop --all` only stops locally tracked sessions; also clean up
-        # any remaining unnamed (`[?]`) server assignments (e.g. Web UI tabs).
+        # any remaining unnamed (`[?]`) server assignments (e.g. Web UI tabs),
+        # and whatever the command above failed to stop.
         for index, leftover in enumerate(self.list_sessions()):
-            if leftover.name is None:
-                cleanup_name = validate_session_name(f"colab-llm-cleanup-{index}")
-                self.adopt_session(session=cleanup_name, target=leftover)
-                self.teardown_session(cleanup_name)
-            else:
-                # Colab's own names are not ours: one we cannot use is an error.
-                self.teardown_session(validate_session_name(leftover.name))
+            try:
+                if leftover.name is None:
+                    cleanup_name = validate_session_name(f"colab-llm-cleanup-{index}")
+                    self.adopt_session(session=cleanup_name, target=leftover)
+                    self.teardown_session(cleanup_name)
+                else:
+                    # Colab's own names are not ours: one we cannot use is an error.
+                    self.teardown_session(validate_session_name(leftover.name))
+            except (ColabError, ValueError) as exc:
+                errors.append(f"{leftover.endpoint}: {exc}")
+        if errors:
+            raise ColabError(
+                "Some Colab sessions may still be running and billing:\n  "
+                + "\n  ".join(errors)
+            )
 
     def ssh_exec(
         self,

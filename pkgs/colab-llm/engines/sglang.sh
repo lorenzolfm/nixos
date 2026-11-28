@@ -13,7 +13,9 @@ SGLANG_PINNED_VERSION="${SGLANG_PINNED_VERSION:?}"
 
 bootstrap_begin
 
-if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+INSTALL_MARKER="${VENV_DIR}/.colab-llm-installed"
+if ! install_marker_matches "${INSTALL_MARKER}" "${SGLANG_PINNED_VERSION}"; then
+  rm -rf "${VENV_DIR}"
   log "Installing SGLang ${SGLANG_PINNED_VERSION} in ${VENV_DIR}..."
   packages=("sglang[all]==${SGLANG_PINNED_VERSION}" "huggingface_hub[hf_xet]" hf_transfer)
   if command -v uv >/dev/null 2>&1; then
@@ -23,6 +25,7 @@ if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
     python3 -m venv "${VENV_DIR}"
     "${VENV_DIR}/bin/pip" install -q --no-input "${packages[@]}"
   fi
+  printf '%s\n' "${SGLANG_PINNED_VERSION}" > "${INSTALL_MARKER}"
 fi
 
 serve_args=(
