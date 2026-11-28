@@ -9,22 +9,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cleanup::{
-    NixGcStats, TmpCleanupStats, TriggerDecision, UserPhaseConfig, apply_user_cleanup,
-    build_notification, build_summary_parts, clean_nix_tmp_dirs, decide_trigger, format_age,
-    format_bytes, parse_nix_gc_freed_line, parse_size_to_bytes, remove_stale_tmp_dirs,
-    run_user_phase_in_process,
+    NixGcStats, TmpCleanupStats, TriggerDecision, UserCleanupCutoffs, UserPhaseConfig,
+    append_error, apply_user_cleanup, build_notification, build_summary_parts, clean_nix_tmp_dirs,
+    decide_trigger, format_age, format_bytes, parse_nix_gc_freed_line, remove_stale_tmp_dirs,
+    run_user_phase_in_process, try_parse_size_to_bytes,
 };
 use crate::cli::{ParseOutcome, parse_args_with_user_resolver};
-use crate::constants::{AGE_DAYS_MAX, CACHEDIR_TAG_SIGNATURE_BYTES, TARGET_MTIME_DEPTH_MAX};
+use crate::constants::{
+    AGE_DAYS_MAX, CACHEDIR_TAG_SIGNATURE_BYTES, CLI_ARGS_MAX, ERROR_MESSAGE_BYTES_MAX, ERRORS_MAX,
+    NANOS_PER_SECOND, SUBPROCESS_OUTPUT_BYTES_MAX, TARGET_MTIME_DEPTH_MAX,
+};
 use crate::ipc::{
     UserPhaseStats, assert_user_phase_stats_valid, encode_user_phase_stats_json,
     parse_user_phase_stats_json,
 };
 use crate::process::{CommandOptions, run_command_streaming};
 use crate::scan::{
-    DiskUsage, NANOS_PER_SECOND, compute_disk_usage, current_time_ns, inspect_tmp_tree,
+    DiskUsage, ProjectScanConfig, compute_disk_usage, current_time_ns, inspect_tmp_tree,
     is_cargo_target_locked, latest_target_mtime_ns, non_negative_seconds_to_ns,
-    parse_nix_develop_pid, scan_projects,
+    parse_nix_develop_pid, scan_projects, scan_stale_nix_tmp_dirs,
 };
 use crate::sys::{
     self, AdvisoryLock, FilesystemStat, RmtreeError, safe_rmtree, safe_rmtree_with_batch_max,
@@ -254,7 +257,14 @@ fn rust_target_cleanup_order_recency_and_markers() {
     fs::create_dir_all(&real_outside).expect("mkdir real_outside");
     symlink(&real_outside, symlink_proj.join("target")).expect("symlink target");
 
-    let scan = scan_projects(&projects, fx.now_ns, 7.0, 24.0);
+    let scan = scan_projects(
+        &projects,
+        &ProjectScanConfig {
+            now_ns: fx.now_ns,
+            result_age_days: 7.0,
+            target_age_hours: 24.0,
+        },
+    );
     let candidate_paths: Vec<PathBuf> = scan
         .target_candidates
         .iter()
@@ -518,6 +528,7 @@ fn safe_rmtree_unsafe_path_error_is_recorded_without_aborting_phase() {
     remove_stale_tmp_dirs(
         &[(first_swapped.clone(), 4096), (second_real.clone(), 4096)],
         false,
+        fx.now_ns + NANOS_PER_SECOND,
         &mut stats,
     );
 
@@ -547,8 +558,9 @@ fn parse_args_rejects_nan_inf_bounds_and_system_roots() {
         vec!["--user", "tester", "--threshold", "101"],
         vec!["--user", "tester", "--projects-dir", "/"],
         vec!["--user", "tester", "--tmp-dir", "/"],
-        vec!["--user", "tester", "--_now-seconds", "0"],
-        vec!["--user", "tester", "--_now-seconds", "nan"],
+        vec!["--user", "tester", "--_now-ns", "0"],
+        vec!["--user", "tester", "--_now-ns", "-1"],
+        vec!["--user", "tester", "--_now-ns", "nan"],
     ];
 
     for argv in invalid_invocations {
@@ -559,14 +571,29 @@ fn parse_args_rejects_nan_inf_bounds_and_system_roots() {
         );
     }
 
-    // Explicit `--user` must not require current UID passwd lookup to succeed.
-    let parsed = parse_args_with_user_resolver(&os_args(&["--user=tester", "--force"]), || {
-        Err("missing uid".to_string())
-    });
+    // Excessive argument counts are rejected by CLI_ARGS_MAX.
+    let too_many_args: Vec<OsString> = vec![OsString::from("--force"); CLI_ARGS_MAX + 1];
+    assert!(matches!(
+        parse_args_with_user_resolver(&too_many_args, || Ok("unused".to_string())),
+        ParseOutcome::Error(_)
+    ));
+
+    // Explicit `--user` must not require current UID passwd lookup to succeed,
+    // and `--_now-ns` preserves exact nanosecond i128 precision.
+    let parsed = parse_args_with_user_resolver(
+        &os_args(&[
+            "--user=tester",
+            "--force",
+            "--_now-ns",
+            "1764322500123456789",
+        ]),
+        || Err("missing uid".to_string()),
+    );
     match parsed {
         ParseOutcome::Parsed(args) => {
             assert_eq!(args.user, "tester");
             assert!(args.force);
+            assert_eq!(args.now_ns, Some(1_764_322_500_123_456_789));
         }
         other => panic!("expected Parsed, got {other:?}"),
     }
@@ -607,10 +634,17 @@ fn fail_closed_on_flock_and_mtime_errors() {
         chmod(&locked_subdir, 0o000);
 
         assert_eq!(
-            latest_target_mtime_ns(&target, fx.now_ns, Some(fx.now_ns), TARGET_MTIME_DEPTH_MAX),
+            latest_target_mtime_ns(&target, Some(fx.now_ns), TARGET_MTIME_DEPTH_MAX),
             None
         );
-        let scan = scan_projects(&projects, fx.now_ns, 7.0, 0.0);
+        let scan = scan_projects(
+            &projects,
+            &ProjectScanConfig {
+                now_ns: fx.now_ns,
+                result_age_days: 7.0,
+                target_age_hours: 0.0,
+            },
+        );
         assert!(scan.target_candidates.is_empty());
         assert_eq!(scan.targets_skipped_recent_count, 1);
 
@@ -625,25 +659,39 @@ fn fail_closed_on_flock_and_mtime_errors() {
         chmod(&inner, 0o000);
 
         assert_eq!(
-            inspect_tmp_tree(&stale, fx.now_ns, fx.now_ns - 24 * 3600 * NANOS_PER_SECOND),
+            inspect_tmp_tree(&stale, fx.now_ns - 24 * 3600 * NANOS_PER_SECOND),
             None
         );
     }
 }
 
 #[test]
-fn pocpou_skips_target_modified_between_scan_and_delete() {
+fn pocpou_skips_target_result_symlink_and_tmp_dir_modified_between_scan_and_delete() {
     let fx = TestFixture::new("pocpou");
     let projects = fx.root.join("Projects");
     let target = fx.make_cargo_project("repo-race", 72.0, Some("CACHEDIR.TAG"), true);
+    let result_link = target.parent().expect("parent").join("result");
+    symlink("/nix/store/aaaa-old", &result_link).expect("symlink old result");
+    set_mtime_ns(&result_link, fx.now_ns - 10 * 86_400 * NANOS_PER_SECOND);
 
-    let scan = scan_projects(&projects, fx.now_ns, 7.0, 24.0);
+    let scan_config = ProjectScanConfig {
+        now_ns: fx.now_ns,
+        result_age_days: 7.0,
+        target_age_hours: 24.0,
+    };
+    let scan = scan_projects(&projects, &scan_config);
+    assert_eq!(scan.stale_results.len(), 1);
     assert_eq!(scan.target_candidates.len(), 1);
 
-    // Simulate a Cargo build running and finishing after `scan_projects` returned.
+    // 1. Simulate a fresh `nix build` replacing `result` between scan and unlink.
+    fs::remove_file(&result_link).expect("remove old result");
+    symlink("/nix/store/bbbb-new", &result_link).expect("symlink new result");
+    let recent_mtime_ns = fx.now_ns - 10 * NANOS_PER_SECOND;
+    set_mtime_ns(&result_link, recent_mtime_ns);
+
+    // 2. Simulate a Cargo build running and finishing after `scan_projects` returned.
     let fresh_artifact = target.join("debug").join("fresh-bin");
     fs::write(&fresh_artifact, "just built").expect("write fresh-bin");
-    let recent_mtime_ns = fx.now_ns - 10 * NANOS_PER_SECOND;
     set_mtime_ns(&fresh_artifact, recent_mtime_ns);
     set_mtime_ns(&target.join("debug"), recent_mtime_ns);
 
@@ -651,17 +699,43 @@ fn pocpou_skips_target_modified_between_scan_and_delete() {
         &scan,
         &[],
         14,
-        fx.now_ns,
-        fx.now_ns - 24 * 3600 * NANOS_PER_SECOND,
+        UserCleanupCutoffs {
+            now_ns: fx.now_ns,
+            result_mtime_max_ns: scan_config.result_mtime_max_ns(),
+            target_mtime_max_ns: scan_config.target_mtime_max_ns(),
+        },
         Instant::now() + Duration::from_secs(60),
     );
+    assert_eq!(stats.result_links_removed_count, 0);
     assert_eq!(stats.targets_removed_count, 0);
     assert_eq!(stats.targets_skipped_recent_count, 1);
+    assert!(fs::symlink_metadata(&result_link).is_ok());
     assert!(target.exists());
+
+    // 3. Simulate a `/tmp/nix-*` directory modified between scan and deletion.
+    let tmp_dir = fx.root.join("pocpou-tmp");
+    let stale_tmp = tmp_dir.join("nix-shell.race");
+    fs::create_dir_all(&stale_tmp).expect("mkdir stale_tmp");
+    let old_mtime_ns = fx.now_ns - 48 * 3600 * NANOS_PER_SECOND;
+    set_mtime_ns(&stale_tmp, old_mtime_ns);
+
+    let tmp_scan = scan_stale_nix_tmp_dirs(&tmp_dir, 24.0, fx.now_ns);
+    assert_eq!(tmp_scan.stale_dirs.len(), 1);
+
+    let fresh_tmp_file = stale_tmp.join("active.log");
+    fs::write(&fresh_tmp_file, "active").expect("write active.log");
+    set_mtime_ns(&fresh_tmp_file, recent_mtime_ns);
+
+    let mut tmp_stats = TmpCleanupStats::default();
+    let tmp_cutoff_ns = fx.now_ns - 24 * 3600 * NANOS_PER_SECOND;
+    remove_stale_tmp_dirs(&tmp_scan.stale_dirs, false, tmp_cutoff_ns, &mut tmp_stats);
+    assert_eq!(tmp_stats.dirs_removed_count, 0);
+    assert_eq!(tmp_stats.dirs_skipped_recent_count, 1);
+    assert!(stale_tmp.exists());
 }
 
 #[test]
-fn ipc_json_pair_validation() {
+fn ipc_json_pair_validation_and_worst_case_error_budget() {
     let valid = UserPhaseStats {
         result_links_removed_count: 2,
         targets_removed_count: 1,
@@ -675,6 +749,30 @@ fn ipc_json_pair_validation() {
     let encoded = encode_user_phase_stats_json(&valid);
     let parsed = parse_user_phase_stats_json(&encoded).expect("round-trip JSON");
     assert_eq!(parsed, valid);
+
+    // Worst-case error budget: ERRORS_MAX oversized UTF-8 + control-char error strings
+    // must truncate cleanly, fit within SUBPROCESS_OUTPUT_BYTES_MAX, and round-trip in O(N).
+    let mut worst_case = UserPhaseStats::default();
+    let noisy_message = format!("{}\u{0001}\"\\é", "é".repeat(ERROR_MESSAGE_BYTES_MAX));
+    for _ in 0..(ERRORS_MAX + 10) {
+        append_error(&mut worst_case.errors, noisy_message.clone());
+    }
+    assert_eq!(worst_case.errors.len(), ERRORS_MAX);
+    assert!(
+        worst_case
+            .errors
+            .iter()
+            .all(|msg| msg.len() <= ERROR_MESSAGE_BYTES_MAX)
+    );
+    let worst_encoded = encode_user_phase_stats_json(&worst_case);
+    assert!(worst_encoded.len() <= SUBPROCESS_OUTPUT_BYTES_MAX);
+    let worst_parsed =
+        parse_user_phase_stats_json(&worst_encoded).expect("round-trip worst-case JSON");
+    assert_eq!(worst_parsed, worst_case);
+
+    // Cross-privilege semantic mismatch must return Err (not panic root).
+    let inconsistent = "{\"result_links_removed_count\":0,\"targets_removed_count\":0,\"targets_freed_bytes\":1024,\"targets_skipped_active_count\":0,\"targets_skipped_recent_count\":0,\"user_profiles_pruned_count\":0,\"errors\":[]}";
+    assert!(parse_user_phase_stats_json(inconsistent).is_err());
 
     let invalid_payloads = [
         "[]",
@@ -694,9 +792,13 @@ fn ipc_json_pair_validation() {
 
 #[test]
 #[should_panic(expected = "targets_freed_bytes must be 0 when no targets were removed")]
-fn ipc_json_inconsistent_targets_trips_paired_assertion() {
-    let inconsistent = "{\"result_links_removed_count\":0,\"targets_removed_count\":0,\"targets_freed_bytes\":1024,\"targets_skipped_active_count\":0,\"targets_skipped_recent_count\":0,\"user_profiles_pruned_count\":0,\"errors\":[]}";
-    let _ = parse_user_phase_stats_json(inconsistent);
+fn ipc_json_inconsistent_targets_trips_write_assertion() {
+    let inconsistent = UserPhaseStats {
+        targets_removed_count: 0,
+        targets_freed_bytes: 1024,
+        ..UserPhaseStats::default()
+    };
+    let _ = encode_user_phase_stats_json(&inconsistent);
 }
 
 #[test]
@@ -708,13 +810,14 @@ fn streaming_subprocess_bounds_timeout_and_truncation() {
         timeout: Duration::from_millis(250),
         env_override: None,
         privilege_drop: None,
-        stdout_lines_max: 1000,
+        stream_lines_max: 1000,
         capture_stdout_bytes_max: 0,
         capture_stderr_bytes_max: 0,
         inherit_stderr: false,
     };
     let timed = run_command_streaming::<fn(&str), fn(&str)>(&timed_opts, None, None);
     assert!(timed.timed_out);
+    assert!(timed.error_message.is_none());
 
     // 2. Byte capture cap sets stdout_truncated without unbounded buffering.
     let capped_opts = CommandOptions {
@@ -723,13 +826,13 @@ fn streaming_subprocess_bounds_timeout_and_truncation() {
         timeout: Duration::from_secs(5),
         env_override: None,
         privilege_drop: None,
-        stdout_lines_max: 1000,
+        stream_lines_max: 1000,
         capture_stdout_bytes_max: 32,
         capture_stderr_bytes_max: 0,
         inherit_stderr: false,
     };
     let capped = run_command_streaming::<fn(&str), fn(&str)>(&capped_opts, None, None);
-    assert_eq!(capped.returncode, 0);
+    assert_eq!(capped.exit_code, 0);
     assert!(capped.stdout_truncated);
     assert_eq!(capped.stdout_text.len(), 32);
 
@@ -741,7 +844,7 @@ fn streaming_subprocess_bounds_timeout_and_truncation() {
         timeout: Duration::from_secs(5),
         env_override: None,
         privilege_drop: None,
-        stdout_lines_max: 1000,
+        stream_lines_max: 1000,
         capture_stdout_bytes_max: 0,
         capture_stderr_bytes_max: 0,
         inherit_stderr: false,
@@ -751,7 +854,7 @@ fn streaming_subprocess_bounds_timeout_and_truncation() {
         Some(|line: &str| seen_lines.push(line.to_string())),
         None::<fn(&str)>,
     );
-    assert_eq!(streamed.returncode, 0);
+    assert_eq!(streamed.exit_code, 0);
     assert_eq!(streamed.stdout_lines_count, 5);
     assert_eq!(
         seen_lines,
@@ -773,10 +876,26 @@ fn advisory_lock_contention_and_size_parsing_invariants() {
     let third = AdvisoryLock::try_acquire(&lock_file).expect("third acquire after drop");
     assert!(third.is_some());
 
-    assert_eq!(parse_size_to_bytes(2.0, "GiB"), 2 * 1024_u64.pow(3));
-    assert_eq!(parse_size_to_bytes(500.0, "B"), 500);
+    assert_eq!(
+        try_parse_size_to_bytes(2.0, "GiB"),
+        Some(2 * 1024_u64.pow(3))
+    );
+    assert_eq!(try_parse_size_to_bytes(500.0, "B"), Some(500));
+    assert_eq!(try_parse_size_to_bytes(10.0, "iB"), None);
+    assert_eq!(try_parse_size_to_bytes(f64::NAN, "MiB"), None);
+    assert_eq!(try_parse_size_to_bytes(-1.0, "MiB"), None);
+    assert_eq!(try_parse_size_to_bytes(1.0e305, "TiB"), None);
     assert_eq!(
         parse_nix_gc_freed_line("1 store paths deleted, 5.0 iB freed"),
+        None
+    );
+    // Overflowing floats from external stdout must return None (never panic or saturate).
+    assert_eq!(
+        parse_nix_gc_freed_line("1 store paths deleted, 999999999999999999999999999999 TiB freed"),
+        None
+    );
+    assert_eq!(
+        parse_nix_gc_freed_line("1 store paths deleted, 18446744073709551616 B freed"),
         None
     );
     assert_eq!(
@@ -787,18 +906,6 @@ fn advisory_lock_contention_and_size_parsing_invariants() {
         parse_nix_gc_freed_line("42 store paths deleted, 50.0 GiB freed"),
         Some((42, 50 * 1024_u64.pow(3)))
     );
-}
-
-#[test]
-#[should_panic(expected = "unrecognized size unit")]
-fn parse_size_rejects_bogus_unit() {
-    let _ = parse_size_to_bytes(10.0, "iB");
-}
-
-#[test]
-#[should_panic(expected = "size value must be finite")]
-fn parse_size_rejects_nan() {
-    let _ = parse_size_to_bytes(f64::NAN, "MiB");
 }
 
 #[test]

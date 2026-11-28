@@ -8,7 +8,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -16,8 +16,8 @@ use std::process::Command;
 use std::ptr;
 
 use crate::constants::{
-    FORBIDDEN_DELETE_PATHS, PASSWD_BUF_BYTES_INITIAL, PASSWD_BUF_BYTES_MAX, RMDIR_BATCH_MAX,
-    TREE_WALK_ENTRIES_MAX, USER_GROUPS_MAX, WALK_DEPTH_MAX,
+    FORBIDDEN_DELETE_PATHS, PASSWD_BUFFER_BYTES_INITIAL, PASSWD_BUFFER_BYTES_MAX,
+    PATH_COMPONENTS_MAX, RMDIR_BATCH_MAX, TREE_WALK_ENTRIES_MAX, USER_GROUPS_MAX, WALK_DEPTH_MAX,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,13 @@ pub struct PasswdEntry {
     pub uid: u32,
     pub gid: u32,
     pub home_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrivilegeDrop {
+    pub user_uid: u32,
+    pub group_gid: u32,
+    pub extra_groups: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,74 +289,45 @@ pub fn passwd_by_name(user_name: &str) -> io::Result<Option<PasswdEntry>> {
         )
     })?;
 
-    let mut buf_size = PASSWD_BUF_BYTES_INITIAL;
-    for _ in 0..8 {
-        assert!(buf_size <= PASSWD_BUF_BYTES_MAX);
-        let mut pwd = MaybeUninit::<libc::passwd>::uninit();
-        let mut storage = vec![0u8; buf_size];
-        let mut result_ptr: *mut libc::passwd = ptr::null_mut();
-
-        // SAFETY: `c_name`, `pwd`, `storage`, and `result_ptr` are valid pointers
-        // with matching lengths.
-        let rc = unsafe {
-            libc::getpwnam_r(
-                c_name.as_ptr(),
-                pwd.as_mut_ptr(),
-                storage.as_mut_ptr().cast::<libc::c_char>(),
-                storage.len(),
-                &mut result_ptr,
-            )
-        };
-
-        if rc == libc::ERANGE {
-            let next_size = buf_size.saturating_mul(2);
-            if next_size > PASSWD_BUF_BYTES_MAX {
-                return Err(io::Error::from_raw_os_error(libc::ERANGE));
-            }
-            buf_size = next_size;
-            continue;
-        }
-        if rc != 0 {
-            return Err(io::Error::from_raw_os_error(rc));
-        }
-        if result_ptr.is_null() {
-            return Ok(None);
-        }
-
-        // SAFETY: `result_ptr` is non-null and points to `pwd` populated by `getpwnam_r`.
-        let entry = unsafe { extract_passwd_entry(&*result_ptr)? };
-        return Ok(Some(entry));
-    }
-
-    Err(io::Error::from_raw_os_error(libc::ERANGE))
+    lookup_passwd_with_retry(|pwd_ptr, buf_ptr, buf_len, result_ptr| {
+        // SAFETY: `c_name` and all output pointers are valid with matching `buf_len`.
+        unsafe { libc::getpwnam_r(c_name.as_ptr(), pwd_ptr, buf_ptr, buf_len, result_ptr) }
+    })
 }
 
 /// Look up a user account by UID via reentrant `getpwuid_r`.
 pub fn passwd_by_uid(uid: u32) -> io::Result<Option<PasswdEntry>> {
-    let mut buf_size = PASSWD_BUF_BYTES_INITIAL;
+    lookup_passwd_with_retry(|pwd_ptr, buf_ptr, buf_len, result_ptr| {
+        // SAFETY: All output pointers are valid with matching `buf_len`.
+        unsafe { libc::getpwuid_r(uid, pwd_ptr, buf_ptr, buf_len, result_ptr) }
+    })
+}
+
+fn lookup_passwd_with_retry<F>(mut call: F) -> io::Result<Option<PasswdEntry>>
+where
+    F: FnMut(*mut libc::passwd, *mut libc::c_char, usize, *mut *mut libc::passwd) -> libc::c_int,
+{
+    let mut buffer_size_bytes = PASSWD_BUFFER_BYTES_INITIAL;
     for _ in 0..8 {
-        assert!(buf_size <= PASSWD_BUF_BYTES_MAX);
+        assert!(buffer_size_bytes > 0);
+        assert!(buffer_size_bytes <= PASSWD_BUFFER_BYTES_MAX);
         let mut pwd = MaybeUninit::<libc::passwd>::uninit();
-        let mut storage = vec![0u8; buf_size];
+        let mut storage = vec![0u8; buffer_size_bytes];
         let mut result_ptr: *mut libc::passwd = ptr::null_mut();
 
-        // SAFETY: `pwd`, `storage`, and `result_ptr` are valid pointers with matching lengths.
-        let rc = unsafe {
-            libc::getpwuid_r(
-                uid,
-                pwd.as_mut_ptr(),
-                storage.as_mut_ptr().cast::<libc::c_char>(),
-                storage.len(),
-                &mut result_ptr,
-            )
-        };
+        let rc = call(
+            pwd.as_mut_ptr(),
+            storage.as_mut_ptr().cast::<libc::c_char>(),
+            storage.len(),
+            &mut result_ptr,
+        );
 
         if rc == libc::ERANGE {
-            let next_size = buf_size.saturating_mul(2);
-            if next_size > PASSWD_BUF_BYTES_MAX {
+            let next_size = buffer_size_bytes.saturating_mul(2);
+            if next_size > PASSWD_BUFFER_BYTES_MAX {
                 return Err(io::Error::from_raw_os_error(libc::ERANGE));
             }
-            buf_size = next_size;
+            buffer_size_bytes = next_size;
             continue;
         }
         if rc != 0 {
@@ -359,7 +337,7 @@ pub fn passwd_by_uid(uid: u32) -> io::Result<Option<PasswdEntry>> {
             return Ok(None);
         }
 
-        // SAFETY: `result_ptr` is non-null and points to `pwd` populated by `getpwuid_r`.
+        // SAFETY: `result_ptr` is non-null and points to `pwd` populated by the lookup call.
         let entry = unsafe { extract_passwd_entry(&*result_ptr)? };
         return Ok(Some(entry));
     }
@@ -377,10 +355,26 @@ unsafe fn extract_passwd_entry(pwd: &libc::passwd) -> io::Result<PasswdEntry> {
     // SAFETY: Checked non-null; `getpwnam_r`/`getpwuid_r` populate NUL-terminated C strings.
     let name_bytes = unsafe { CStr::from_ptr(pwd.pw_name) }.to_bytes();
     let dir_bytes = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+    if name_bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "passwd entry has empty username",
+        ));
+    }
+    if dir_bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "passwd entry has empty home directory",
+        ));
+    }
     let name = String::from_utf8(name_bytes.to_vec())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "passwd username is not UTF-8"))?;
     let home_dir = PathBuf::from(OsString::from_vec(dir_bytes.to_vec()));
     assert!(!name.is_empty(), "passwd name must be non-empty");
+    assert!(
+        !home_dir.as_os_str().is_empty(),
+        "passwd home_dir must be non-empty"
+    );
     Ok(PasswdEntry {
         name,
         uid: pwd.pw_uid,
@@ -404,21 +398,12 @@ pub fn user_groups(user_name: &str, primary_gid: u32) -> io::Result<Vec<u32>> {
     #[cfg(not(target_os = "macos"))]
     type GroupElem = libc::gid_t;
 
-    let base_gid: GroupElem = {
-        #[cfg(target_os = "macos")]
-        {
-            libc::c_int::try_from(primary_gid).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "primary_gid exceeds c_int::MAX",
-                )
-            })?
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            primary_gid
-        }
-    };
+    // On macOS, `getgrouplist` uses `c_int` (`i32`) to carry unsigned 32-bit `gid_t` values
+    // (such as `nogroup` = 4294967294 = -2i32), so preserve the bit pattern via `cast_signed`/`cast_unsigned`.
+    #[cfg(target_os = "macos")]
+    let base_gid: GroupElem = primary_gid.cast_signed();
+    #[cfg(not(target_os = "macos"))]
+    let base_gid: GroupElem = primary_gid;
 
     let mut capacity: usize = 64;
     for _ in 0..2 {
@@ -444,16 +429,11 @@ pub fn user_groups(user_name: &str, primary_gid: u32) -> io::Result<Vec<u32>> {
             let mut result = Vec::with_capacity(actual_len);
             for raw_gid in raw_groups.into_iter().take(actual_len) {
                 #[cfg(target_os = "macos")]
-                {
-                    if let Ok(gid_u32) = u32::try_from(raw_gid) {
-                        result.push(gid_u32);
-                    }
-                }
+                result.push(raw_gid.cast_unsigned());
                 #[cfg(not(target_os = "macos"))]
-                {
-                    result.push(raw_gid);
-                }
+                result.push(raw_gid);
             }
+            assert!(result.len() <= USER_GROUPS_MAX);
             return Ok(result);
         }
 
@@ -468,14 +448,11 @@ pub fn user_groups(user_name: &str, primary_gid: u32) -> io::Result<Vec<u32>> {
 
 /// Configure a `Command` to drop privileges (`setgroups` -> `setgid` -> `setuid`)
 /// atomically in `pre_exec` before `execve`.
-pub fn configure_privilege_drop(
-    cmd: &mut Command,
-    user_uid: u32,
-    group_gid: u32,
-    extra_groups: &[u32],
-) {
-    assert!(extra_groups.len() <= USER_GROUPS_MAX);
-    let groups: Vec<libc::gid_t> = extra_groups.to_vec();
+pub fn configure_privilege_drop(cmd: &mut Command, privilege_drop: &PrivilegeDrop) {
+    assert!(privilege_drop.extra_groups.len() <= USER_GROUPS_MAX);
+    let user_uid = privilege_drop.user_uid;
+    let group_gid = privilege_drop.group_gid;
+    let groups: Vec<libc::gid_t> = privilege_drop.extra_groups.clone();
 
     // SAFETY: The closure calls only async-signal-safe POSIX functions
     // (`setgroups`, `setgid`, `setuid`) and performs no heap allocations.
@@ -524,7 +501,19 @@ pub fn statvfs_path(path: &Path) -> io::Result<FilesystemStat> {
 
     // `fsblkcnt_t` is `u32` on macOS and `u64` on Linux; `u64::from` handles both without `as`.
     #[allow(clippy::useless_conversion)]
-    let fragment_size_bytes = u64::from(vfs.f_frsize);
+    let raw_frsize = u64::from(vfs.f_frsize);
+    #[allow(clippy::useless_conversion)]
+    let raw_bsize = u64::from(vfs.f_bsize);
+    let fragment_size_bytes = if raw_frsize > 0 {
+        raw_frsize
+    } else if raw_bsize > 0 {
+        raw_bsize
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "statvfs returned zero block and fragment size",
+        ));
+    };
     #[allow(clippy::useless_conversion)]
     let blocks_total = u64::from(vfs.f_blocks);
     #[allow(clippy::useless_conversion)]
@@ -532,6 +521,7 @@ pub fn statvfs_path(path: &Path) -> io::Result<FilesystemStat> {
     #[allow(clippy::useless_conversion)]
     let blocks_available = u64::from(vfs.f_bavail);
 
+    assert!(fragment_size_bytes > 0);
     Ok(FilesystemStat {
         device_id,
         fragment_size_bytes,
@@ -613,6 +603,7 @@ pub fn read_fd_nonblocking(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     let Ok(bytes_read) = usize::try_from(rc) else {
         panic!("non-negative read return fits usize");
     };
+    assert!(bytes_read <= buf.len(), "read exceeded buffer length");
     Ok(bytes_read)
 }
 
@@ -624,10 +615,14 @@ pub fn format_local_timestamp() -> String {
     // SAFETY: `now` and `tm` are valid pointers; `localtime_r` is thread-safe.
     let ptr = unsafe { libc::localtime_r(&now, tm.as_mut_ptr()) };
     if ptr.is_null() {
-        return format!("{now}");
+        let fallback = format!("{now}");
+        assert!(!fallback.is_empty());
+        return fallback;
     }
     // SAFETY: `localtime_r` returned non-null, initializing `tm`.
     let tm = unsafe { tm.assume_init() };
+    assert!((0..=11).contains(&tm.tm_mon), "tm_mon out of range");
+    assert!((1..=31).contains(&tm.tm_mday), "tm_mday out of range");
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         tm.tm_year + 1900,
@@ -658,7 +653,15 @@ pub fn absolutize_path(path: &Path) -> io::Result<PathBuf> {
     };
 
     let mut normalized = PathBuf::new();
+    let mut components_count: usize = 0;
     for component in joined.components() {
+        components_count = components_count.saturating_add(1);
+        if components_count > PATH_COMPONENTS_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path exceeds maximum {PATH_COMPONENTS_MAX} components"),
+            ));
+        }
         match component {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             Component::RootDir => normalized.push(Component::RootDir.as_os_str()),
@@ -871,34 +874,28 @@ fn read_dir_batch(
 
     // Duplicate the directory descriptor so `closedir` never closes `dir_fd`.
     // SAFETY: `dir_fd` is a valid open directory descriptor.
-    let dup_fd = unsafe { libc::fcntl(dir_fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if dup_fd < 0 {
+    let dup_raw_fd = unsafe { libc::fcntl(dir_fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_raw_fd < 0 {
         return Err(RmtreeError::Io(io::Error::last_os_error()));
     }
+    // SAFETY: `dup_raw_fd` is a freshly duplicated owned file descriptor.
+    let owned_dup = unsafe { OwnedFd::from_raw_fd(dup_raw_fd) };
+    let transferred_fd = owned_dup.into_raw_fd();
 
-    // Rewind the shared open file description before scanning again.
-    // SAFETY: `dup_fd` is a valid directory fd; seeking to offset 0 rewinds directory stream.
-    let seek_rc = unsafe { libc::lseek(dup_fd, 0, libc::SEEK_SET) };
-    if seek_rc < 0 {
-        let err = io::Error::last_os_error();
-        // SAFETY: `dup_fd` is owned and not yet transferred to `fdopendir`.
-        unsafe {
-            libc::close(dup_fd);
-        }
-        return Err(RmtreeError::Io(err));
-    }
-
-    // SAFETY: `dup_fd` transfers ownership into `fdopendir` on success.
-    let raw_dir = unsafe { libc::fdopendir(dup_fd) };
+    // SAFETY: `transferred_fd` transfers ownership into `fdopendir` on success.
+    let raw_dir = unsafe { libc::fdopendir(transferred_fd) };
     if raw_dir.is_null() {
         let err = io::Error::last_os_error();
-        // SAFETY: `fdopendir` failed, so we still own `dup_fd`.
-        unsafe {
-            libc::close(dup_fd);
-        }
+        // SAFETY: `fdopendir` failed, so we still own `transferred_fd`; drop via RAII.
+        let _reclaimed = unsafe { OwnedFd::from_raw_fd(transferred_fd) };
         return Err(RmtreeError::Io(err));
     }
     let dir_stream = DirStream { ptr: raw_dir };
+    // Rewind the shared directory stream using POSIX-standard `rewinddir`.
+    // SAFETY: `dir_stream.ptr` is a valid open `DIR*`.
+    unsafe {
+        libc::rewinddir(dir_stream.ptr);
+    }
 
     let mut batch_files = Vec::new();
     let mut batch_subdirs = Vec::new();
@@ -959,6 +956,7 @@ fn open_dir_path(path: &Path) -> io::Result<OwnedFd> {
     if raw_fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    assert!(raw_fd >= 0);
     // SAFETY: `raw_fd` is a freshly opened owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
@@ -969,6 +967,11 @@ fn open_subdir_nofollow(
     display_path: &Path,
 ) -> Result<OwnedFd, RmtreeError> {
     assert!(parent_fd >= 0);
+    assert!(!name.to_bytes().is_empty(), "entry name must be non-empty");
+    assert!(
+        !name.to_bytes().contains(&b'/'),
+        "entry name must be a single path component"
+    );
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `parent_fd` is valid and `name` is NUL-terminated.
     let raw_fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
@@ -986,6 +989,7 @@ fn open_subdir_nofollow(
         }
         return Err(RmtreeError::Io(err));
     }
+    assert!(raw_fd >= 0);
     // SAFETY: `raw_fd` is a freshly opened owned descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
@@ -1023,6 +1027,11 @@ fn fstat_fd(fd: RawFd) -> io::Result<libc::stat> {
 
 fn fstatat_nofollow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
     assert!(dir_fd >= 0);
+    assert!(!name.to_bytes().is_empty(), "entry name must be non-empty");
+    assert!(
+        !name.to_bytes().contains(&b'/'),
+        "entry name must be a single path component"
+    );
     let mut stat_buf = MaybeUninit::<libc::stat>::zeroed();
     // SAFETY: `dir_fd` is open, `name` is NUL-terminated, and `stat_buf` is valid.
     let rc = unsafe {
@@ -1042,6 +1051,11 @@ fn fstatat_nofollow(dir_fd: RawFd, name: &CStr) -> io::Result<libc::stat> {
 
 fn unlinkat_entry(dir_fd: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<()> {
     assert!(dir_fd >= 0);
+    assert!(!name.to_bytes().is_empty(), "entry name must be non-empty");
+    assert!(
+        !name.to_bytes().contains(&b'/'),
+        "entry name must be a single path component"
+    );
     // SAFETY: `dir_fd` is open and `name` is NUL-terminated.
     let rc = unsafe { libc::unlinkat(dir_fd, name.as_ptr(), flags) };
     if rc != 0 {
@@ -1056,6 +1070,11 @@ fn unlinkat_entry(dir_fd: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<
 
 fn rmdirat_entry(dir_fd: RawFd, name: &CStr) -> io::Result<()> {
     assert!(dir_fd >= 0);
+    assert!(!name.to_bytes().is_empty(), "entry name must be non-empty");
+    assert!(
+        !name.to_bytes().contains(&b'/'),
+        "entry name must be a single path component"
+    );
     // SAFETY: `dir_fd` is open and `name` is NUL-terminated.
     let rc = unsafe { libc::unlinkat(dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) };
     if rc != 0 {
@@ -1065,16 +1084,20 @@ fn rmdirat_entry(dir_fd: RawFd, name: &CStr) -> io::Result<()> {
 }
 
 fn path_to_cstring(path: &Path) -> io::Result<CString> {
+    assert!(!path.as_os_str().is_empty(), "path must be non-empty");
     os_str_to_cstring(path.as_os_str())
 }
 
 fn os_str_to_cstring(value: &OsStr) -> io::Result<CString> {
-    CString::new(value.as_bytes()).map_err(|_| {
+    assert!(!value.is_empty(), "CString input must be non-empty");
+    let cstr = CString::new(value.as_bytes()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "path contains interior NUL byte",
         )
-    })
+    })?;
+    assert_eq!(cstr.as_bytes().len(), value.len());
+    Ok(cstr)
 }
 
 #[cfg(target_os = "macos")]

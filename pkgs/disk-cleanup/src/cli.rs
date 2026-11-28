@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::constants::{AGE_DAYS_MAX, AGE_HOURS_MAX};
+use crate::constants::{AGE_DAYS_MAX, AGE_HOURS_MAX, CLI_ARGS_MAX, NOW_NS_MAX};
 use crate::sys;
 
 pub const USAGE: &str = "\
@@ -43,7 +43,7 @@ pub struct CliArgs {
     pub no_notify: bool,
     pub verbose: bool,
     pub user_phase: bool,
-    pub now_seconds: Option<f64>,
+    pub now_ns: Option<i128>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -71,6 +71,10 @@ pub fn parse_args_with_user_resolver<F>(args: &[OsString], resolve_current_user:
 where
     F: FnOnce() -> Result<String, String>,
 {
+    if args.len() > CLI_ARGS_MAX {
+        return ParseOutcome::Error(format!("too many arguments (max {CLI_ARGS_MAX})"));
+    }
+
     let mut threshold: i64 = 85;
     let mut user: Option<String> = None;
     let mut projects_dir: Option<PathBuf> = None;
@@ -85,10 +89,10 @@ where
     let mut no_notify = false;
     let mut verbose = false;
     let mut user_phase = false;
-    let mut now_seconds: Option<f64> = None;
+    let mut now_ns: Option<i128> = None;
 
     let mut index: usize = 0;
-    // Bounded loop: at most `args.len()` iterations, index strictly increases each step.
+    // Bounded loop: at most `CLI_ARGS_MAX` iterations, index strictly increases each step.
     for _ in 0..args.len() {
         if index >= args.len() {
             break;
@@ -226,12 +230,12 @@ where
                 }
                 lock_file = Some(PathBuf::from(raw));
             }
-            "--_now-seconds" => {
-                let raw = match take_value("--_now-seconds", inline_value, args, &mut index) {
+            "--_now-ns" => {
+                let raw = match take_value("--_now-ns", inline_value, args, &mut index) {
                     Ok(val) => val,
                     Err(msg) => return ParseOutcome::Error(msg),
                 };
-                now_seconds = Some(match parse_f64_arg("--_now-seconds", &raw) {
+                now_ns = Some(match parse_i128_arg("--_now-ns", &raw) {
                     Ok(val) => val,
                     Err(msg) => return ParseOutcome::Error(msg),
                 });
@@ -253,47 +257,36 @@ where
         return ParseOutcome::Error("--user must be non-empty".to_string());
     }
 
-    if !(1..=100).contains(&threshold) {
+    let threshold_u8 = if (1..=100).contains(&threshold) {
+        u8::try_from(threshold).expect("validated threshold in 1..=100 fits u8")
+    } else {
         return ParseOutcome::Error("--threshold must be between 1 and 100".to_string());
-    }
-    let threshold_u8 = u8::try_from(threshold).expect("validated threshold in 1..=100 fits u8");
+    };
 
-    if !(result_age_days.is_finite()
-        && result_age_days >= 0.0
-        && result_age_days <= f64::from(AGE_DAYS_MAX))
-    {
-        return ParseOutcome::Error(format!(
-            "--result-age-days must be a finite number in [0, {AGE_DAYS_MAX}]"
-        ));
+    if let Err(msg) = validate_f64_range("--result-age-days", result_age_days, AGE_DAYS_MAX) {
+        return ParseOutcome::Error(msg);
     }
-    if !(target_age_hours.is_finite()
-        && target_age_hours >= 0.0
-        && target_age_hours <= f64::from(AGE_HOURS_MAX))
-    {
-        return ParseOutcome::Error(format!(
-            "--target-age-hours must be a finite number in [0, {AGE_HOURS_MAX}]"
-        ));
+    if let Err(msg) = validate_f64_range("--target-age-hours", target_age_hours, AGE_HOURS_MAX) {
+        return ParseOutcome::Error(msg);
     }
-    if nix_gc_age_days < 0 || nix_gc_age_days > i64::from(AGE_DAYS_MAX) {
+    let nix_gc_age_days_u32 = if (0..=i64::from(AGE_DAYS_MAX)).contains(&nix_gc_age_days) {
+        u32::try_from(nix_gc_age_days).expect("validated nix_gc_age_days fits u32")
+    } else {
         return ParseOutcome::Error(format!(
             "--nix-gc-age-days must be an integer in [0, {AGE_DAYS_MAX}]"
         ));
+    };
+    if let Err(msg) = validate_f64_range("--tmp-age-hours", tmp_age_hours, AGE_HOURS_MAX) {
+        return ParseOutcome::Error(msg);
     }
-    let nix_gc_age_days_u32 =
-        u32::try_from(nix_gc_age_days).expect("validated nix_gc_age_days fits u32");
 
-    if !(tmp_age_hours.is_finite()
-        && tmp_age_hours >= 0.0
-        && tmp_age_hours <= f64::from(AGE_HOURS_MAX))
-    {
-        return ParseOutcome::Error(format!(
-            "--tmp-age-hours must be a finite number in [0, {AGE_HOURS_MAX}]"
-        ));
-    }
-    if let Some(now_val) = now_seconds
-        && !(now_val.is_finite() && now_val > 0.0 && now_val <= 1.0e13)
-    {
-        return ParseOutcome::Error("--_now-seconds must be a finite positive number".to_string());
+    if let Some(now_val) = now_ns {
+        let valid_now = (1..=NOW_NS_MAX).contains(&now_val);
+        if !valid_now {
+            return ParseOutcome::Error(format!(
+                "--_now-ns must be an integer in [1, {NOW_NS_MAX}]"
+            ));
+        }
     }
 
     if let Some(ref proj_dir) = projects_dir {
@@ -319,8 +312,19 @@ where
         return ParseOutcome::Error("--tmp-dir cannot be /".to_string());
     }
 
-    assert!((1..=100).contains(&threshold_u8));
+    assert!(threshold_u8 >= 1);
+    assert!(threshold_u8 <= 100);
+    assert!(result_age_days.is_finite());
+    assert!(result_age_days >= 0.0);
     assert!(target_age_hours.is_finite());
+    assert!(target_age_hours >= 0.0);
+    assert!(nix_gc_age_days_u32 <= AGE_DAYS_MAX);
+    assert!(tmp_age_hours.is_finite());
+    assert!(tmp_age_hours >= 0.0);
+    if let Some(ns) = now_ns {
+        assert!(ns > 0);
+        assert!(ns <= NOW_NS_MAX);
+    }
     assert!(!resolved_user.is_empty());
 
     ParseOutcome::Parsed(CliArgs {
@@ -338,8 +342,19 @@ where
         no_notify,
         verbose,
         user_phase,
-        now_seconds,
+        now_ns,
     })
+}
+
+fn validate_f64_range(flag: &str, value: f64, max: u32) -> Result<(), String> {
+    assert!(!flag.is_empty(), "flag name must be non-empty");
+    assert!(max > 0, "max bound must be positive");
+    let in_range = value.is_finite() && (0.0..=f64::from(max)).contains(&value);
+    if in_range {
+        Ok(())
+    } else {
+        Err(format!("{flag} must be a finite number in [0, {max}]"))
+    }
 }
 
 fn split_flag_and_value(raw_arg: &OsString) -> (String, Option<OsString>) {
@@ -362,6 +377,8 @@ fn take_value(
     args: &[OsString],
     index: &mut usize,
 ) -> Result<OsString, String> {
+    assert!(!flag.is_empty(), "flag name must be non-empty");
+    assert!(*index <= args.len(), "argument index out of bounds");
     if let Some(val) = inline_value {
         return Ok(val);
     }
@@ -369,10 +386,12 @@ fn take_value(
         return Err(format!("option {flag} requires a value"));
     };
     *index += 1;
+    assert!(*index <= args.len());
     Ok(next.clone())
 }
 
 fn parse_i64_arg(flag: &str, raw: &OsString) -> Result<i64, String> {
+    assert!(!flag.is_empty(), "flag name must be non-empty");
     let text = raw
         .to_str()
         .ok_or_else(|| format!("invalid integer for {flag}"))?;
@@ -380,7 +399,17 @@ fn parse_i64_arg(flag: &str, raw: &OsString) -> Result<i64, String> {
         .map_err(|_| format!("invalid integer for {flag}: {text:?}"))
 }
 
+fn parse_i128_arg(flag: &str, raw: &OsString) -> Result<i128, String> {
+    assert!(!flag.is_empty(), "flag name must be non-empty");
+    let text = raw
+        .to_str()
+        .ok_or_else(|| format!("invalid integer for {flag}"))?;
+    text.parse::<i128>()
+        .map_err(|_| format!("invalid integer for {flag}: {text:?}"))
+}
+
 fn parse_f64_arg(flag: &str, raw: &OsString) -> Result<f64, String> {
+    assert!(!flag.is_empty(), "flag name must be non-empty");
     let text = raw
         .to_str()
         .ok_or_else(|| format!("invalid number for {flag}"))?;

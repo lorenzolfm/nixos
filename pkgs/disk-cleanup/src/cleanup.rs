@@ -8,19 +8,24 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::constants::{
-    AGE_DAYS_MAX, AGE_HOURS_MAX, DEAD_PATHS_COUNT_MAX, ERRORS_MAX, NIX_ENV_LOG_LINES_MAX,
-    NIX_ENV_TIMEOUT_SECONDS, NOTIFY_FREED_BYTES_MIN, NOTIFY_TIMEOUT_SECONDS,
-    SUBPROCESS_OUTPUT_BYTES_MAX, SUBPROCESS_STDERR_BYTES_MAX, TARGET_MTIME_DEPTH_MAX,
-    USER_PHASE_TIMEOUT_SECONDS,
+    AGE_DAYS_MAX, AGE_HOURS_MAX, CANDIDATES_MAX, DEAD_PATHS_COUNT_MAX, ENV_VARS_MAX,
+    ERROR_MESSAGE_BYTES_MAX, ERRORS_MAX, NANOS_PER_SECOND_U128, NIX_ENV_LOG_LINES_MAX,
+    NIX_ENV_TIMEOUT_SECONDS, NOTIFY_FREED_BYTES_MIN, NOTIFY_TIMEOUT_SECONDS, SECONDS_PER_DAY,
+    SECONDS_PER_HOUR, SUBPROCESS_LINE_BYTES_MAX, SUBPROCESS_OUTPUT_BYTES_MAX,
+    SUBPROCESS_STDERR_BYTES_MAX, TARGET_MTIME_DEPTH_MAX, USER_PHASE_TIMEOUT_SECONDS,
+    USER_PROFILES_MAX,
 };
 use crate::ipc::{self, UserPhaseStats};
 use crate::process::{self, CommandOptions, PrivilegeDrop};
 use crate::scan::{
-    self, DiskUsage, NANOS_PER_SECOND, ProjectScanResult, is_cargo_target_dir,
-    is_cargo_target_locked, latest_target_mtime_ns, non_negative_seconds_to_ns, scan_projects,
-    scan_stale_nix_tmp_dirs, user_nix_profiles,
+    self, DiskUsage, ProjectScanConfig, ProjectScanResult, inspect_tmp_tree, is_cargo_target_dir,
+    is_cargo_target_locked, latest_target_mtime_ns, non_negative_seconds_to_ns,
+    parse_nix_develop_pid, scan_projects, scan_stale_nix_tmp_dirs, user_nix_profiles,
 };
 use crate::sys::{self, PasswdEntry};
+
+/// `2^64` in `f64` (exact); any non-negative `f64` strictly below this fits in `u64`.
+const U64_UPPER_BOUND_F64: f64 = 18_446_744_073_709_551_616.0;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct NixGcStats {
@@ -52,6 +57,13 @@ pub struct UserPhaseConfig<'a> {
     pub deadline: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserCleanupCutoffs {
+    pub now_ns: i128,
+    pub result_mtime_max_ns: i128,
+    pub target_mtime_max_ns: i128,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriggerDecision {
     SkipBelowThreshold,
@@ -64,13 +76,36 @@ pub struct NotificationMessage {
     pub body: String,
 }
 
-/// Append an error string to a bounded list without exceeding `ERRORS_MAX`.
+/// Append a byte-bounded error string without exceeding `ERRORS_MAX` or `ERROR_MESSAGE_BYTES_MAX`.
 pub fn append_error(errors: &mut Vec<String>, message: String) {
     assert!(!message.is_empty(), "error message must be non-empty");
     if errors.len() < ERRORS_MAX {
-        errors.push(message);
+        let bounded = truncate_utf8_bytes(message, ERROR_MESSAGE_BYTES_MAX);
+        assert!(!bounded.is_empty());
+        assert!(bounded.len() <= ERROR_MESSAGE_BYTES_MAX);
+        errors.push(bounded);
     }
     assert!(errors.len() <= ERRORS_MAX);
+}
+
+fn truncate_utf8_bytes(mut text: String, max_bytes: usize) -> String {
+    assert!(max_bytes >= 3, "max_bytes must fit ellipsis");
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut boundary = max_bytes - 3;
+    // A UTF-8 scalar value is at most 4 bytes, so at most 3 decrements reach a boundary.
+    for _ in 0..4 {
+        if text.is_char_boundary(boundary) {
+            break;
+        }
+        boundary = boundary.saturating_sub(1);
+    }
+    assert!(text.is_char_boundary(boundary));
+    text.truncate(boundary);
+    text.push_str("...");
+    assert!(text.len() <= max_bytes);
+    text
 }
 
 /// Compute remaining wall-clock budget clamped to `cap`, or `None` if exhausted.
@@ -85,6 +120,7 @@ pub fn remaining_budget(deadline: Instant, cap: Duration) -> Option<Duration> {
     if clamped.is_zero() {
         None
     } else {
+        assert!(clamped <= cap);
         Some(clamped)
     }
 }
@@ -162,8 +198,13 @@ pub fn build_notification(
 }
 
 /// Run Phase 1 directly or in a privilege-dropped subprocess when invoked as root.
-pub fn run_user_phase(passwd: &PasswdEntry, config: &UserPhaseConfig<'_>) -> UserPhaseStats {
+pub fn run_user_phase(
+    passwd: &PasswdEntry,
+    user_home: &Path,
+    config: &UserPhaseConfig<'_>,
+) -> UserPhaseStats {
     assert!(!passwd.name.is_empty(), "passwd.name must be non-empty");
+    assert!(user_home.is_absolute(), "user_home must be absolute");
     assert!(
         config.projects_dir.is_absolute(),
         "projects_dir must be absolute"
@@ -172,9 +213,7 @@ pub fn run_user_phase(passwd: &PasswdEntry, config: &UserPhaseConfig<'_>) -> Use
 
     let should_drop_privileges = sys::effective_uid() == 0 && passwd.uid != 0;
     if !should_drop_privileges {
-        let user_home =
-            sys::absolutize_path(&passwd.home_dir).unwrap_or_else(|_| passwd.home_dir.clone());
-        return run_user_phase_in_process(&passwd.name, &user_home, config);
+        return run_user_phase_in_process(&passwd.name, user_home, config);
     }
 
     let Some(timeout) = remaining_budget(
@@ -202,12 +241,6 @@ pub fn run_user_phase(passwd: &PasswdEntry, config: &UserPhaseConfig<'_>) -> Use
     };
     assert!(current_exe.is_absolute(), "current_exe must be absolute");
 
-    let whole_secs = config.now_ns / NANOS_PER_SECOND;
-    let rem_nanos = config.now_ns % NANOS_PER_SECOND;
-    assert!(whole_secs >= 0);
-    assert!(rem_nanos >= 0);
-    let now_seconds_arg = format!("{whole_secs}.{rem_nanos:09}");
-
     let mut args: Vec<OsString> = vec![
         OsString::from("--_user-phase"),
         OsString::from("--user"),
@@ -220,8 +253,8 @@ pub fn run_user_phase(passwd: &PasswdEntry, config: &UserPhaseConfig<'_>) -> Use
         OsString::from(format!("{}", config.target_age_hours)),
         OsString::from("--nix-gc-age-days"),
         OsString::from(format!("{}", config.nix_gc_age_days)),
-        OsString::from("--_now-seconds"),
-        OsString::from(now_seconds_arg),
+        OsString::from("--_now-ns"),
+        OsString::from(format!("{}", config.now_ns)),
     ];
     if config.dry_run {
         args.push(OsString::from("--dry-run"));
@@ -232,10 +265,7 @@ pub fn run_user_phase(passwd: &PasswdEntry, config: &UserPhaseConfig<'_>) -> Use
             OsString::from("PATH"),
             env::var_os("PATH").unwrap_or_default(),
         ),
-        (
-            OsString::from("HOME"),
-            passwd.home_dir.as_os_str().to_os_string(),
-        ),
+        (OsString::from("HOME"), user_home.as_os_str().to_os_string()),
         (OsString::from("USER"), OsString::from(&passwd.name)),
         (OsString::from("LOGNAME"), OsString::from(&passwd.name)),
     ];
@@ -273,35 +303,16 @@ pub fn run_user_phase(passwd: &PasswdEntry, config: &UserPhaseConfig<'_>) -> Use
             group_gid: passwd.gid,
             extra_groups,
         }),
-        stdout_lines_max: DEAD_PATHS_COUNT_MAX,
+        stream_lines_max: DEAD_PATHS_COUNT_MAX,
         capture_stdout_bytes_max: SUBPROCESS_OUTPUT_BYTES_MAX,
         capture_stderr_bytes_max: 0,
         inherit_stderr: true,
     };
 
     let result = process::run_command_streaming::<fn(&str), fn(&str)>(&options, None, None);
-    if let Some(err_msg) = result.error_message {
+    if let Some(detail) = result.failure_detail(timeout) {
         let mut stats = UserPhaseStats::default();
-        append_error(
-            &mut stats.errors,
-            format!("user phase failed to execute: {err_msg}"),
-        );
-        return stats;
-    }
-    if result.timed_out {
-        let mut stats = UserPhaseStats::default();
-        append_error(
-            &mut stats.errors,
-            format!("user phase timed out after {}s", timeout.as_secs()),
-        );
-        return stats;
-    }
-    if result.returncode != 0 {
-        let mut stats = UserPhaseStats::default();
-        append_error(
-            &mut stats.errors,
-            format!("user phase exited with code {}", result.returncode),
-        );
+        append_error(&mut stats.errors, format!("user phase failed: {detail}"));
         return stats;
     }
     if result.stdout_truncated {
@@ -343,25 +354,27 @@ pub fn run_user_phase_in_process(
     );
     assert!(config.now_ns > 0, "now_ns must be positive");
 
-    let scan = scan_projects(
-        config.projects_dir,
-        config.now_ns,
-        config.result_age_days,
-        config.target_age_hours,
-    );
+    let scan_config = ProjectScanConfig {
+        now_ns: config.now_ns,
+        result_age_days: config.result_age_days,
+        target_age_hours: config.target_age_hours,
+    };
+    let scan = scan_projects(config.projects_dir, &scan_config);
     let profiles = user_nix_profiles(user_name, user_home);
 
     let stats = if config.dry_run {
         log_user_dry_run(&scan, &profiles, config.nix_gc_age_days, config.now_ns)
     } else {
-        let target_mtime_max_ns =
-            config.now_ns - non_negative_seconds_to_ns(config.target_age_hours * 3600.0);
+        let cutoffs = UserCleanupCutoffs {
+            now_ns: config.now_ns,
+            result_mtime_max_ns: scan_config.result_mtime_max_ns(),
+            target_mtime_max_ns: scan_config.target_mtime_max_ns(),
+        };
         apply_user_cleanup(
             &scan,
             &profiles,
             config.nix_gc_age_days,
-            config.now_ns,
-            target_mtime_max_ns,
+            cutoffs,
             config.deadline,
         )
     };
@@ -382,13 +395,18 @@ pub fn log_user_dry_run(
         nix_gc_age_days <= AGE_DAYS_MAX,
         "nix_gc_age_days out of bounds"
     );
+    assert!(scan.stale_results.len() <= CANDIDATES_MAX);
+    assert!(scan.target_candidates.len() <= CANDIDATES_MAX);
+    assert!(profiles.len() <= USER_PROFILES_MAX);
 
     let mut stats = UserPhaseStats {
         targets_skipped_active_count: scan.targets_skipped_active_count,
         targets_skipped_recent_count: scan.targets_skipped_recent_count,
-        errors: scan.errors.iter().take(ERRORS_MAX).cloned().collect(),
         ..UserPhaseStats::default()
     };
+    for error_text in &scan.errors {
+        append_error(&mut stats.errors, error_text.clone());
+    }
 
     for (link_path, mtime_ns) in &scan.stale_results {
         let age = format_age(age_ns_since(now_ns, *mtime_ns));
@@ -435,26 +453,30 @@ pub fn apply_user_cleanup(
     scan: &ProjectScanResult,
     profiles: &[PathBuf],
     nix_gc_age_days: u32,
-    now_ns: i128,
-    target_mtime_max_ns: i128,
+    cutoffs: UserCleanupCutoffs,
     deadline: Instant,
 ) -> UserPhaseStats {
-    assert!(now_ns > 0, "now_ns must be positive");
+    assert!(cutoffs.now_ns > 0, "now_ns must be positive");
     assert!(
         nix_gc_age_days <= AGE_DAYS_MAX,
         "nix_gc_age_days out of bounds"
     );
+    assert!(scan.stale_results.len() <= CANDIDATES_MAX);
+    assert!(scan.target_candidates.len() <= CANDIDATES_MAX);
+    assert!(profiles.len() <= USER_PROFILES_MAX);
 
     let mut stats = UserPhaseStats {
         targets_skipped_active_count: scan.targets_skipped_active_count,
         targets_skipped_recent_count: scan.targets_skipped_recent_count,
-        errors: scan.errors.iter().take(ERRORS_MAX).cloned().collect(),
         ..UserPhaseStats::default()
     };
+    for error_text in &scan.errors {
+        append_error(&mut stats.errors, error_text.clone());
+    }
 
     for (link_path, mtime_ns) in &scan.stale_results {
-        let age = format_age(age_ns_since(now_ns, *mtime_ns));
-        // Re-verify symlink target immediately before unlink (closes POCPOU gap).
+        let age = format_age(age_ns_since(cutoffs.now_ns, *mtime_ns));
+        // Re-verify symlink type, target prefix, and mtime immediately before unlink (closes POCPOU gap).
         let link_meta = match fs::symlink_metadata(link_path) {
             Ok(meta) => meta,
             Err(err) => {
@@ -466,6 +488,14 @@ pub fn apply_user_cleanup(
             }
         };
         if !link_meta.file_type().is_symlink() {
+            continue;
+        }
+        let refreshed_mtime_ns = scan::metadata_mtime_ns(&link_meta);
+        if refreshed_mtime_ns > cutoffs.result_mtime_max_ns {
+            log(&format!(
+                "skipped Nix result symlink (replaced during scan): {}",
+                link_path.display()
+            ));
             continue;
         }
         let link_target = match fs::read_link(link_path) {
@@ -521,12 +551,11 @@ pub fn apply_user_cleanup(
         }
         let refreshed_mtime_ns = latest_target_mtime_ns(
             &candidate.path,
-            now_ns,
-            Some(target_mtime_max_ns),
+            Some(cutoffs.target_mtime_max_ns),
             TARGET_MTIME_DEPTH_MAX,
         );
         let is_still_stale =
-            refreshed_mtime_ns.is_some_and(|mtime_ns| mtime_ns <= target_mtime_max_ns);
+            refreshed_mtime_ns.is_some_and(|mtime_ns| mtime_ns <= cutoffs.target_mtime_max_ns);
         if !is_still_stale {
             stats.targets_skipped_recent_count += 1;
             log(&format!(
@@ -536,7 +565,7 @@ pub fn apply_user_cleanup(
             continue;
         }
 
-        let age = format_age(age_ns_since(now_ns, candidate.mtime_latest_ns));
+        let age = format_age(age_ns_since(cutoffs.now_ns, candidate.mtime_latest_ns));
         let size_text = format_bytes(candidate.size_bytes);
         match sys::safe_rmtree(&candidate.path) {
             Ok(()) => {
@@ -593,7 +622,7 @@ pub fn apply_user_cleanup(
                 timeout,
                 env_override: None,
                 privilege_drop: None,
-                stdout_lines_max: DEAD_PATHS_COUNT_MAX,
+                stream_lines_max: DEAD_PATHS_COUNT_MAX,
                 capture_stdout_bytes_max: 0,
                 capture_stderr_bytes_max: SUBPROCESS_STDERR_BYTES_MAX,
                 inherit_stderr: false,
@@ -611,33 +640,13 @@ pub fn apply_user_cleanup(
                 None::<fn(&str)>,
             );
 
-            if let Some(err_msg) = result.error_message {
-                append_error(
-                    &mut stats.errors,
-                    format!("nix-env {}: {err_msg}", profile.display()),
-                );
-            } else if result.timed_out {
-                append_error(
-                    &mut stats.errors,
-                    format!(
-                        "nix-env {}: timed out after {}s",
-                        profile.display(),
-                        timeout.as_secs()
-                    ),
-                );
-            } else if result.returncode == 0 {
-                stats.user_profiles_pruned_count += 1;
-            } else {
-                let trimmed = result.stderr_tail.trim();
-                let detail = if trimmed.is_empty() {
-                    format!("exit {}", result.returncode)
-                } else {
-                    trimmed.to_string()
-                };
+            if let Some(detail) = result.failure_detail(timeout) {
                 append_error(
                     &mut stats.errors,
                     format!("nix-env {}: {detail}", profile.display()),
                 );
+            } else {
+                stats.user_profiles_pruned_count += 1;
             }
         }
     }
@@ -656,17 +665,21 @@ pub fn clean_nix_tmp_dirs(
     assert!(tmp_dir.is_absolute(), "tmp_dir must be absolute");
     assert!(now_ns > 0, "now_ns must be positive");
     assert!(tmp_age_hours.is_finite());
+    assert!(tmp_age_hours >= 0.0);
     assert!(tmp_age_hours <= f64::from(AGE_HOURS_MAX));
 
+    let cutoff_ns = now_ns - non_negative_seconds_to_ns(tmp_age_hours * SECONDS_PER_HOUR);
     let scan = scan_stale_nix_tmp_dirs(tmp_dir, tmp_age_hours, now_ns);
     let mut stats = TmpCleanupStats {
         dirs_skipped_active_count: scan.dirs_skipped_active_count,
         dirs_skipped_recent_count: scan.dirs_skipped_recent_count,
-        errors: scan.errors.into_iter().take(ERRORS_MAX).collect(),
         ..TmpCleanupStats::default()
     };
+    for error_text in scan.errors {
+        append_error(&mut stats.errors, error_text);
+    }
 
-    remove_stale_tmp_dirs(&scan.stale_dirs, dry_run, &mut stats);
+    remove_stale_tmp_dirs(&scan.stale_dirs, dry_run, cutoff_ns, &mut stats);
 
     if stats.dirs_removed_count > 0 {
         let verb = if dry_run {
@@ -682,6 +695,7 @@ pub fn clean_nix_tmp_dirs(
         ));
     }
 
+    assert!(stats.errors.len() <= ERRORS_MAX);
     stats
 }
 
@@ -689,8 +703,10 @@ pub fn clean_nix_tmp_dirs(
 pub fn remove_stale_tmp_dirs(
     stale_dirs: &[(PathBuf, u64)],
     dry_run: bool,
+    cutoff_ns: i128,
     stats: &mut TmpCleanupStats,
 ) {
+    assert!(stale_dirs.len() <= CANDIDATES_MAX);
     assert!(stats.errors.len() <= ERRORS_MAX);
     if dry_run {
         for &(_, size_bytes) in stale_dirs {
@@ -701,6 +717,26 @@ pub fn remove_stale_tmp_dirs(
     }
 
     for (entry_path, size_bytes) in stale_dirs {
+        // Re-verify PID liveness and recency for real directories right before deletion
+        // (closes POCPOU gap); symlink swaps still hit `safe_rmtree` so they are logged as errors.
+        if let Ok(meta) = fs::symlink_metadata(entry_path)
+            && meta.file_type().is_dir()
+        {
+            if entry_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(parse_nix_develop_pid)
+                .is_some_and(sys::is_pid_alive)
+            {
+                stats.dirs_skipped_active_count += 1;
+                continue;
+            }
+            if inspect_tmp_tree(entry_path, cutoff_ns).is_none() {
+                stats.dirs_skipped_recent_count += 1;
+                continue;
+            }
+        }
+
         match sys::safe_rmtree(entry_path) {
             Ok(()) => {
                 stats.dirs_removed_count += 1;
@@ -714,6 +750,7 @@ pub fn remove_stale_tmp_dirs(
             }
         }
     }
+    assert!(stats.errors.len() <= ERRORS_MAX);
 }
 
 /// Prune old Nix generations and collect unreferenced `/nix/store` paths.
@@ -745,7 +782,7 @@ pub fn run_nix_gc(nix_gc_age_days: u32, dry_run: bool, timeout: Option<Duration>
             timeout,
             env_override: None,
             privilege_drop: None,
-            stdout_lines_max: DEAD_PATHS_COUNT_MAX,
+            stream_lines_max: DEAD_PATHS_COUNT_MAX,
             capture_stdout_bytes_max: 0,
             capture_stderr_bytes_max: SUBPROCESS_STDERR_BYTES_MAX,
             inherit_stderr: false,
@@ -760,38 +797,21 @@ pub fn run_nix_gc(nix_gc_age_days: u32, dry_run: bool, timeout: Option<Duration>
             None::<fn(&str)>,
         );
 
-        if let Some(err_msg) = result.error_message {
+        if let Some(detail) = result.failure_detail(timeout) {
             append_error(
                 &mut stats.errors,
-                format!("nix-store --gc --print-dead: {err_msg}"),
+                format!("nix-store --gc --print-dead: {detail}"),
             );
-        } else if result.timed_out {
-            append_error(
-                &mut stats.errors,
-                format!(
-                    "nix-store --gc --print-dead: timed out after {}s",
-                    timeout.as_secs()
-                ),
-            );
-        } else if result.returncode == 0 {
+        } else {
             stats.dead_paths_count = dead_paths_count;
             log(&format!(
                 "[dry-run] would run nix-collect-garbage --delete-older-than {nix_gc_age_days}d \
                  ({dead_paths_count} currently dead store paths; additional paths will become \
                  dead after pruning result* links and generations)"
             ));
-        } else {
-            let trimmed = result.stderr_tail.trim();
-            let detail = if trimmed.is_empty() {
-                format!("exit {}", result.returncode)
-            } else {
-                trimmed.to_string()
-            };
-            append_error(
-                &mut stats.errors,
-                format!("nix-store --gc --print-dead: {detail}"),
-            );
         }
+        assert!(stats.dead_paths_count <= DEAD_PATHS_COUNT_MAX);
+        assert!(stats.errors.len() <= ERRORS_MAX);
         return stats;
     }
 
@@ -809,7 +829,6 @@ pub fn run_nix_gc(nix_gc_age_days: u32, dry_run: bool, timeout: Option<Duration>
         log("running non-root: system profile generations will not be pruned");
     }
 
-    let mut matched_summary: Option<(u64, u64)> = None;
     let options = CommandOptions {
         program: nix_gc.into_os_string(),
         args: vec![
@@ -819,7 +838,7 @@ pub fn run_nix_gc(nix_gc_age_days: u32, dry_run: bool, timeout: Option<Duration>
         timeout,
         env_override: None,
         privilege_drop: None,
-        stdout_lines_max: DEAD_PATHS_COUNT_MAX,
+        stream_lines_max: DEAD_PATHS_COUNT_MAX,
         capture_stdout_bytes_max: 0,
         capture_stderr_bytes_max: SUBPROCESS_STDERR_BYTES_MAX,
         inherit_stderr: false,
@@ -842,12 +861,8 @@ pub fn run_nix_gc(nix_gc_age_days: u32, dry_run: bool, timeout: Option<Duration>
             }
         }),
     );
-    if stdout_match.is_some() {
-        matched_summary = stdout_match;
-    }
-    if stderr_match.is_some() {
-        matched_summary = stderr_match;
-    }
+    let matched_summary = stderr_match.or(stdout_match);
+    let failure_detail = result.failure_detail(timeout);
 
     stats.ran = true;
 
@@ -859,30 +874,15 @@ pub fn run_nix_gc(nix_gc_age_days: u32, dry_run: bool, timeout: Option<Duration>
             stats.paths_deleted_count,
             format_bytes(stats.freed_bytes)
         ));
-    } else if result.returncode == 0 && !result.timed_out && result.error_message.is_none() {
+    } else if failure_detail.is_none() {
         log("warning: nix-collect-garbage succeeded without a recognized freed-bytes summary line");
     }
 
-    if let Some(err_msg) = result.error_message {
-        append_error(&mut stats.errors, format!("nix-collect-garbage: {err_msg}"));
-    } else if result.timed_out {
-        append_error(
-            &mut stats.errors,
-            format!(
-                "nix-collect-garbage: timed out after {}s",
-                timeout.as_secs()
-            ),
-        );
-    } else if result.returncode != 0 {
-        let trimmed = result.stderr_tail.trim();
-        let detail = if trimmed.is_empty() {
-            format!("exit {}", result.returncode)
-        } else {
-            trimmed.to_string()
-        };
+    if let Some(detail) = failure_detail {
         append_error(&mut stats.errors, format!("nix-collect-garbage: {detail}"));
     }
 
+    assert!(stats.errors.len() <= ERRORS_MAX);
     stats
 }
 
@@ -896,22 +896,8 @@ pub fn send_notification(passwd: &PasswdEntry, title: &str, body: &str) {
     };
 
     let result = process::run_command_streaming::<fn(&str), fn(&str)>(&options, None, None);
-    if let Some(err_msg) = result.error_message {
-        log(&format!("warning: desktop notification failed: {err_msg}"));
-    } else if result.timed_out {
-        log(&format!(
-            "warning: desktop notification timed out after {NOTIFY_TIMEOUT_SECONDS}s"
-        ));
-    } else if result.returncode != 0 {
-        let trimmed = result.stderr_tail.trim();
-        let detail = if trimmed.is_empty() {
-            format!("exit {}", result.returncode)
-        } else {
-            trimmed.to_string()
-        };
-        log(&format!(
-            "warning: desktop notification exited non-zero: {detail}"
-        ));
+    if let Some(detail) = result.failure_detail(Duration::from_secs(NOTIFY_TIMEOUT_SECONDS)) {
+        log(&format!("warning: desktop notification failed: {detail}"));
     }
 }
 
@@ -921,6 +907,10 @@ fn build_notification_command(
     title: &str,
     body: &str,
 ) -> Option<CommandOptions> {
+    assert!(!passwd.name.is_empty(), "passwd.name must be non-empty");
+    assert!(!title.is_empty(), "notification title must be non-empty");
+    assert!(!body.is_empty(), "notification body must be non-empty");
+
     let notify_send = process::find_executable_in_path("notify-send")?;
     let bus_path = PathBuf::from(format!("/run/user/{}/bus", passwd.uid));
     let should_drop_privileges = sys::effective_uid() == 0 && passwd.uid != 0;
@@ -955,7 +945,7 @@ fn build_notification_command(
         };
         (Some(env_pairs), Some(drop_cfg))
     } else {
-        let mut env_pairs: Vec<(OsString, OsString)> = env::vars_os().collect();
+        let mut env_pairs: Vec<(OsString, OsString)> = env::vars_os().take(ENV_VARS_MAX).collect();
         let has_dbus = env_pairs
             .iter()
             .any(|(key, _)| key == "DBUS_SESSION_BUS_ADDRESS");
@@ -981,7 +971,7 @@ fn build_notification_command(
         timeout: Duration::from_secs(NOTIFY_TIMEOUT_SECONDS),
         env_override,
         privilege_drop,
-        stdout_lines_max: 64,
+        stream_lines_max: 64,
         capture_stdout_bytes_max: 0,
         capture_stderr_bytes_max: 4096,
         inherit_stderr: false,
@@ -994,6 +984,10 @@ fn build_notification_command(
     title: &str,
     body: &str,
 ) -> Option<CommandOptions> {
+    assert!(!passwd.name.is_empty(), "passwd.name must be non-empty");
+    assert!(!title.is_empty(), "notification title must be non-empty");
+    assert!(!body.is_empty(), "notification body must be non-empty");
+
     let base_command: Vec<OsString> = if let Some(notifier) =
         process::find_executable_in_path("terminal-notifier")
     {
@@ -1043,7 +1037,7 @@ fn build_notification_command(
         timeout: Duration::from_secs(NOTIFY_TIMEOUT_SECONDS),
         env_override: None,
         privilege_drop: None,
-        stdout_lines_max: 64,
+        stream_lines_max: 64,
         capture_stdout_bytes_max: 0,
         capture_stderr_bytes_max: 4096,
         inherit_stderr: false,
@@ -1107,120 +1101,123 @@ pub fn format_bytes(size_bytes: u64) -> String {
             return format!("{value:.1} {unit}");
         }
     }
-    format!("{size_bytes} B")
+    unreachable!("UNITS is non-empty and the final iteration always returns")
 }
 
 pub fn format_age(age_ns: u128) -> String {
-    let age_seconds_whole = age_ns / 1_000_000_000;
+    let age_seconds_whole = age_ns.div_euclid(NANOS_PER_SECOND_U128);
     if age_seconds_whole < 3600 {
-        let minutes = age_seconds_whole / 60;
+        let minutes = age_seconds_whole.div_euclid(60);
         return format!("{minutes}m");
     }
     #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
-    let age_seconds = (age_ns as f64) / 1_000_000_000.0;
-    if age_seconds < 86_400.0 {
-        return format!("{:.1}h", age_seconds / 3600.0);
+    let age_seconds = (age_ns as f64) / (NANOS_PER_SECOND_U128 as f64);
+    if age_seconds < SECONDS_PER_DAY {
+        return format!("{:.1}h", age_seconds / SECONDS_PER_HOUR);
     }
-    format!("{:.1}d", age_seconds / 86_400.0)
+    format!("{:.1}d", age_seconds / SECONDS_PER_DAY)
 }
 
-/// Convert a Nix GC size value + unit string (`B`, `KB`, `KiB`, ..., `TiB`) to bytes.
-pub fn parse_size_to_bytes(value: f64, unit: &str) -> u64 {
-    assert!(value.is_finite(), "size value must be finite: {value}");
-    assert!(value >= 0.0, "size value must be non-negative: {value}");
-
-    let multiplier =
-        size_unit_multiplier(unit).unwrap_or_else(|| panic!("unrecognized size unit: {unit:?}"));
+/// Fallible conversion of a Nix GC size value + unit string (`B`..`TiB`) to bytes.
+///
+/// Rejects non-finite values, negative values, unknown units, and products that
+/// overflow `u64` instead of panicking or saturating.
+pub fn try_parse_size_to_bytes(value: f64, unit: &str) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let multiplier = size_unit_multiplier(unit)?;
     #[allow(clippy::as_conversions, clippy::cast_precision_loss)]
     let product = value * (multiplier as f64);
-    assert!(product.is_finite(), "computed byte size must be finite");
-    assert!(product >= 0.0, "computed byte size must be non-negative");
-
+    if !product.is_finite() || product < 0.0 || product >= U64_UPPER_BOUND_F64 {
+        return None;
+    }
     #[allow(
         clippy::as_conversions,
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
     let bytes = product as u64;
-    bytes
+    Some(bytes)
 }
 
 /// Parse a `nix-collect-garbage` summary line such as:
 /// `"42 store paths deleted, 12.50 MiB freed"` -> `Some((42, 13_107_200))`.
+///
+/// Uses a zero-allocation 7-token stack sliding window on the per-line hot path.
 pub fn parse_nix_gc_freed_line(line: &str) -> Option<(u64, u64)> {
-    // Tokenize on ASCII whitespace and search for the sequence:
-    //   <u64> "store" "paths" "deleted," <decimal> <unit> "freed"
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    if tokens.len() < 7 {
-        return None;
-    }
+    assert!(
+        line.len() <= SUBPROCESS_LINE_BYTES_MAX,
+        "line exceeded SUBPROCESS_LINE_BYTES_MAX"
+    );
 
-    for window in tokens.windows(7) {
-        let Some(&count_tok) = window.first() else {
-            continue;
-        };
-        let Some(&store_tok) = window.get(1) else {
-            continue;
-        };
-        let Some(&paths_tok) = window.get(2) else {
-            continue;
-        };
-        let Some(&deleted_tok) = window.get(3) else {
-            continue;
-        };
-        let Some(&amount_tok) = window.get(4) else {
-            continue;
-        };
-        let Some(&unit_tok) = window.get(5) else {
-            continue;
-        };
-        let Some(&freed_tok) = window.get(6) else {
-            continue;
-        };
+    let mut window: [&str; 7] = [""; 7];
+    let mut filled: usize = 0;
 
-        if !store_tok.eq_ignore_ascii_case("store")
-            || !paths_tok.eq_ignore_ascii_case("paths")
-            || !deleted_tok.eq_ignore_ascii_case("deleted,")
+    for token in line.split_whitespace() {
+        if filled < 7 {
+            if let Some(slot) = window.get_mut(filled) {
+                *slot = token;
+            }
+            filled += 1;
+        } else {
+            let [_, w1, w2, w3, w4, w5, w6] = window;
+            window = [w1, w2, w3, w4, w5, w6, token];
+        }
+
+        if filled == 7
+            && let Some(parsed) = parse_gc_summary_window(window)
         {
-            continue;
+            return Some(parsed);
         }
-        // Allow trailing punctuation like `freed.` or `freed` cleanly.
-        let freed_prefix_ok = freed_tok.len() >= 5
-            && freed_tok
-                .get(..5)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("freed"))
-            && freed_tok.get(5..).is_some_and(|tail| {
-                tail.is_empty() || !tail.chars().next().is_some_and(char::is_alphanumeric)
-            });
-        if !freed_prefix_ok {
-            continue;
-        }
-
-        if count_tok.is_empty() || !count_tok.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(paths_deleted) = count_tok.parse::<u64>() else {
-            continue;
-        };
-
-        if amount_tok.is_empty() || !amount_tok.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-            continue;
-        }
-        let Ok(amount) = amount_tok.parse::<f64>() else {
-            continue;
-        };
-        if !amount.is_finite() || amount < 0.0 {
-            continue;
-        }
-
-        if size_unit_multiplier(unit_tok).is_none() {
-            continue;
-        }
-        let freed_bytes = parse_size_to_bytes(amount, unit_tok);
-        return Some((paths_deleted, freed_bytes));
     }
 
     None
+}
+
+fn parse_gc_summary_window(window: [&str; 7]) -> Option<(u64, u64)> {
+    let [
+        count_tok,
+        store_tok,
+        paths_tok,
+        deleted_tok,
+        amount_tok,
+        unit_tok,
+        freed_tok,
+    ] = window;
+
+    let keywords_match = store_tok.eq_ignore_ascii_case("store")
+        && paths_tok.eq_ignore_ascii_case("paths")
+        && deleted_tok.eq_ignore_ascii_case("deleted,");
+    if !keywords_match {
+        return None;
+    }
+
+    // Allow trailing punctuation like `freed.` or `freed` cleanly.
+    let freed_matches = freed_tok
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("freed"))
+        && freed_tok.get(5..).is_some_and(|tail| {
+            tail.is_empty() || tail.chars().next().is_some_and(|c| !c.is_alphanumeric())
+        });
+    if !freed_matches {
+        return None;
+    }
+
+    let valid_count = !count_tok.is_empty() && count_tok.bytes().all(|b| b.is_ascii_digit());
+    if !valid_count {
+        return None;
+    }
+    let paths_deleted = count_tok.parse::<u64>().ok()?;
+
+    let valid_amount =
+        !amount_tok.is_empty() && amount_tok.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+    if !valid_amount {
+        return None;
+    }
+    let amount = amount_tok.parse::<f64>().ok()?;
+    let freed_bytes = try_parse_size_to_bytes(amount, unit_tok)?;
+    Some((paths_deleted, freed_bytes))
 }
 
 fn size_unit_multiplier(unit: &str) -> Option<u64> {
@@ -1248,6 +1245,7 @@ fn size_unit_multiplier(unit: &str) -> Option<u64> {
 }
 
 fn age_ns_since(now_ns: i128, mtime_ns: i128) -> u128 {
+    assert!(now_ns > 0, "now_ns must be positive");
     let diff = now_ns.saturating_sub(mtime_ns);
     if diff <= 0 {
         0

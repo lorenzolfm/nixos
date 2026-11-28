@@ -33,9 +33,7 @@ use crate::cleanup::{
 };
 use crate::cli::{CliArgs, ParseOutcome};
 use crate::constants::{NIX_GC_TIMEOUT_SECONDS, TOTAL_RUN_TIMEOUT_SECONDS};
-use crate::scan::{
-    default_lock_path, non_negative_seconds_to_ns, stat_filesystem, worst_disk_usage,
-};
+use crate::scan::{default_lock_path, stat_filesystem, worst_disk_usage};
 use crate::sys::{AdvisoryLock, PasswdEntry};
 
 fn main() -> ExitCode {
@@ -97,14 +95,12 @@ fn run(args_os: &[OsString]) -> i32 {
         }
     };
 
-    let now_ns = match args.now_seconds {
-        Some(val) => non_negative_seconds_to_ns(val),
-        None => cleanup::default_now_ns(),
-    };
+    let now_ns = args.now_ns.unwrap_or_else(cleanup::default_now_ns);
     let deadline = Instant::now() + Duration::from_secs(TOTAL_RUN_TIMEOUT_SECONDS);
 
     assert!(user_home.is_absolute(), "user_home must be absolute");
     assert!(projects_dir.is_absolute(), "projects_dir must be absolute");
+    assert!(tmp_dir.is_absolute(), "tmp_dir must be absolute");
     assert!(now_ns > 0, "now_ns must be positive");
 
     if args.user_phase {
@@ -262,7 +258,7 @@ fn run_cleanup_orchestrator(
         now_ns,
         deadline,
     };
-    let user_stats = run_user_phase(passwd, &user_phase_config);
+    let user_stats = run_user_phase(passwd, user_home, &user_phase_config);
 
     // Phase 2a (Linux only): clean stale /tmp/nix-* shell/build dirs before GC.
     let tmp_stats = if cfg!(target_os = "linux") {

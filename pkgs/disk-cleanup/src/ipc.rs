@@ -1,11 +1,11 @@
 //! Paired JSON IPC encoding, decoding, and invariant validation for `--_user-phase`.
 //!
 //! Zero external dependencies and zero recursion: the schema is a flat object with
-//! six non-negative integers and a bounded array of error strings.
+//! six non-negative integers and a bounded array of bounded-length error strings.
 
 use std::fmt::Write as _;
 
-use crate::constants::{ERRORS_MAX, SUBPROCESS_OUTPUT_BYTES_MAX};
+use crate::constants::{ERROR_MESSAGE_BYTES_MAX, ERRORS_MAX, SUBPROCESS_OUTPUT_BYTES_MAX};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UserPhaseStats {
@@ -18,7 +18,23 @@ pub struct UserPhaseStats {
     pub errors: Vec<String>,
 }
 
-/// Verify `UserPhaseStats` invariants (paired across JSON IPC write/read).
+/// Validate `UserPhaseStats` invariants across untrusted/cross-privilege boundaries.
+pub fn validate_user_phase_stats(stats: &UserPhaseStats) -> Result<(), String> {
+    if stats.targets_removed_count == 0 && stats.targets_freed_bytes != 0 {
+        return Err("targets_freed_bytes must be 0 when no targets were removed".to_string());
+    }
+    if stats.errors.len() > ERRORS_MAX {
+        return Err("errors list exceeded ERRORS_MAX".to_string());
+    }
+    for item in &stats.errors {
+        if item.len() > ERROR_MESSAGE_BYTES_MAX {
+            return Err("error message exceeded ERROR_MESSAGE_BYTES_MAX".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Assert `UserPhaseStats` programmer invariants on internal/in-process paths.
 pub fn assert_user_phase_stats_valid(stats: &UserPhaseStats) {
     if stats.targets_removed_count == 0 {
         assert_eq!(
@@ -30,6 +46,12 @@ pub fn assert_user_phase_stats_valid(stats: &UserPhaseStats) {
         stats.errors.len() <= ERRORS_MAX,
         "errors list exceeded ERRORS_MAX"
     );
+    for item in &stats.errors {
+        assert!(
+            item.len() <= ERROR_MESSAGE_BYTES_MAX,
+            "error message exceeded ERROR_MESSAGE_BYTES_MAX"
+        );
+    }
 }
 
 /// Serialize `UserPhaseStats` to a compact RFC 8259 JSON object.
@@ -67,15 +89,14 @@ pub fn encode_user_phase_stats_json(stats: &UserPhaseStats) -> String {
 
 /// Deserialize and validate `UserPhaseStats` from the privilege-dropped child.
 ///
-/// Structural/type mismatches return `Err`; semantic invariant violations trip
-/// `assert_user_phase_stats_valid` (paired with `encode_user_phase_stats_json`).
+/// Both structural/type mismatches and semantic invariant violations return `Err`
+/// so a corrupted unprivileged child cannot panic the root parent before Phase 2.
 pub fn parse_user_phase_stats_json(raw_json: &str) -> Result<UserPhaseStats, String> {
-    assert!(
-        raw_json.len() <= SUBPROCESS_OUTPUT_BYTES_MAX,
-        "raw_json exceeded SUBPROCESS_OUTPUT_BYTES_MAX"
-    );
+    if raw_json.len() > SUBPROCESS_OUTPUT_BYTES_MAX {
+        return Err("user phase payload exceeded SUBPROCESS_OUTPUT_BYTES_MAX".to_string());
+    }
 
-    let mut cursor = JsonCursor::new(raw_json.as_bytes());
+    let mut cursor = JsonCursor::new(raw_json);
     cursor.skip_whitespace();
     cursor.expect_byte(b'{', "user phase payload must be a JSON object")?;
 
@@ -156,11 +177,17 @@ pub fn parse_user_phase_stats_json(raw_json: &str) -> Result<UserPhaseStats, Str
         return Err("missing required key(s) in user phase payload".to_string());
     }
 
+    validate_user_phase_stats(&stats)?;
     assert_user_phase_stats_valid(&stats);
     Ok(stats)
 }
 
 fn write_json_escaped_string(out: &mut String, text: &str) {
+    assert!(
+        text.len() <= ERROR_MESSAGE_BYTES_MAX,
+        "text exceeded ERROR_MESSAGE_BYTES_MAX"
+    );
+    let len_before = out.len();
     out.push('"');
     for ch in text.chars() {
         match ch {
@@ -178,39 +205,48 @@ fn write_json_escaped_string(out: &mut String, text: &str) {
         }
     }
     out.push('"');
+    assert!(
+        out.len() - len_before <= ERROR_MESSAGE_BYTES_MAX * 6 + 2,
+        "escaped JSON string exceeded worst-case expansion bound"
+    );
 }
 
 struct JsonCursor<'a> {
-    bytes: &'a [u8],
+    text: &'a str,
     offset: usize,
 }
 
 impl<'a> JsonCursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        assert!(bytes.len() <= SUBPROCESS_OUTPUT_BYTES_MAX);
-        Self { bytes, offset: 0 }
+    fn new(text: &'a str) -> Self {
+        assert!(text.len() <= SUBPROCESS_OUTPUT_BYTES_MAX);
+        Self { text, offset: 0 }
     }
 
     fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.offset).copied()
+        assert!(self.offset <= self.text.len());
+        self.text.as_bytes().get(self.offset).copied()
     }
 
     fn advance(&mut self) {
-        assert!(self.offset < self.bytes.len());
+        assert!(self.offset < self.text.len());
         self.offset += 1;
     }
 
     fn skip_whitespace(&mut self) {
-        let remaining = self.bytes.len().saturating_sub(self.offset);
+        assert!(self.offset <= self.text.len());
+        let remaining = self.text.len().saturating_sub(self.offset);
         for _ in 0..remaining {
             match self.peek() {
                 Some(b' ' | b'\t' | b'\r' | b'\n') => self.advance(),
                 _ => break,
             }
         }
+        assert!(self.offset <= self.text.len());
     }
 
     fn expect_byte(&mut self, expected: u8, message: &str) -> Result<(), String> {
+        assert!(!message.is_empty(), "error message must be non-empty");
+        assert!(self.offset <= self.text.len());
         if self.peek() == Some(expected) {
             self.advance();
             Ok(())
@@ -220,6 +256,8 @@ impl<'a> JsonCursor<'a> {
     }
 
     fn parse_u64(&mut self, field_name: &str) -> Result<u64, String> {
+        assert!(!field_name.is_empty(), "field_name must be non-empty");
+        assert!(self.offset <= self.text.len());
         let start = self.offset;
         let first = self
             .peek()
@@ -248,12 +286,10 @@ impl<'a> JsonCursor<'a> {
             return Err(format!("non-integer number in field {field_name:?}"));
         }
 
-        let slice = self
-            .bytes
+        let text = self
+            .text
             .get(start..self.offset)
             .ok_or_else(|| format!("slice error parsing {field_name:?}"))?;
-        let text = std::str::from_utf8(slice)
-            .map_err(|_| format!("invalid UTF-8 in field {field_name:?}"))?;
         text.parse::<u64>()
             .map_err(|_| format!("integer overflow in field {field_name:?}"))
     }
@@ -273,6 +309,9 @@ impl<'a> JsonCursor<'a> {
                 return Err("errors field exceeded ERRORS_MAX".to_string());
             }
             let item = self.parse_string()?;
+            if item.len() > ERROR_MESSAGE_BYTES_MAX {
+                return Err("error message exceeded ERROR_MESSAGE_BYTES_MAX".to_string());
+            }
             items.push(item);
             self.skip_whitespace();
             match self.peek() {
@@ -289,9 +328,10 @@ impl<'a> JsonCursor<'a> {
     }
 
     fn parse_string(&mut self) -> Result<String, String> {
+        assert!(self.offset <= self.text.len());
         self.expect_byte(b'"', "expected JSON string")?;
         let mut out = String::new();
-        let max_steps = self.bytes.len().saturating_sub(self.offset);
+        let max_steps = self.text.len().saturating_sub(self.offset);
 
         for _ in 0..max_steps {
             let byte = self
@@ -299,6 +339,7 @@ impl<'a> JsonCursor<'a> {
                 .ok_or_else(|| "unterminated JSON string".to_string())?;
             if byte == b'"' {
                 self.advance();
+                assert!(out.len() <= SUBPROCESS_OUTPUT_BYTES_MAX);
                 return Ok(out);
             }
             if byte == b'\\' {
@@ -322,14 +363,15 @@ impl<'a> JsonCursor<'a> {
                             self.expect_byte(b'\\', "unpaired high surrogate in JSON string")?;
                             self.expect_byte(b'u', "unpaired high surrogate in JSON string")?;
                             let low_unit = self.parse_hex_u16()?;
-                            if !(0xDC00..=0xDFFF).contains(&low_unit) {
+                            if (0xDC00..=0xDFFF).contains(&low_unit) {
+                                let combined = 0x10000
+                                    + ((u32::from(code_unit) - 0xD800) << 10)
+                                    + (u32::from(low_unit) - 0xDC00);
+                                char::from_u32(combined)
+                                    .ok_or_else(|| "invalid Unicode scalar".to_string())?
+                            } else {
                                 return Err("invalid low surrogate in JSON string".to_string());
                             }
-                            let combined = 0x10000
-                                + ((u32::from(code_unit) - 0xD800) << 10)
-                                + (u32::from(low_unit) - 0xDC00);
-                            char::from_u32(combined)
-                                .ok_or_else(|| "invalid Unicode scalar".to_string())?
                         } else {
                             char::from_u32(u32::from(code_unit))
                                 .ok_or_else(|| "invalid surrogate in JSON string".to_string())?
@@ -344,25 +386,30 @@ impl<'a> JsonCursor<'a> {
                 return Err("unescaped control character in JSON string".to_string());
             }
 
-            // Consume a full valid UTF-8 scalar value.
-            let remaining = self
-                .bytes
-                .get(self.offset..)
-                .ok_or_else(|| "slice error in JSON string".to_string())?;
-            let text = std::str::from_utf8(remaining)
-                .map_err(|_| "invalid UTF-8 in JSON string".to_string())?;
-            let ch = text
-                .chars()
-                .next()
-                .ok_or_else(|| "unterminated JSON string".to_string())?;
-            out.push(ch);
-            self.offset = self.offset.saturating_add(ch.len_utf8());
+            if byte < 0x80 {
+                out.push(char::from(byte));
+                self.advance();
+            } else {
+                // `self.text` is already validated UTF-8 and `self.offset` always lands
+                // on a scalar boundary, so decoding the next char is O(1).
+                let tail = self
+                    .text
+                    .get(self.offset..)
+                    .ok_or_else(|| "slice error in JSON string".to_string())?;
+                let ch = tail
+                    .chars()
+                    .next()
+                    .ok_or_else(|| "unterminated JSON string".to_string())?;
+                out.push(ch);
+                self.offset = self.offset.saturating_add(ch.len_utf8());
+            }
         }
 
         Err("unterminated JSON string".to_string())
     }
 
     fn parse_hex_u16(&mut self) -> Result<u16, String> {
+        assert!(self.offset <= self.text.len());
         let mut value: u16 = 0;
         for _ in 0..4 {
             let digit = self
@@ -377,6 +424,7 @@ impl<'a> JsonCursor<'a> {
             };
             value = (value << 4) | nibble;
         }
+        assert!(self.offset <= self.text.len());
         Ok(value)
     }
 }

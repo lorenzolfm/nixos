@@ -12,16 +12,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cleanup::{append_error, log};
 use crate::constants::{
-    AGE_DAYS_MAX, AGE_HOURS_MAX, CACHEDIR_TAG_SIGNATURE_BYTES, CANDIDATES_MAX, INODES_TRACKED_MAX,
-    NIX_TMP_PREFIXES, PROJECTS_WALK_ENTRIES_MAX, SKIP_WALK_DIRS, TARGET_MTIME_DEPTH_MAX,
+    AGE_DAYS_MAX, AGE_HOURS_MAX, CACHEDIR_TAG_SIGNATURE_BYTES, CANDIDATES_MAX, ERRORS_MAX,
+    INODES_TRACKED_MAX, NANOS_PER_SECOND, NIX_TMP_PREFIXES, PROJECTS_WALK_ENTRIES_MAX,
+    SECONDS_PER_DAY, SECONDS_PER_HOUR, SKIP_WALK_DIRS, TARGET_MTIME_DEPTH_MAX,
     TARGET_SKIP_MTIME_CHILDREN, TMP_DIR_ENTRIES_MAX, TREE_WALK_ENTRIES_MAX, WALK_DEPTH_MAX,
     WATCH_PATHS_MAX,
 };
 use crate::sys::{self, FilesystemStat, LockProbe};
-
-pub const NANOS_PER_SECOND: i128 = 1_000_000_000;
-const SECONDS_PER_HOUR: f64 = 3600.0;
-const SECONDS_PER_DAY: f64 = 86_400.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskUsage {
@@ -30,6 +27,35 @@ pub struct DiskUsage {
     pub used_bytes: u64,
     pub available_bytes: u64,
     pub used_percent: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProjectScanConfig {
+    pub now_ns: i128,
+    pub result_age_days: f64,
+    pub target_age_hours: f64,
+}
+
+impl ProjectScanConfig {
+    pub fn assert_valid(&self) {
+        assert!(self.now_ns > 0, "now_ns must be positive");
+        assert!(self.result_age_days.is_finite());
+        assert!(self.result_age_days >= 0.0);
+        assert!(self.result_age_days <= f64::from(AGE_DAYS_MAX));
+        assert!(self.target_age_hours.is_finite());
+        assert!(self.target_age_hours >= 0.0);
+        assert!(self.target_age_hours <= f64::from(AGE_HOURS_MAX));
+    }
+
+    pub fn result_mtime_max_ns(&self) -> i128 {
+        self.assert_valid();
+        self.now_ns - non_negative_seconds_to_ns(self.result_age_days * SECONDS_PER_DAY)
+    }
+
+    pub fn target_mtime_max_ns(&self) -> i128 {
+        self.assert_valid();
+        self.now_ns - non_negative_seconds_to_ns(self.target_age_hours * SECONDS_PER_HOUR)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +120,8 @@ pub fn current_time_ns() -> i128 {
 pub fn metadata_mtime_ns(metadata: &fs::Metadata) -> i128 {
     let secs = i128::from(metadata.mtime());
     let nsec = i128::from(metadata.mtime_nsec());
+    assert!(nsec >= 0, "mtime_nsec must be non-negative: {nsec}");
+    assert!(nsec < NANOS_PER_SECOND, "mtime_nsec out of range: {nsec}");
     secs * NANOS_PER_SECOND + nsec
 }
 
@@ -171,7 +199,9 @@ pub fn compute_disk_usage(path: &Path, fs_stat: FilesystemStat) -> DiskUsage {
 pub fn stat_filesystem(path: &Path) -> io::Result<DiskUsage> {
     assert!(path.is_absolute(), "path must be absolute");
     let fs_stat = sys::statvfs_path(path)?;
-    Ok(compute_disk_usage(path, fs_stat))
+    let usage = compute_disk_usage(path, fs_stat);
+    assert!(usage.used_percent <= 100);
+    Ok(usage)
 }
 
 /// Return the highest-usage filesystem among existing candidate paths.
@@ -220,7 +250,9 @@ pub fn worst_disk_usage(paths: &[PathBuf]) -> io::Result<DiskUsage> {
 pub fn dir_disk_usage(root: &Path) -> u64 {
     assert!(root.is_absolute(), "dir_disk_usage requires absolute path");
 
-    let mut total_bytes: u64 = 0;
+    let mut total_bytes: u64 = fs::symlink_metadata(root)
+        .map(|meta| meta.blocks().saturating_mul(512))
+        .unwrap_or(0);
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
     let mut entries_visited_count: usize = 0;
     let mut stack: Vec<(PathBuf, usize)> = Vec::with_capacity(WALK_DEPTH_MAX);
@@ -262,12 +294,13 @@ pub fn dir_disk_usage(root: &Path) -> u64 {
             }
             // `st_blocks` is always in 512-byte units on POSIX.
             total_bytes = total_bytes.saturating_add(meta.blocks().saturating_mul(512));
-            if meta.file_type().is_dir() {
+            if meta.file_type().is_dir() && depth + 1 < WALK_DEPTH_MAX {
                 stack.push((entry_path, depth + 1));
             }
         }
     }
 
+    assert!(entries_visited_count <= TREE_WALK_ENTRIES_MAX);
     total_bytes
 }
 
@@ -320,6 +353,10 @@ pub fn is_cargo_target_dir(target_dir: &Path) -> bool {
 /// Return `true` if Cargo holds an exclusive `flock` on `.cargo-lock` (fails closed).
 pub fn is_cargo_target_locked(target_dir: &Path) -> bool {
     assert!(target_dir.is_absolute(), "target_dir must be absolute");
+    assert!(
+        target_dir.parent().is_some(),
+        "target_dir cannot be filesystem root"
+    );
     let lock_file = target_dir.join(".cargo-lock");
     match sys::probe_exclusive_flock(&lock_file) {
         LockProbe::Unlocked => false,
@@ -342,12 +379,10 @@ pub fn is_cargo_target_locked(target_dir: &Path) -> bool {
 /// bounds are exceeded, or if `cutoff_ns` is given and any entry is newer.
 pub fn latest_target_mtime_ns(
     target_dir: &Path,
-    now_ns: i128,
     cutoff_ns: Option<i128>,
     depth_max: usize,
 ) -> Option<i128> {
     assert!(target_dir.is_absolute(), "target_dir must be absolute");
-    assert!(now_ns > 0, "now_ns must be positive");
     assert!(depth_max >= 1, "depth_max must be at least 1");
     assert!(
         depth_max <= WALK_DEPTH_MAX,
@@ -402,7 +437,7 @@ pub fn latest_target_mtime_ns(
                     .file_name()
                     .to_str()
                     .is_some_and(|name| TARGET_SKIP_MTIME_CHILDREN.contains(&name));
-                if !is_skipped_child {
+                if !is_skipped_child && depth + 1 < depth_max {
                     stack.push((entry_path, depth + 1));
                 }
             }
@@ -419,9 +454,8 @@ pub fn latest_target_mtime_ns(
 ///
 /// Returns `None` (fail closed / skip) if any entry is newer than `cutoff_ns`,
 /// if any subdirectory/entry cannot be stat-ed, or if walk bounds are exceeded.
-pub fn inspect_tmp_tree(root: &Path, now_ns: i128, cutoff_ns: i128) -> Option<TmpTreeSummary> {
+pub fn inspect_tmp_tree(root: &Path, cutoff_ns: i128) -> Option<TmpTreeSummary> {
     assert!(root.is_absolute(), "root must be absolute");
-    assert!(now_ns > 0, "now_ns must be positive");
 
     let root_meta = fs::symlink_metadata(root).ok()?;
     if !root_meta.file_type().is_dir() {
@@ -498,36 +532,24 @@ pub fn inspect_tmp_tree(root: &Path, now_ns: i128, cutoff_ns: i128) -> Option<Tm
 }
 
 /// Walk `projects_dir` once to discover stale Nix `result*` links and Rust `target/` dirs.
-pub fn scan_projects(
-    projects_dir: &Path,
-    now_ns: i128,
-    result_age_days: f64,
-    target_age_hours: f64,
-) -> ProjectScanResult {
+pub fn scan_projects(projects_dir: &Path, config: &ProjectScanConfig) -> ProjectScanResult {
     assert!(projects_dir.is_absolute(), "projects_dir must be absolute");
     assert!(
         !sys::is_forbidden_delete_path(projects_dir),
         "projects_dir cannot be a system root"
     );
-    assert!(now_ns > 0, "now_ns must be positive");
-    assert!(result_age_days.is_finite());
-    assert!(result_age_days >= 0.0);
-    assert!(result_age_days <= f64::from(AGE_DAYS_MAX));
-    assert!(target_age_hours.is_finite());
-    assert!(target_age_hours >= 0.0);
-    assert!(target_age_hours <= f64::from(AGE_HOURS_MAX));
+    config.assert_valid();
 
     let mut result = ProjectScanResult::default();
     if !projects_dir.is_dir() {
         return result;
     }
 
-    let result_mtime_max_ns =
-        now_ns - non_negative_seconds_to_ns(result_age_days * SECONDS_PER_DAY);
-    let target_mtime_max_ns =
-        now_ns - non_negative_seconds_to_ns(target_age_hours * SECONDS_PER_HOUR);
+    let result_mtime_max_ns = config.result_mtime_max_ns();
+    let target_mtime_max_ns = config.target_mtime_max_ns();
 
     let mut entries_visited_count: usize = 0;
+    let mut candidates_limit_reported = false;
     let mut stack: Vec<(PathBuf, usize)> = Vec::with_capacity(WALK_DEPTH_MAX);
     stack.push((projects_dir.to_path_buf(), 0));
 
@@ -564,7 +586,6 @@ pub fn scan_projects(
             }
         };
 
-        let mut subdirs_to_push: Vec<PathBuf> = Vec::new();
         for entry_result in read_dir {
             entries_visited_count = entries_visited_count.saturating_add(1);
             if entries_visited_count > PROJECTS_WALK_ENTRIES_MAX {
@@ -576,7 +597,6 @@ pub fn scan_projects(
                     ),
                 );
                 stack.clear();
-                subdirs_to_push.clear();
                 break;
             }
 
@@ -596,14 +616,24 @@ pub fn scan_projects(
                     && let Ok(link_target) = fs::read_link(&entry_path)
                 {
                     let mtime_ns = metadata_mtime_ns(&entry_meta);
-                    if link_target
+                    let is_stale_nix_link = link_target
                         .as_os_str()
                         .as_bytes()
                         .starts_with(b"/nix/store/")
-                        && mtime_ns <= result_mtime_max_ns
-                        && result.stale_results.len() < CANDIDATES_MAX
-                    {
-                        result.stale_results.push((entry_path, mtime_ns));
+                        && mtime_ns <= result_mtime_max_ns;
+                    if is_stale_nix_link {
+                        if result.stale_results.len() < CANDIDATES_MAX {
+                            result.stale_results.push((entry_path, mtime_ns));
+                        } else if !candidates_limit_reported {
+                            candidates_limit_reported = true;
+                            append_error(
+                                &mut result.errors,
+                                format!(
+                                    "scan {}: exceeded {CANDIDATES_MAX} candidate limit",
+                                    projects_dir.display()
+                                ),
+                            );
+                        }
                     }
                 }
                 continue;
@@ -626,7 +656,6 @@ pub fn scan_projects(
                     } else {
                         let newest_ns = latest_target_mtime_ns(
                             &entry_path,
-                            now_ns,
                             Some(target_mtime_max_ns),
                             TARGET_MTIME_DEPTH_MAX,
                         );
@@ -639,6 +668,15 @@ pub fn scan_projects(
                                     mtime_latest_ns,
                                     size_bytes,
                                 });
+                            } else if !candidates_limit_reported {
+                                candidates_limit_reported = true;
+                                append_error(
+                                    &mut result.errors,
+                                    format!(
+                                        "scan {}: exceeded {CANDIDATES_MAX} candidate limit",
+                                        projects_dir.display()
+                                    ),
+                                );
                             }
                         } else {
                             result.targets_skipped_recent_count += 1;
@@ -649,11 +687,9 @@ pub fn scan_projects(
                 continue;
             }
 
-            subdirs_to_push.push(entry_path);
-        }
-
-        for subdir in subdirs_to_push {
-            stack.push((subdir, depth + 1));
+            if depth + 1 < WALK_DEPTH_MAX {
+                stack.push((entry_path, depth + 1));
+            }
         }
     }
 
@@ -670,6 +706,7 @@ pub fn scan_projects(
         result.target_candidates.len() <= CANDIDATES_MAX,
         "target_candidates exceeded CANDIDATES_MAX"
     );
+    assert!(result.errors.len() <= ERRORS_MAX);
     result
 }
 
@@ -748,7 +785,7 @@ pub fn scan_stale_nix_tmp_dirs(tmp_dir: &Path, tmp_age_hours: f64, now_ns: i128)
             continue;
         }
 
-        let Some(tree) = inspect_tmp_tree(&entry_path, now_ns, cutoff_ns) else {
+        let Some(tree) = inspect_tmp_tree(&entry_path, cutoff_ns) else {
             result.dirs_skipped_recent_count += 1;
             continue;
         };
@@ -767,6 +804,7 @@ pub fn scan_stale_nix_tmp_dirs(tmp_dir: &Path, tmp_age_hours: f64, now_ns: i128)
     }
 
     assert!(result.stale_dirs.len() <= CANDIDATES_MAX);
+    assert!(result.errors.len() <= ERRORS_MAX);
     result
 }
 
@@ -823,11 +861,20 @@ pub fn is_nix_tmp_dir_name(name: &str) -> bool {
 
 /// Extract PID from `nix-develop-<pid>-...` directory names.
 pub fn parse_nix_develop_pid(name: &str) -> Option<u32> {
+    assert!(
+        !name.contains('/'),
+        "directory entry name must not contain '/'"
+    );
     let rest = name.strip_prefix("nix-develop-")?;
     let dash_index = rest.find('-')?;
     let digits = rest.get(..dash_index)?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    digits.parse::<u32>().ok()
+    let pid = digits.parse::<u32>().ok()?;
+    if pid == 0 {
+        return None;
+    }
+    assert!(pid > 0);
+    Some(pid)
 }

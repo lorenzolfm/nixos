@@ -215,8 +215,8 @@ fn cli_dry_run_and_user_phase_json_end_to_end() {
             "--dry-run",
             "--projects-dir",
             projects.to_str().expect("utf-8"),
-            "--_now-seconds",
-            "1764322500.0",
+            "--_now-ns",
+            "1764322500123456789",
         ])
         .env("PATH", &fake_bin)
         .output()

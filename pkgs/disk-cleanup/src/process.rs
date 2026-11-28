@@ -1,27 +1,24 @@
 //! Bounded, streaming subprocess execution with strict wall-clock timeouts.
 
+use std::collections::VecDeque;
 use std::env;
 use std::ffi::OsString;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::constants::{
-    PIPE_READ_BYTES, SUBPROCESS_LINE_BYTES_MAX, SUBPROCESS_READ_ITERATIONS_MAX,
+    PATH_ENTRIES_MAX, PIPE_READ_BYTES, SUBPROCESS_LINE_BYTES_MAX, SUBPROCESS_READ_ITERATIONS_MAX,
+    WAIT_ITERATIONS_MAX,
 };
 use crate::sys;
 
-#[derive(Debug, Clone)]
-pub struct PrivilegeDrop {
-    pub user_uid: u32,
-    pub group_gid: u32,
-    pub extra_groups: Vec<u32>,
-}
+pub use crate::sys::PrivilegeDrop;
 
 #[derive(Debug, Clone)]
 pub struct CommandOptions {
@@ -30,7 +27,7 @@ pub struct CommandOptions {
     pub timeout: Duration,
     pub env_override: Option<Vec<(OsString, OsString)>>,
     pub privilege_drop: Option<PrivilegeDrop>,
-    pub stdout_lines_max: u64,
+    pub stream_lines_max: u64,
     pub capture_stdout_bytes_max: usize,
     pub capture_stderr_bytes_max: usize,
     pub inherit_stderr: bool,
@@ -38,13 +35,44 @@ pub struct CommandOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
-    pub returncode: i32,
+    pub exit_code: i32,
     pub timed_out: bool,
     pub stdout_text: String,
     pub stderr_tail: String,
     pub stdout_lines_count: u64,
     pub stdout_truncated: bool,
     pub error_message: Option<String>,
+}
+
+impl CommandResult {
+    /// Format a spawn/IO error, timeout, or non-zero exit status, or `None` on success.
+    pub fn failure_detail(&self, timeout: Duration) -> Option<String> {
+        assert!(!timeout.is_zero(), "timeout must be positive");
+        if let Some(err_msg) = &self.error_message {
+            assert!(!err_msg.is_empty(), "error_message must be non-empty");
+            return Some(err_msg.clone());
+        }
+        if self.timed_out {
+            return Some(format!("timed out after {}s", timeout.as_secs()));
+        }
+        if self.exit_code != 0 {
+            let trimmed = self.stderr_tail.trim();
+            let detail = if trimmed.is_empty() {
+                format!("exit {}", self.exit_code)
+            } else {
+                trimmed.to_string()
+            };
+            return Some(detail);
+        }
+        assert_eq!(self.exit_code, 0);
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StreamTag {
+    Stdout,
+    Stderr,
 }
 
 /// Locate an executable by name using `PATH` (equivalent to `shutil.which`).
@@ -56,7 +84,7 @@ pub fn find_executable_in_path(name: &str) -> Option<PathBuf> {
     );
 
     let path_var = env::var_os("PATH")?;
-    for dir in env::split_paths(&path_var) {
+    for dir in env::split_paths(&path_var).take(PATH_ENTRIES_MAX) {
         let candidate = dir.join(name);
         if is_executable_file(&candidate) {
             return Some(candidate);
@@ -65,7 +93,8 @@ pub fn find_executable_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn is_executable_file(path: &PathBuf) -> bool {
+fn is_executable_file(path: &Path) -> bool {
+    assert!(!path.as_os_str().is_empty(), "path must be non-empty");
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
@@ -85,8 +114,8 @@ where
     assert!(!options.program.is_empty(), "program must be non-empty");
     assert!(!options.timeout.is_zero(), "timeout must be positive");
     assert!(
-        options.stdout_lines_max > 0,
-        "stdout_lines_max must be positive"
+        options.stream_lines_max > 0,
+        "stream_lines_max must be positive"
     );
 
     let mut command = Command::new(&options.program);
@@ -105,19 +134,14 @@ where
         command.envs(env_pairs.iter().map(|(k, v)| (k, v)));
     }
     if let Some(drop_cfg) = &options.privilege_drop {
-        sys::configure_privilege_drop(
-            &mut command,
-            drop_cfg.user_uid,
-            drop_cfg.group_gid,
-            &drop_cfg.extra_groups,
-        );
+        sys::configure_privilege_drop(&mut command, drop_cfg);
     }
 
     let mut child = match command.spawn() {
         Ok(proc_handle) => proc_handle,
         Err(err) => {
             return CommandResult {
-                returncode: -1,
+                exit_code: -1,
                 timed_out: false,
                 stdout_text: String::new(),
                 stderr_tail: String::new(),
@@ -137,7 +161,7 @@ where
     {
         kill_and_reap(&mut child);
         return CommandResult {
-            returncode: -1,
+            exit_code: -1,
             timed_out: false,
             stdout_text: String::new(),
             stderr_tail: String::new(),
@@ -151,7 +175,7 @@ where
     {
         kill_and_reap(&mut child);
         return CommandResult {
-            returncode: -1,
+            exit_code: -1,
             timed_out: false,
             stdout_text: String::new(),
             stderr_tail: String::new(),
@@ -161,21 +185,24 @@ where
         };
     }
 
-    let mut stdout_capture = Vec::<u8>::new();
-    let mut stderr_tail = Vec::<u8>::new();
+    let mut stdout_capture = Vec::<u8>::with_capacity(options.capture_stdout_bytes_max.min(4096));
+    let mut stderr_tail = VecDeque::<u8>::with_capacity(options.capture_stderr_bytes_max);
     let mut stdout_line_buf = Vec::<u8>::new();
     let mut stderr_line_buf = Vec::<u8>::new();
     let mut stdout_lines_count: u64 = 0;
     let mut stderr_lines_count: u64 = 0;
     let mut stdout_truncated = false;
     let mut timed_out = false;
+    let mut io_error_message: Option<String> = None;
     let mut read_buf = [0u8; PIPE_READ_BYTES];
 
     let mut iterations_count: usize = 0;
-    while stdout_pipe.is_some() || stderr_pipe.is_some() {
+    'poll_loop: while stdout_pipe.is_some() || stderr_pipe.is_some() {
         iterations_count = iterations_count.saturating_add(1);
         if iterations_count > SUBPROCESS_READ_ITERATIONS_MAX {
-            timed_out = true;
+            io_error_message = Some(format!(
+                "subprocess exceeded {SUBPROCESS_READ_ITERATIONS_MAX} read iterations"
+            ));
             break;
         }
 
@@ -200,35 +227,37 @@ where
             },
         ];
         let mut stream_tags = [StreamTag::Stdout; 2];
-        let mut nfds: usize = 0;
+        let mut pollfds_count: usize = 0;
 
         if let Some(pipe) = &stdout_pipe {
-            if let Some(slot) = pollfds.get_mut(nfds) {
+            if let Some(slot) = pollfds.get_mut(pollfds_count) {
                 slot.fd = pipe.as_raw_fd();
             }
-            if let Some(tag_slot) = stream_tags.get_mut(nfds) {
+            if let Some(tag_slot) = stream_tags.get_mut(pollfds_count) {
                 *tag_slot = StreamTag::Stdout;
             }
-            nfds += 1;
+            pollfds_count += 1;
         }
         if let Some(pipe) = &stderr_pipe {
-            if let Some(slot) = pollfds.get_mut(nfds) {
+            if let Some(slot) = pollfds.get_mut(pollfds_count) {
                 slot.fd = pipe.as_raw_fd();
             }
-            if let Some(tag_slot) = stream_tags.get_mut(nfds) {
+            if let Some(tag_slot) = stream_tags.get_mut(pollfds_count) {
                 *tag_slot = StreamTag::Stderr;
             }
-            nfds += 1;
+            pollfds_count += 1;
         }
-        assert!(nfds >= 1);
-        assert!(nfds <= 2);
+        assert!(pollfds_count >= 1);
+        assert!(pollfds_count <= 2);
 
-        let poll_slice = pollfds.get_mut(..nfds).expect("nfds in 1..=2");
+        let poll_slice = pollfds
+            .get_mut(..pollfds_count)
+            .expect("pollfds_count in 1..=2");
         let ready_count = match sys::poll_fds(poll_slice, timeout_ms) {
             Ok(count) => count,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                timed_out = true;
+            Err(err) => {
+                io_error_message = Some(format!("poll failed: {err}"));
                 break;
             }
         };
@@ -236,7 +265,7 @@ where
             continue;
         }
 
-        for index in 0..nfds {
+        for index in 0..pollfds_count {
             let pfd = match pollfds.get(index) {
                 Some(entry) => *entry,
                 None => continue,
@@ -250,11 +279,8 @@ where
             };
 
             if (pfd.revents & libc::POLLNVAL) != 0 {
-                match tag {
-                    StreamTag::Stdout => stdout_pipe = None,
-                    StreamTag::Stderr => stderr_pipe = None,
-                }
-                continue;
+                io_error_message = Some("invalid pipe descriptor in poll".to_string());
+                break 'poll_loop;
             }
 
             let read_result = sys::read_fd_nonblocking(pfd.fd, &mut read_buf);
@@ -287,24 +313,23 @@ where
                                 &mut stdout_line_buf,
                                 chunk,
                                 stdout_lines_count,
-                                options.stdout_lines_max,
+                                options.stream_lines_max,
                                 on_stdout_line.as_mut(),
                             );
                         }
                         StreamTag::Stderr => {
                             if options.capture_stderr_bytes_max > 0 {
-                                stderr_tail.extend_from_slice(chunk);
-                                if stderr_tail.len() > options.capture_stderr_bytes_max {
-                                    let excess =
-                                        stderr_tail.len() - options.capture_stderr_bytes_max;
-                                    stderr_tail.drain(..excess);
-                                }
+                                append_bounded_tail(
+                                    &mut stderr_tail,
+                                    chunk,
+                                    options.capture_stderr_bytes_max,
+                                );
                             }
                             stderr_lines_count = drain_stream_lines(
                                 &mut stderr_line_buf,
                                 chunk,
                                 stderr_lines_count,
-                                options.stdout_lines_max,
+                                options.stream_lines_max,
                                 on_stderr_line.as_mut(),
                             );
                         }
@@ -316,16 +341,16 @@ where
                 {
                     continue;
                 }
-                Err(_) => match tag {
-                    StreamTag::Stdout => stdout_pipe = None,
-                    StreamTag::Stderr => stderr_pipe = None,
-                },
+                Err(err) => {
+                    io_error_message = Some(format!("pipe read failed: {err}"));
+                    break 'poll_loop;
+                }
             }
         }
     }
 
     // Flush any trailing non-newline-terminated line.
-    if !stdout_line_buf.is_empty() && stdout_lines_count < options.stdout_lines_max {
+    if !stdout_line_buf.is_empty() && stdout_lines_count < options.stream_lines_max {
         stdout_lines_count += 1;
         if let Some(callback) = on_stdout_line.as_mut() {
             let text = String::from_utf8_lossy(&stdout_line_buf);
@@ -333,7 +358,7 @@ where
         }
     }
     if !stderr_line_buf.is_empty()
-        && stderr_lines_count < options.stdout_lines_max
+        && stderr_lines_count < options.stream_lines_max
         && let Some(callback) = on_stderr_line.as_mut()
     {
         let text = String::from_utf8_lossy(&stderr_line_buf);
@@ -343,47 +368,64 @@ where
     drop(stdout_pipe);
     drop(stderr_pipe);
 
-    let exit_status = if timed_out {
+    let exit_status = if timed_out || io_error_message.is_some() {
         kill_and_reap(&mut child)
     } else {
         match wait_until(&mut child, deadline) {
-            Some(status) => Some(status),
-            None => {
+            Ok(Some(status)) => Some(status),
+            Ok(None) => {
                 timed_out = true;
+                kill_and_reap(&mut child)
+            }
+            Err(err) => {
+                io_error_message = Some(format!("wait failed: {err}"));
                 kill_and_reap(&mut child)
             }
         }
     };
 
-    let returncode = match exit_status {
-        Some(status) => status_to_returncode(status),
+    let exit_code = match exit_status {
+        Some(status) => status_to_exit_code(status),
         None => -1,
     };
 
-    assert!(
-        stdout_capture.len() <= options.capture_stdout_bytes_max
-            || options.capture_stdout_bytes_max == 0
-    );
-    assert!(
-        stderr_tail.len() <= options.capture_stderr_bytes_max
-            || options.capture_stderr_bytes_max == 0
-    );
+    assert!(stdout_capture.len() <= options.capture_stdout_bytes_max);
+    assert!(stderr_tail.len() <= options.capture_stderr_bytes_max);
+    if timed_out {
+        assert!(io_error_message.is_none());
+    }
 
+    let stderr_slice = stderr_tail.make_contiguous();
     CommandResult {
-        returncode,
+        exit_code,
         timed_out,
         stdout_text: String::from_utf8_lossy(&stdout_capture).into_owned(),
-        stderr_tail: String::from_utf8_lossy(&stderr_tail).into_owned(),
+        stderr_tail: String::from_utf8_lossy(stderr_slice).into_owned(),
         stdout_lines_count,
         stdout_truncated,
-        error_message: None,
+        error_message: io_error_message,
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum StreamTag {
-    Stdout,
-    Stderr,
+fn append_bounded_tail(tail: &mut VecDeque<u8>, chunk: &[u8], cap_bytes_max: usize) {
+    assert!(cap_bytes_max > 0, "cap_bytes_max must be positive");
+    assert!(tail.len() <= cap_bytes_max, "tail exceeded cap_bytes_max");
+
+    if chunk.len() >= cap_bytes_max {
+        tail.clear();
+        let tail_start = chunk.len() - cap_bytes_max;
+        let suffix = chunk.get(tail_start..).expect("tail_start within chunk");
+        tail.extend(suffix);
+    } else {
+        let next_len = tail.len().saturating_add(chunk.len());
+        if next_len > cap_bytes_max {
+            let excess = next_len - cap_bytes_max;
+            tail.drain(..excess);
+        }
+        tail.extend(chunk);
+    }
+
+    assert!(tail.len() <= cap_bytes_max, "tail exceeded cap_bytes_max");
 }
 
 fn drain_stream_lines<F>(
@@ -396,6 +438,10 @@ fn drain_stream_lines<F>(
 where
     F: FnMut(&str),
 {
+    assert!(
+        chunk.len() <= PIPE_READ_BYTES,
+        "chunk exceeded PIPE_READ_BYTES"
+    );
     assert!(lines_max > 0, "lines_max must be positive");
     assert!(
         line_buffer.len() <= SUBPROCESS_LINE_BYTES_MAX,
@@ -440,50 +486,63 @@ where
             break;
         }
     }
+
+    assert!(line_buffer.len() <= SUBPROCESS_LINE_BYTES_MAX);
+    assert!(lines_count <= lines_max);
     lines_count
 }
 
 fn duration_to_poll_ms(remaining: Duration) -> i32 {
     let millis = remaining.as_millis().min(1000);
     let clamped = millis.max(1);
-    i32::try_from(clamped).expect("clamped millis in 1..=1000 fits i32")
+    let result = i32::try_from(clamped).expect("clamped millis in 1..=1000 fits i32");
+    assert!((1..=1000).contains(&result));
+    result
 }
 
-fn wait_until(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
+fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    assert!(child.id() > 0, "child PID must be positive");
     // Bounded polling loop so we never block indefinitely if a child ignores EOF.
     const POLL_SLEEP: Duration = Duration::from_millis(10);
-    const MAX_WAIT_ITERS: usize = 400_000;
-    for _ in 0..MAX_WAIT_ITERS {
+    for _ in 0..WAIT_ITERATIONS_MAX {
         match child.try_wait() {
-            Ok(Some(status)) => return Some(status),
+            Ok(Some(status)) => return Ok(Some(status)),
             Ok(None) => {}
-            Err(_) => return None,
+            Err(err) => return Err(err),
         }
         let now = Instant::now();
         if now >= deadline {
-            return None;
+            return Ok(None);
         }
         let sleep_for = deadline.saturating_duration_since(now).min(POLL_SLEEP);
         thread::sleep(sleep_for);
     }
-    None
+    Ok(None)
 }
 
 fn kill_and_reap(child: &mut Child) -> Option<ExitStatus> {
+    assert!(child.id() > 0, "child PID must be positive");
     if let Err(err) = child.kill()
         && err.kind() != io::ErrorKind::InvalidInput
     {
-        eprintln!("disk-cleanup: warning: failed to kill timed-out child: {err}");
+        eprintln!("disk-cleanup: warning: failed to kill child process: {err}");
     }
     let reap_deadline = Instant::now() + Duration::from_secs(5);
-    wait_until(child, reap_deadline)
+    match wait_until(child, reap_deadline) {
+        Ok(status) => status,
+        Err(err) => {
+            eprintln!("disk-cleanup: warning: failed to reap child process: {err}");
+            None
+        }
+    }
 }
 
-fn status_to_returncode(status: ExitStatus) -> i32 {
+fn status_to_exit_code(status: ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }
     if let Some(signal) = status.signal() {
+        assert!(signal > 0, "termination signal must be positive");
         return -signal;
     }
     -1
