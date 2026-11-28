@@ -14,7 +14,7 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never
 
 from colab_llm.colab import (
     build_proxy_command,
@@ -25,6 +25,7 @@ from colab_llm.config import (
     HEARTBEAT_INTERVAL_S,
     SIGNAL_STOP_REASONS,
     LaunchConfig,
+    SessionName,
     StopReason,
     deadman_heartbeat_timeout_s,
     format_duration,
@@ -89,36 +90,60 @@ def bind_loopback_listener(bind_host: str, port: int) -> socket.socket:
     return listener
 
 
+@dataclass(frozen=True)
+class Healthy:
+    """The engine answered 200 and is serving. `info` is its own health payload."""
+
+    info: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Loading:
+    """The engine answered, but says it is not serving yet."""
+
+    status: str
+
+
+@dataclass(frozen=True)
+class Unreachable:
+    """No usable answer: nothing is listening, or the tunnel is down."""
+
+
+Health = Healthy | Loading | Unreachable
+
+_LOADING_STATUSES = frozenset({"loading", "reloading", "updating"})
+
+
 def probe_http_health(
     *,
     port: int,
     health_path: str = "/health",
     timeout_s: float = 3.0,
-) -> tuple[bool, dict[str, Any] | None]:
+) -> Health:
     """Query the remote inference server through the internal loopback tunnel port."""
     url = f"http://127.0.0.1:{port}{health_path}"
     req = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             if resp.status != 200:
-                return False, None
+                return Unreachable()
             raw = resp.read().decode("utf-8", errors="replace").strip()
-            if not raw:
-                return True, {}
-            try:
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    status = data.get("status")
-                    if status in ("loading", "reloading", "updating"):
-                        return False, data
-                    if data.get("unloaded") is True:
-                        return False, data
-                    return True, data
-            except ValueError:
-                return True, {"raw": raw[:200]}
     except (urllib.error.URLError, TimeoutError, OSError):
-        return False, None
-    return False, None
+        return Unreachable()
+    if not raw:
+        return Healthy(info={})
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return Healthy(info={"raw": raw[:200]})
+    if not isinstance(data, dict):
+        return Unreachable()
+    status = data.get("status")
+    if isinstance(status, str) and status in _LOADING_STATUSES:
+        return Loading(status=status)
+    if data.get("unloaded") is True:
+        return Loading(status="unloaded")
+    return Healthy(info=data)
 
 
 @dataclass
@@ -337,7 +362,7 @@ class TunnelSupervisor:
         *,
         colab_bin: str,
         ssh_bin: str,
-        session: str,
+        session: SessionName,
         tunnel_port: int,
         remote_port: int,
         identity: Path,
@@ -502,10 +527,8 @@ class TunnelSupervisor:
 
 @dataclass(frozen=True)
 class SessionOutcome:
+    # Says by itself whether the engine was ever ready: see `is_failed_start`.
     stop_reason: StopReason
-    # Whether the engine ever reported healthy. A session that ends before that
-    # is a failed start, whatever the reason.
-    was_ready: bool
     total_connections: int
 
 
@@ -564,6 +587,10 @@ async def run_supervised_session(
             stop_event.set()
 
     loop = asyncio.get_running_loop()
+    # `remove_signal_handler` resets a signal to its default action, not to the
+    # handler it replaced. The caller's handlers are what route SIGTERM and
+    # SIGHUP through teardown, so they are saved here and put back on the way out.
+    caller_handlers = {sig: signal.getsignal(sig) for sig in SIGNAL_STOP_REASONS}
     installed_signals: list[signal.Signals] = []
     for sig, reason in SIGNAL_STOP_REASONS.items():
         try:
@@ -579,15 +606,14 @@ async def run_supervised_session(
     def _outcome() -> SessionOutcome:
         return SessionOutcome(
             stop_reason=stop_reason,
-            was_ready=ready,
             total_connections=proxy.stats.total_connections,
         )
 
-    def _stop_for_ended_tunnel() -> None:
+    def _stop_for_ended_tunnel(reason: StopReason) -> None:
         error = tunnel.end_error()
         if error is not None:
             print(f"[colab-llm] SSH tunnel supervisor failed: {error!r}", file=sys.stderr)
-        _request_stop(StopReason.TUNNEL_DISCONNECTED)
+        _request_stop(reason)
 
     heartbeat_last = float("-inf")
     heartbeat_failures_consecutive = 0
@@ -625,29 +651,34 @@ async def run_supervised_session(
         last_log = time.monotonic()
         health_info: dict[str, Any] = {}
         while not stop_event.is_set():
-            ok, data = await asyncio.to_thread(
+            health = await asyncio.to_thread(
                 probe_http_health,
                 port=tunnel_port,
                 health_path=health_path,
                 timeout_s=HEALTH_PROBE_INTERVAL_S,
             )
-            if ok:
-                ready = True
-                health_info = data or {}
-                break
+            status_hint = ""
+            match health:
+                case Healthy(info=info):
+                    ready = True
+                    health_info = info
+                    break
+                case Loading(status=status):
+                    status_hint = f" (engine status: {status})"
+                case Unreachable():
+                    pass
+                case _:
+                    assert_never(health)
             now = time.monotonic()
             if now >= deadline:
                 _request_stop(StopReason.HEALTH_TIMEOUT)
                 break
             if tunnel.ended:
-                _stop_for_ended_tunnel()
+                _stop_for_ended_tunnel(StopReason.TUNNEL_FAILED)
                 break
             await _heartbeat_if_due(now, tunnel_expected=False)
             if now - last_log >= HEALTH_LOG_INTERVAL_S:
                 remaining_s = max(0.0, deadline - now)
-                status_hint = ""
-                if data and data.get("status"):
-                    status_hint = f" (engine status: {data['status']})"
                 print(
                     f"[colab-llm] Waiting for {engine} on 127.0.0.1:{remote_port}{health_path}"
                     f"{status_hint} — {format_duration(remaining_s)} remaining...",
@@ -697,7 +728,7 @@ async def run_supervised_session(
                 _request_stop(StopReason.IDLE_TIMEOUT)
                 break
             if tunnel.ended:
-                _stop_for_ended_tunnel()
+                _stop_for_ended_tunnel(StopReason.TUNNEL_DISCONNECTED)
                 break
 
             if now - last_state_write >= STATE_WRITE_INTERVAL_S:
@@ -740,6 +771,11 @@ async def run_supervised_session(
                         loop.remove_signal_handler(sig)
                     except (NotImplementedError, RuntimeError):
                         pass
+                    previous = caller_handlers[sig]
+                    # None is a handler that was not installed from Python;
+                    # there is nothing of the caller's to put back.
+                    if previous is not None:
+                        signal.signal(sig, previous)
                 # Not "stopped": the runtime is only stopped once the caller's
                 # teardown has verified it.
                 state.write(Stopping(stop_reason=stop_reason))

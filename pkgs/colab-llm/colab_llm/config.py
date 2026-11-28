@@ -8,14 +8,29 @@ import signal
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import assert_never
+from typing import NewType, assert_never
 
-DEFAULT_SESSION = "colab-llm"
-DEFAULT_GPU = "G4"
-ALLOWED_GPUS = ("G4", "A100", "H100", "L4", "T4")
+# A session name that passed `validate_session_name`. It is interpolated into
+# file paths and command lines, so everything behind the edge takes this type
+# instead of checking the string again.
+SessionName = NewType("SessionName", str)
+
+DEFAULT_SESSION = SessionName("colab-llm")
+
+
+class Gpu(StrEnum):
+    """Colab GPU tiers this launcher allocates."""
+
+    G4 = "G4"
+    A100 = "A100"
+    H100 = "H100"
+    L4 = "L4"
+    T4 = "T4"
+
+
+DEFAULT_GPU = Gpu.G4
 # Colab rejects `shape=hm` (HTTP 400) on single-shape GPU tiers.
-SINGLE_SHAPE_GPUS = frozenset({"G4", "L4"})
-assert SINGLE_SHAPE_GPUS <= set(ALLOWED_GPUS)
+SINGLE_SHAPE_GPUS = frozenset({Gpu.G4, Gpu.L4})
 
 # Colab AUP guardrail: bind strictly to loopback so endpoints are never exposed
 # publicly or accidentally bound to wildcard interfaces.
@@ -65,11 +80,9 @@ class Draft(StrEnum):
 
 
 DEFAULT_ENGINE = Engine.MAYA
-ALLOWED_ENGINES = tuple(engine.value for engine in Engine)
 
 DEFAULT_MAYA_MODEL = "EXL3-3.05bpw"
 DEFAULT_MAYA_DRAFT = Draft.DFLASH2
-ALLOWED_MAYA_DRAFTS = tuple(draft.value for draft in Draft)
 DEFAULT_CONTEXT_LENGTH = 131072
 CONTEXT_LENGTH_MIN = 4096
 CONTEXT_LENGTH_MAX = 1048576
@@ -126,8 +139,11 @@ class StopReason(StrEnum):
     SIGNAL_SIGHUP = "signal:SIGHUP"
     HEALTH_TIMEOUT = "startup_timeout"
     REMOTE_PROCESS_EXITED = "remote_process_exited"
+    # The tunnel gave up before the engine ever reported healthy.
+    TUNNEL_FAILED = "tunnel_failed"
     IDLE_TIMEOUT = "idle_timeout"
     MAX_DURATION = "max_duration"
+    # The tunnel gave up while a ready engine was being served.
     TUNNEL_DISCONNECTED = "tunnel_disconnected"
 
 
@@ -138,17 +154,42 @@ SIGNAL_STOP_REASONS: dict[signal.Signals, StopReason] = {
 }
 
 
-def exit_code_for(stop_reason: StopReason, *, was_ready: bool) -> int:
+def is_failed_start(stop_reason: StopReason) -> bool:
+    """Whether the session ended because the engine never became ready."""
+    match stop_reason:
+        case (
+            StopReason.HEALTH_TIMEOUT
+            | StopReason.REMOTE_PROCESS_EXITED
+            | StopReason.TUNNEL_FAILED
+        ):
+            return True
+        case (
+            StopReason.ERROR
+            | StopReason.SIGNAL_SIGINT
+            | StopReason.SIGNAL_SIGTERM
+            | StopReason.SIGNAL_SIGHUP
+            | StopReason.IDLE_TIMEOUT
+            | StopReason.MAX_DURATION
+            | StopReason.TUNNEL_DISCONNECTED
+        ):
+            return False
+        case _:
+            assert_never(stop_reason)
+
+
+def exit_code_for(stop_reason: StopReason) -> int:
     """Process exit code for a finished session. Total: every reason is decided here."""
     match stop_reason:
         case StopReason.SIGNAL_SIGINT | StopReason.SIGNAL_SIGTERM | StopReason.SIGNAL_SIGHUP:
             return 0
-        case StopReason.IDLE_TIMEOUT | StopReason.MAX_DURATION:
+        case StopReason.IDLE_TIMEOUT | StopReason.MAX_DURATION | StopReason.TUNNEL_DISCONNECTED:
             return 0
-        case StopReason.TUNNEL_DISCONNECTED:
-            # A tunnel that never carried a ready engine is a failed start.
-            return 0 if was_ready else 1
-        case StopReason.HEALTH_TIMEOUT | StopReason.REMOTE_PROCESS_EXITED | StopReason.ERROR:
+        case (
+            StopReason.HEALTH_TIMEOUT
+            | StopReason.REMOTE_PROCESS_EXITED
+            | StopReason.TUNNEL_FAILED
+            | StopReason.ERROR
+        ):
             return 1
         case _:
             assert_never(stop_reason)
@@ -163,20 +204,21 @@ _MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9_./:-]{1,200}$")
 _GGUF_MODEL_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(:[A-Za-z0-9_.-]+)?$")
 
 
-def validate_session_name(name: str) -> str:
-    if not name or not _SESSION_RE.fullmatch(name):
+def validate_session_name(name: str) -> SessionName:
+    """The one way a string becomes a `SessionName`."""
+    if not _SESSION_RE.fullmatch(name):
         raise ValueError(
             f"Invalid session name {name!r}: must match {_SESSION_RE.pattern}"
         )
-    return name
+    return SessionName(name)
 
 
-def validate_gpu(gpu: str) -> str:
-    upper = gpu.strip().upper()
-    if upper not in ALLOWED_GPUS:
-        allowed = ", ".join(ALLOWED_GPUS)
-        raise ValueError(f"Unsupported GPU {gpu!r}: allowed values are {allowed}")
-    return upper
+def parse_gpu(text: str) -> Gpu:
+    try:
+        return Gpu(text.strip().upper())
+    except ValueError:
+        allowed = ", ".join(Gpu)
+        raise ValueError(f"Unsupported GPU {text!r}: allowed values are {allowed}") from None
 
 
 def validate_loopback_host(host: str) -> str:
@@ -407,7 +449,7 @@ def build_engine_config(
     model: str | None = None,
     hf_repo: str | None = None,
     hf_revision: str | None = None,
-    draft: str | None = None,
+    draft: Draft | None = None,
     parallel: int | None = None,
     no_vision: bool = False,
     web_ui: bool = False,
@@ -415,7 +457,8 @@ def build_engine_config(
     """Parse the engine flags of `start` into the one variant they describe.
 
     `None` and `False` mean the flag was not given. A flag the chosen engine
-    does not have is rejected by name instead of being dropped.
+    does not have is rejected by name instead of being dropped. An empty string
+    is a given value, and an invalid one: it never selects a default.
     """
 
     def reject(**flags: object) -> None:
@@ -426,6 +469,8 @@ def build_engine_config(
 
     if model is not None and hf_repo is not None:
         raise ValueError("--model and --hf-repo both name the model to serve: pass only one")
+    # At most one of the two is given; for every engine but Maya they are synonyms.
+    named = model if model is not None else hf_repo
 
     match engine:
         case Engine.MAYA:
@@ -438,23 +483,23 @@ def build_engine_config(
                 maya_model = model
             return MayaConfig(
                 model=maya_model,
-                draft=Draft(draft) if draft is not None else DEFAULT_MAYA_DRAFT,
+                draft=draft if draft is not None else DEFAULT_MAYA_DRAFT,
                 parallel=parallel if parallel is not None else DEFAULT_PARALLEL,
                 vision=not no_vision,
                 web_ui=web_ui,
             )
         case Engine.VLLM:
             reject(draft=draft, parallel=parallel, no_vision=no_vision, web_ui=web_ui)
-            repo = model or hf_repo or DEFAULT_ENGINE_MODELS[engine]
+            repo = named if named is not None else DEFAULT_ENGINE_MODELS[engine]
             return VllmConfig(model=HfModel(repo, hf_revision))
         case Engine.SGLANG:
             reject(draft=draft, parallel=parallel, no_vision=no_vision, web_ui=web_ui)
-            repo = model or hf_repo or DEFAULT_ENGINE_MODELS[engine]
+            repo = named if named is not None else DEFAULT_ENGINE_MODELS[engine]
             return SglangConfig(model=HfModel(repo, hf_revision))
         case Engine.LLAMA_CPP:
             reject(hf_revision=hf_revision, draft=draft, no_vision=no_vision, web_ui=web_ui)
             return LlamaCppConfig(
-                model=model or hf_repo or DEFAULT_ENGINE_MODELS[engine],
+                model=named if named is not None else DEFAULT_ENGINE_MODELS[engine],
                 parallel=parallel if parallel is not None else DEFAULT_PARALLEL,
             )
         case _:
@@ -471,11 +516,15 @@ class Attach:
 
     endpoint: str | None = None
 
+    def __post_init__(self) -> None:
+        if self.endpoint is not None and not self.endpoint.strip():
+            raise ValueError("--attach was given an empty endpoint")
+
 
 @dataclass(frozen=True)
 class LaunchConfig:
-    session: str = DEFAULT_SESSION
-    gpu: str = DEFAULT_GPU
+    session: SessionName = DEFAULT_SESSION
+    gpu: Gpu = DEFAULT_GPU
     high_mem: bool = False
     engine: EngineConfig = field(default_factory=MayaConfig)
     context_length: int = DEFAULT_CONTEXT_LENGTH
@@ -494,8 +543,6 @@ class LaunchConfig:
     hf_token_file: Path | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "session", validate_session_name(self.session))
-        object.__setattr__(self, "gpu", validate_gpu(self.gpu))
         object.__setattr__(self, "bind_host", validate_loopback_host(self.bind_host))
         validate_port(self.local_port, "local_port")
         validate_port(self.remote_port, "remote_port")

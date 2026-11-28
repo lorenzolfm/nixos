@@ -12,7 +12,7 @@ import socket
 import stat
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,17 +20,18 @@ from typing import Any, assert_never
 
 from colab_llm import __version__
 from colab_llm.colab import (
+    Adopt,
     ColabClient,
     ColabError,
+    Create,
+    Reuse,
+    SessionPlan,
     UsageSnapshot,
     find_colab_bin,
     render_ssh_config_block,
     resolve_ssh_identity,
 )
 from colab_llm.config import (
-    ALLOWED_ENGINES,
-    ALLOWED_GPUS,
-    ALLOWED_MAYA_DRAFTS,
     DEFAULT_BIND_HOST,
     DEFAULT_BOOTSTRAP_TIMEOUT_S,
     DEFAULT_CONTEXT_LENGTH,
@@ -45,27 +46,33 @@ from colab_llm.config import (
     DEFAULT_SESSION,
     SIGNAL_STOP_REASONS,
     Attach,
+    Draft,
     Engine,
+    Gpu,
     LaunchConfig,
+    SessionName,
     StopReason,
     build_engine_config,
     exit_code_for,
     format_duration,
+    is_failed_start,
     parse_duration,
+    parse_gpu,
     resolve_hf_token,
     state_dir,
     validate_session_name,
 )
 from colab_llm.engines import get_engine, list_engines, support_script_paths
 from colab_llm.proxy import (
+    Healthy,
     bind_loopback_listener,
     probe_http_health,
     run_supervised_session,
 )
 from colab_llm.state import (
-    LEDGER_VERSION,
     Allocating,
     Bootstrapping,
+    LedgerRecord,
     Ready,
     RunInfo,
     SessionBusyError,
@@ -74,14 +81,16 @@ from colab_llm.state import (
     StateWriter,
     Stopped,
     Stopping,
+    Supervised,
     Traffic,
+    Unsupervised,
     WaitingHealth,
     acquire_session_lock,
-    append_jsonl,
+    append_ledger,
     ledger_path,
-    live_supervisor_pid,
     phase_name,
-    read_jsonl_tail,
+    probe_supervisor,
+    read_ledger_tail,
     read_session_state,
     session_state_path,
     state_to_json,
@@ -129,8 +138,7 @@ def _control_socket_dir() -> Path:
     return socket_dir
 
 
-def _control_socket_path(session: str) -> Path:
-    validate_session_name(session)
+def _control_socket_path(session: SessionName) -> Path:
     path = _control_socket_dir() / f"{session}.sock"
     if len(os.fsencode(path)) > SOCKET_PATH_BYTES_MAX:
         raise ColabError(f"Control socket path is too long for a Unix socket: {path}")
@@ -252,7 +260,9 @@ def _raise_terminated(signum: int, _frame: object) -> None:
     raise _Terminated(SIGNAL_STOP_REASONS[signal.Signals(signum)])
 
 
-def _teardown_runtime(client: ColabClient, session: str, stop_reason: StopReason) -> bool:
+def _teardown_runtime(
+    client: ColabClient, session: SessionName, stop_reason: StopReason
+) -> bool:
     """Stop the billable runtime. Returns whether the stop was verified.
 
     Signals are ignored for the duration: the child `colab stop` shares our
@@ -304,31 +314,24 @@ def _record_session_end(
     usage_after = _try_get_usage(client)
     elapsed_s = round(time.monotonic() - started_mono, 1)
     assert elapsed_s >= 0
-    cu_delta = (
-        round(usage_before.balance_cu - usage_after.balance_cu, 3)
-        if usage_before is not None and usage_after is not None
-        else None
+    record = LedgerRecord(
+        session=config.session,
+        gpu=config.gpu,
+        engine=config.engine.kind,
+        model=config.engine.served_model,
+        started_at=started_wall.isoformat(),
+        ended_at=datetime.now(UTC).isoformat(),
+        duration_s=elapsed_s,
+        connections=connections_total,
+        stop_reason=stop_reason,
+        runtime_stopped=runtime_stopped,
+        cu_before=usage_before.balance_cu if usage_before else None,
+        cu_after=usage_after.balance_cu if usage_after else None,
     )
-    # `cu_delta` is not stored: it is the difference of the two balances below,
-    # and `usage` computes it when it reads the record.
-    record: dict[str, Any] = {
-        "version": LEDGER_VERSION,
-        "session": config.session,
-        "gpu": config.gpu,
-        "engine": config.engine.kind.value,
-        "model": config.engine.served_model,
-        "started_at": started_wall.isoformat(),
-        "ended_at": datetime.now(UTC).isoformat(),
-        "duration_s": elapsed_s,
-        "connections": connections_total,
-        "stop_reason": stop_reason.value,
-        "runtime_stopped": runtime_stopped,
-        "cu_before": usage_before.balance_cu if usage_before else None,
-        "cu_after": usage_after.balance_cu if usage_after else None,
-    }
-    append_jsonl(ledger_path(), record)
+    append_ledger(ledger_path(), record)
     if usage_after is not None:
-        delta_str = f" (burned ~{cu_delta:.2f} CU)" if cu_delta is not None else ""
+        burned = record.cu_burned
+        delta_str = f" (burned ~{burned:.2f} CU)" if burned is not None else ""
         _say(
             f"[colab-llm] Session ended after {format_duration(elapsed_s)}. "
             f"Remaining balance: {usage_after.balance_cu:.2f} CU{delta_str}."
@@ -341,7 +344,7 @@ def _cmd_start(args: argparse.Namespace) -> int:
         gpu=args.gpu,
         high_mem=args.high_mem,
         engine=build_engine_config(
-            Engine(args.engine),
+            args.engine,
             model=args.model,
             hf_repo=args.hf_repo,
             hf_revision=args.hf_revision,
@@ -354,16 +357,16 @@ def _cmd_start(args: argparse.Namespace) -> int:
         bind_host=args.host,
         local_port=args.port,
         remote_port=args.remote_port,
-        idle_timeout_s=parse_duration(args.idle_timeout),
-        max_duration_s=parse_duration(args.max_duration),
-        bootstrap_timeout_s=parse_duration(args.bootstrap_timeout),
+        idle_timeout_s=args.idle_timeout,
+        max_duration_s=args.max_duration,
+        bootstrap_timeout_s=args.bootstrap_timeout,
         fast_hf=not args.no_fast_hf,
         rm_on_disconnect=args.rm_on_disconnect,
         reconfigure=args.reconfigure,
         attach=args.attach,
-        identity=Path(args.identity) if args.identity else None,
-        colab_config=Path(args.colab_config) if args.colab_config else None,
-        hf_token_file=Path(args.hf_token_file) if args.hf_token_file else None,
+        identity=args.identity,
+        colab_config=args.colab_config,
+        hf_token_file=args.hf_token_file,
     )
 
     # Everything that can fail locally is resolved here, before a billable GPU
@@ -398,6 +401,18 @@ def _cmd_start(args: argparse.Namespace) -> int:
             listener.close()
     finally:
         lock.release()
+
+
+def _plan_action(plan: SessionPlan) -> str:
+    match plan:
+        case Create():
+            return "Allocated new"
+        case Adopt():
+            return "Attached to existing"
+        case Reuse():
+            return "Reusing existing"
+        case _:
+            assert_never(plan)
 
 
 def _run_session(
@@ -440,28 +455,26 @@ def _run_session(
     for sig in _TERMINATION_SIGNALS:
         signal.signal(sig, _raise_terminated)
 
-    started_wall = datetime.now(UTC)
-    started_mono = time.monotonic()
-    state.write(Allocating())
-    # `ensure_session` stops whatever it allocated if it fails part-way.
-    info, created = client.ensure_session(
+    # Read-only: a refusal here (a session on other hardware, nothing to attach
+    # to) ends the run before anything billable was touched or taken over.
+    plan = client.plan_session(
         session=config.session,
         gpu=config.gpu,
         high_mem=config.high_mem,
         attach=config.attach,
     )
 
+    started_wall = datetime.now(UTC)
+    started_mono = time.monotonic()
     stop_reason = StopReason.ERROR
-    was_ready = False
     connections_total = 0
+    state.write(Allocating())
+    # From the first statement of this `try` a billable runtime may exist, and
+    # the `finally` is the only way out: no step sits between the two.
     try:
-        action = (
-            "Allocated new"
-            if created
-            else ("Attached to existing" if config.attach is not None else "Reusing existing")
-        )
+        info = client.realise_session(config.session, plan)
         print(
-            f"[colab-llm] {action} session [{info.name}] ({info.endpoint}) "
+            f"[colab-llm] {_plan_action(plan)} session [{info.name}] ({info.endpoint}) "
             f"Hardware={info.hardware} Shape={info.shape}"
         )
         state.write(Bootstrapping())
@@ -506,9 +519,8 @@ def _run_session(
             )
         )
         stop_reason = outcome.stop_reason
-        was_ready = outcome.was_ready
         connections_total = outcome.total_connections
-        if not was_ready and exit_code_for(stop_reason, was_ready=False) != 0:
+        if is_failed_start(stop_reason):
             print(
                 f"[colab-llm] Engine did not reach ready state ({stop_reason}). "
                 "Last 40 lines of remote server.log:",
@@ -551,13 +563,34 @@ def _run_session(
             _say(f"[colab-llm] Warning: could not record session in ledger: {exc}", error=True)
     if not runtime_stopped:
         return 1
-    return exit_code_for(stop_reason, was_ready=was_ready)
+    return exit_code_for(stop_reason)
 
 
-def _stop_local_supervisor(session: str) -> None:
+def _signallable_supervisor_pid(session: SessionName) -> int | None:
+    """PID of the live supervisor, None if there is none to signal.
+
+    Bounded: a supervisor that holds the lock writes its PID right after, so
+    one that still has none after the last poll is reported and left alone.
+    """
+    for _ in range(SUPERVISOR_STOP_POLLS_MAX):
+        supervision = probe_supervisor(session)
+        if isinstance(supervision, Unsupervised):
+            return None
+        if supervision.pid is not None:
+            return supervision.pid
+        time.sleep(SUPERVISOR_STOP_POLL_S)
+    print(
+        f"[colab-llm] Warning: the supervisor of {session!r} never recorded its PID; "
+        "it was not signalled.",
+        file=sys.stderr,
+    )
+    return None
+
+
+def _stop_local_supervisor(session: SessionName) -> None:
     # Liveness comes from the session lock, so a stale or recycled PID is never
     # signalled: a dead supervisor holds no lock.
-    pid = live_supervisor_pid(session)
+    pid = _signallable_supervisor_pid(session)
     if pid is None:
         return
     try:
@@ -570,7 +603,7 @@ def _stop_local_supervisor(session: str) -> None:
     # Give the supervisor a moment to close its SSH tunnel cleanly.
     for _ in range(SUPERVISOR_STOP_POLLS_MAX):
         time.sleep(SUPERVISOR_STOP_POLL_S)
-        if live_supervisor_pid(session) is None:
+        if isinstance(probe_supervisor(session), Unsupervised):
             return
     print(
         f"[colab-llm] Warning: local supervisor pid {pid} is still running after "
@@ -580,21 +613,23 @@ def _stop_local_supervisor(session: str) -> None:
     )
 
 
-def _try_stop_local_supervisor(session: str) -> None:
-    """Best effort: nothing on the local side may prevent the Colab stop."""
+def _try_stop_local_supervisor(lock_stem: str) -> None:
+    """Best effort: nothing on the local side may prevent the Colab stop.
+
+    Takes a raw file stem: a stray `*.lock` that is not a session name is
+    reported here instead of aborting the stop.
+    """
     try:
-        _stop_local_supervisor(session)
+        _stop_local_supervisor(validate_session_name(lock_stem))
     except (ValueError, OSError) as exc:
         print(
-            f"[colab-llm] Warning: could not stop local supervisor of {session!r}: {exc}",
+            f"[colab-llm] Warning: could not stop local supervisor of {lock_stem!r}: {exc}",
             file=sys.stderr,
         )
 
 
 def _cmd_stop(args: argparse.Namespace) -> int:
-    client = ColabClient(
-        colab_config=Path(args.colab_config) if args.colab_config else None
-    )
+    client = ColabClient(colab_config=args.colab_config)
     if args.all:
         for lock_file in state_dir().glob("*.lock"):
             _try_stop_local_supervisor(lock_file.stem)
@@ -602,7 +637,7 @@ def _cmd_stop(args: argparse.Namespace) -> int:
         print("[colab-llm] Stopped all active Colab sessions.")
         return 0
 
-    session = validate_session_name(args.session or DEFAULT_SESSION)
+    session: SessionName = args.session
     _try_stop_local_supervisor(session)
     # Same stop as `start` uses on exit: issued unconditionally, then verified.
     client.teardown_session(session)
@@ -637,56 +672,80 @@ def _describe_live_state(state: SessionState, *, healthy: bool) -> str:
             assert_never(phase)
 
 
-def _describe_last_state(state: SessionState) -> str:
+def _describe_last_state(state: SessionState, *, runtime_listed: bool) -> str:
+    """What the last, now dead, supervisor left behind.
+
+    Whether the runtime is still there is Colab's fact, not the state file's:
+    `runtime_listed` is read from the live listing, so a stop made afterwards
+    (by `colab-llm stop`, the remote deadman, or Colab itself) ends the warning.
+    """
     phase = state.phase
+    stop_hint = f"Run: colab-llm stop -s {state.run.session}"
     match phase:
         case Stopped(stop_reason=stop_reason, runtime_stopped=True):
-            return f"last run ended ({stop_reason.value}); runtime stop verified"
+            ended = f"last run ended ({stop_reason.value}); runtime stop verified"
+            if runtime_listed:
+                return (
+                    f"WARNING: {ended}, but a session with this name is listed on "
+                    f"Colab again and nothing supervises it. {stop_hint}"
+                )
+            return ended
         case Stopped(stop_reason=stop_reason):
-            return (
-                f"WARNING: last run ended ({stop_reason.value}) but the runtime stop was "
-                f"NOT verified; it may still be billing. Run: colab-llm stop -s {state.run.session}"
-            )
+            ended = f"last run ended ({stop_reason.value}) without a verified runtime stop"
+            if runtime_listed:
+                return f"WARNING: {ended}, and the session is still listed on Colab. {stop_hint}"
+            return f"{ended}; the session is no longer listed on Colab"
         case Allocating() | Bootstrapping() | WaitingHealth() | Ready() | Stopping():
-            return (
-                f"WARNING: last supervisor (pid {state.run.pid}) died in phase "
-                f"{phase_name(phase)} without confirming a stop; check the sessions above. "
-                f"Run: colab-llm stop -s {state.run.session}"
+            died = (
+                f"last supervisor (pid {state.run.pid}) died in phase "
+                f"{phase_name(phase)} without confirming a stop"
             )
+            if runtime_listed:
+                return f"WARNING: {died}, and the session is still listed on Colab. {stop_hint}"
+            return f"{died}; the session is no longer listed on Colab"
         case _:
             assert_never(phase)
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    validate_session_name(args.session)
-    client = ColabClient(
-        colab_config=Path(args.colab_config) if args.colab_config else None
-    )
+    session: SessionName = args.session
+    client = ColabClient(colab_config=args.colab_config)
     sessions = client.list_sessions()
+    runtime_listed = any(s.name == session for s in sessions)
     usage = _try_get_usage(client)
 
     state_error: str | None = None
     local_state: SessionState | None = None
     try:
-        local_state = read_session_state(args.session)
+        local_state = read_session_state(session)
     except StateError as exc:
         state_error = str(exc)
 
-    supervisor_pid = live_supervisor_pid(args.session)
+    supervision = probe_supervisor(session)
     # A state file written by an earlier supervisor says nothing about this one.
-    live_state = (
-        local_state
-        if local_state is not None and local_state.run.pid == supervisor_pid
-        else None
-    )
+    live_state: SessionState | None = None
+    supervisor_pid: int | None = None
+    match supervision:
+        case Unsupervised():
+            pass
+        case Supervised(pid=pid):
+            supervisor_pid = pid
+            if local_state is not None and local_state.run.pid == pid:
+                live_state = local_state
+        case _:
+            assert_never(supervision)
+
     local_healthy = False
     if live_state is not None:
         match live_state.phase:
             case WaitingHealth(traffic=traffic) | Ready(traffic=traffic):
-                local_healthy, _ = probe_http_health(
-                    port=traffic.tunnel_port,
-                    health_path=get_engine(live_state.run.engine).health_path,
-                    timeout_s=2.0,
+                local_healthy = isinstance(
+                    probe_http_health(
+                        port=traffic.tunnel_port,
+                        health_path=get_engine(live_state.run.engine).health_path,
+                        timeout_s=2.0,
+                    ),
+                    Healthy,
                 )
             case _:
                 pass
@@ -695,12 +754,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(
             json.dumps(
                 {
-                    "session": args.session,
-                    "local_supervisor_alive": supervisor_pid is not None,
+                    "session": session,
+                    "local_supervisor_alive": isinstance(supervision, Supervised),
                     "local_supervisor_pid": supervisor_pid,
                     "local_endpoint_healthy": local_healthy,
                     "local_state": state_to_json(local_state) if local_state else None,
                     "local_state_error": state_error,
+                    "runtime_listed": runtime_listed,
                     "remote_sessions": [asdict(s) for s in sessions],
                     "usage": asdict(usage) if usage else None,
                 },
@@ -723,60 +783,53 @@ def _cmd_status(args: argparse.Namespace) -> int:
             f"| active: {usage.active_assignments}"
         )
 
-    label = f"Local supervisor [{args.session}]"
+    label = f"Local supervisor [{session}]"
     if state_error is not None:
         print(f"{label}: state file unreadable: {state_error}", file=sys.stderr)
-    if supervisor_pid is None:
-        print(f"{label}: not running")
-        if local_state is not None:
-            print(f"  {_describe_last_state(local_state)}")
-    elif live_state is None:
-        print(f"{label}: pid={supervisor_pid} running; it has not recorded a state yet")
-    else:
-        print(f"{label}: {_describe_live_state(live_state, healthy=local_healthy)}")
+    match supervision:
+        case Unsupervised():
+            print(f"{label}: not running")
+            if local_state is not None:
+                print(f"  {_describe_last_state(local_state, runtime_listed=runtime_listed)}")
+        case Supervised() if live_state is not None:
+            print(f"{label}: {_describe_live_state(live_state, healthy=local_healthy)}")
+        case Supervised(pid=None):
+            print(f"{label}: starting; it has not recorded its PID yet")
+        case Supervised(pid=pid):
+            print(f"{label}: pid={pid} running; it has not recorded a state yet")
+        case _:
+            assert_never(supervision)
     return 0
 
 
 def _cmd_usage(args: argparse.Namespace) -> int:
-    if args.history < 0:
-        raise ValueError(f"--history must be 0 or greater, got {args.history}")
-    client = ColabClient(
-        colab_config=Path(args.colab_config) if args.colab_config else None
-    )
+    client = ColabClient(colab_config=args.colab_config)
     usage = client.get_usage()
     print(f"Current balance:    {usage.balance_cu:.2f} CU")
     print(f"Usage rate:         {usage.rate_cu_per_hour:.2f} CU/hr")
     print(f"Active assignments: {usage.active_assignments}")
 
-    history = read_jsonl_tail(ledger_path(), limit=args.history)
+    history = read_ledger_tail(ledger_path(), limit=args.history)
     if history:
         print(f"\nRecent sessions ({len(history)}):")
         for rec in history:
-            duration = format_duration(float(rec.get("duration_s", 0)))
-            before, after = rec.get("cu_before"), rec.get("cu_after")
-            delta_text = (
-                f"{before - after:.2f} CU"
-                if isinstance(before, (int, float)) and isinstance(after, (int, float))
-                else "n/a"
-            )
+            burned = rec.cu_burned
+            delta_text = f"{burned:.2f} CU" if burned is not None else "n/a"
+            unverified = "" if rec.runtime_stopped else "  STOP NOT VERIFIED"
             print(
-                f"  {rec.get('started_at', '?')}  [{rec.get('session')}]  "
-                f"{rec.get('gpu')}  {rec.get('engine')}:{rec.get('model')}  "
-                f"dur={duration}  cu={delta_text}  reason={rec.get('stop_reason')}"
+                f"  {rec.started_at}  [{rec.session}]  "
+                f"{rec.gpu.value}  {rec.engine.value}:{rec.model}  "
+                f"dur={format_duration(rec.duration_s)}  cu={delta_text}  "
+                f"reason={rec.stop_reason.value}{unverified}"
             )
     return 0
 
 
 def _cmd_logs(args: argparse.Namespace) -> int:
-    validate_session_name(args.session)
-    if args.lines < 1:
-        raise ValueError(f"--lines must be 1 or greater, got {args.lines}")
-    identity = resolve_ssh_identity(Path(args.identity) if args.identity else None)
-    client = ColabClient(
-        colab_config=Path(args.colab_config) if args.colab_config else None
-    )
+    identity = resolve_ssh_identity(args.identity)
+    client = ColabClient(colab_config=args.colab_config)
     control_path = _control_socket_path(args.session)
-    line_count = int(args.lines)
+    line_count: int = args.lines
     tail_cmd = (
         f"tail -n {line_count} -f {REMOTE_WORK_DIR}/server.log"
         if args.follow
@@ -791,11 +844,8 @@ def _cmd_logs(args: argparse.Namespace) -> int:
 
 
 def _cmd_ssh(args: argparse.Namespace) -> int:
-    validate_session_name(args.session)
-    identity = resolve_ssh_identity(Path(args.identity) if args.identity else None)
-    client = ColabClient(
-        colab_config=Path(args.colab_config) if args.colab_config else None
-    )
+    identity = resolve_ssh_identity(args.identity)
+    client = ColabClient(colab_config=args.colab_config)
     control_path = _control_socket_path(args.session)
     cmd = list(args.cmd) if args.cmd else None
     if cmd and cmd[0] == "--":
@@ -809,8 +859,8 @@ def _cmd_ssh(args: argparse.Namespace) -> int:
 
 
 def _cmd_ssh_config(args: argparse.Namespace) -> int:
-    identity = Path(args.identity).expanduser() if args.identity else None
-    colab_bin = args.colab_bin or find_colab_bin()
+    identity: Path | None = args.identity.expanduser() if args.identity is not None else None
+    colab_bin: str = args.colab_bin if args.colab_bin is not None else find_colab_bin()
     block = render_ssh_config_block(
         colab_bin=colab_bin,
         session=args.session,
@@ -818,7 +868,7 @@ def _cmd_ssh_config(args: argparse.Namespace) -> int:
         remote_port=args.remote_port,
         identity=identity,
         rm_on_disconnect=args.rm,
-        colab_config=Path(args.colab_config) if args.colab_config else None,
+        colab_config=args.colab_config,
     )
     sys.stdout.write(block)
     return 0
@@ -829,6 +879,49 @@ def _cmd_engines(_args: argparse.Namespace) -> int:
         print(f"{engine.name:10s}  default={engine.default_model}")
         print(f"            {engine.description}")
     return 0
+
+
+# Every command-line value is parsed here, once, into the type the rest of the
+# program takes. An empty string is a value that fails to parse; it is never
+# read as "not given", so it can never select a default.
+
+
+def _arg[T](parse: Callable[[str], T]) -> Callable[[str], T]:
+    """Adapt a parser that raises ValueError so argparse reports its message."""
+
+    def parsed(text: str) -> T:
+        try:
+            return parse(text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    return parsed
+
+
+def _non_empty(text: str) -> str:
+    if not text.strip():
+        raise ValueError("the value is empty")
+    return text
+
+
+def _path(text: str) -> Path:
+    return Path(_non_empty(text))
+
+
+def _int_at_least(minimum: int) -> Callable[[str], int]:
+    def parse(text: str) -> int:
+        value = int(text)
+        if value < minimum:
+            raise ValueError(f"must be {minimum} or greater, got {value}")
+        return value
+
+    return _arg(parse)
+
+
+_session_arg = _arg(validate_session_name)
+_path_arg = _arg(_path)
+_text_arg = _arg(_non_empty)
+_duration_arg = _arg(parse_duration)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -845,14 +938,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     # start
     p_start = sub.add_parser("start", help="Allocate Colab GPU, bootstrap engine, tunnel locally")
-    p_start.add_argument("-s", "--session", default=DEFAULT_SESSION, help=f"Colab session name (default: {DEFAULT_SESSION})")
-    p_start.add_argument("--gpu", default=DEFAULT_GPU, choices=ALLOWED_GPUS, help=f"Colab GPU tier (default: {DEFAULT_GPU})")
+    p_start.add_argument("-s", "--session", type=_session_arg, default=DEFAULT_SESSION, help=f"Colab session name (default: {DEFAULT_SESSION})")
+    p_start.add_argument("--gpu", type=_arg(parse_gpu), default=DEFAULT_GPU, choices=tuple(Gpu), help=f"Colab GPU tier (default: {DEFAULT_GPU})")
     p_start.add_argument("--high-mem", action="store_true", help="Request the high-RAM shape (not available on single-shape GPUs: G4, L4)")
-    p_start.add_argument("--engine", default=DEFAULT_ENGINE, choices=ALLOWED_ENGINES, help=f"Inference engine (default: {DEFAULT_ENGINE})")
-    p_start.add_argument("--model", default=None, help="Model to serve: a Maya quant name, owner/repo, or owner/repo:quant for llama-cpp (default: per engine, see `colab-llm engines`)")
-    p_start.add_argument("--hf-repo", default=None, help="Hugging Face repo (owner/repo) to serve instead of --model; for maya, a custom EXL3 repo")
-    p_start.add_argument("--hf-revision", default=None, help="Branch/tag/commit of the served repo; not for llama-cpp")
-    p_start.add_argument("--draft", default=None, choices=ALLOWED_MAYA_DRAFTS, help=f"Maya drafting mode; maya only (default: {DEFAULT_MAYA_DRAFT})")
+    p_start.add_argument("--engine", type=Engine, default=DEFAULT_ENGINE, choices=tuple(Engine), help=f"Inference engine (default: {DEFAULT_ENGINE})")
+    p_start.add_argument("--model", type=_text_arg, default=None, help="Model to serve: a Maya quant name, owner/repo, or owner/repo:quant for llama-cpp (default: per engine, see `colab-llm engines`)")
+    p_start.add_argument("--hf-repo", type=_text_arg, default=None, help="Hugging Face repo (owner/repo) to serve instead of --model; for maya, a custom EXL3 repo")
+    p_start.add_argument("--hf-revision", type=_text_arg, default=None, help="Branch/tag/commit of the served repo; not for llama-cpp")
+    p_start.add_argument("--draft", type=Draft, default=None, choices=tuple(Draft), help=f"Maya drafting mode; maya only (default: {DEFAULT_MAYA_DRAFT})")
     p_start.add_argument("--context", type=int, default=DEFAULT_CONTEXT_LENGTH, help=f"Context length in tokens (default: {DEFAULT_CONTEXT_LENGTH})")
     p_start.add_argument("--parallel", type=int, default=None, help=f"Concurrent request slots; maya and llama-cpp only (default: {DEFAULT_PARALLEL})")
     p_start.add_argument("--no-vision", action="store_true", help="Disable Maya image encoder build & download; maya only")
@@ -860,12 +953,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--host", default=DEFAULT_BIND_HOST, help=f"Local loopback bind address (default: {DEFAULT_BIND_HOST})")
     p_start.add_argument("--port", type=int, default=DEFAULT_LOCAL_PORT, help=f"Local loopback port (default: {DEFAULT_LOCAL_PORT})")
     p_start.add_argument("--remote-port", type=int, default=DEFAULT_REMOTE_PORT, help=f"Remote loopback port on Colab VM (default: {DEFAULT_REMOTE_PORT})")
-    p_start.add_argument("--idle-timeout", default=f"{DEFAULT_IDLE_TIMEOUT_S // 60}m", help="Auto-stop after this long with no traffic through the proxy (default: 30m)")
-    p_start.add_argument("--max-duration", default=f"{DEFAULT_MAX_DURATION_S // 3600}h", help="Hard max session duration before forced teardown (default: 4h)")
-    p_start.add_argument("--bootstrap-timeout", default=f"{DEFAULT_BOOTSTRAP_TIMEOUT_S // 60}m", help="Timeout for the remote bootstrap, and again for the engine to report healthy (default: 30m)")
-    p_start.add_argument("-i", "--identity", default=None, help="SSH ed25519/ecdsa key path (default: ~/.ssh/id_ed25519)")
-    p_start.add_argument("--colab-config", default=None, help="Override google-colab-cli sessions.json path")
-    p_start.add_argument("--hf-token-file", default=None, help="File containing optional HF token (or set HF_TOKEN_FILE / HF_TOKEN)")
+    p_start.add_argument("--idle-timeout", type=_duration_arg, default=f"{DEFAULT_IDLE_TIMEOUT_S // 60}m", help="Auto-stop after this long with no traffic through the proxy (default: 30m)")
+    p_start.add_argument("--max-duration", type=_duration_arg, default=f"{DEFAULT_MAX_DURATION_S // 3600}h", help="Hard max session duration before forced teardown (default: 4h)")
+    p_start.add_argument("--bootstrap-timeout", type=_duration_arg, default=f"{DEFAULT_BOOTSTRAP_TIMEOUT_S // 60}m", help="Timeout for the remote bootstrap, and again for the engine to report healthy (default: 30m)")
+    p_start.add_argument("-i", "--identity", type=_path_arg, default=None, help="SSH ed25519/ecdsa key path (default: ~/.ssh/id_ed25519)")
+    p_start.add_argument("--colab-config", type=_path_arg, default=None, help="Override google-colab-cli sessions.json path")
+    p_start.add_argument("--hf-token-file", type=_path_arg, default=None, help="File containing optional HF token (or set HF_TOKEN_FILE / HF_TOKEN)")
     p_start.add_argument("--no-fast-hf", action="store_true", help="Disable fast Hugging Face Xet prefetch before Maya setup")
     p_start.add_argument("--rm-on-disconnect", action="store_true", help="Pass --rm to `colab ssh --proxy-mode` (tears down on any SSH drop)")
     p_start.add_argument("--reconfigure", action="store_true", help="Force re-running engine bootstrap even if server is already listening")
@@ -873,7 +966,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--attach",
         nargs="?",
         const=Attach(),
-        type=Attach,
+        type=_arg(Attach),
         default=None,
         metavar="ENDPOINT",
         help="Attach to an existing unnamed Colab runtime (e.g. allocated in the Web UI when CLI /tun/m/assign returns 503)",
@@ -883,50 +976,50 @@ def build_parser() -> argparse.ArgumentParser:
     # stop
     p_stop = sub.add_parser("stop", help="Stop Colab session and local tunnel")
     stop_target = p_stop.add_mutually_exclusive_group()
-    stop_target.add_argument("-s", "--session", default=None, help=f"Colab session name (default: {DEFAULT_SESSION})")
+    stop_target.add_argument("-s", "--session", type=_session_arg, default=DEFAULT_SESSION, help=f"Colab session name (default: {DEFAULT_SESSION})")
     stop_target.add_argument("--all", action="store_true", help="Stop all active Colab sessions")
-    p_stop.add_argument("--colab-config", default=None, help="Override google-colab-cli sessions.json path")
+    p_stop.add_argument("--colab-config", type=_path_arg, default=None, help="Override google-colab-cli sessions.json path")
     p_stop.set_defaults(handler=_cmd_stop)
 
     # status
     p_status = sub.add_parser("status", help="Show active Colab sessions, CU balance, and local watchdog status")
-    p_status.add_argument("-s", "--session", default=DEFAULT_SESSION, help=f"Session name (default: {DEFAULT_SESSION})")
+    p_status.add_argument("-s", "--session", type=_session_arg, default=DEFAULT_SESSION, help=f"Session name (default: {DEFAULT_SESSION})")
     p_status.add_argument("--json", action="store_true", help="Output machine-readable JSON")
-    p_status.add_argument("--colab-config", default=None, help="Override google-colab-cli sessions.json path")
+    p_status.add_argument("--colab-config", type=_path_arg, default=None, help="Override google-colab-cli sessions.json path")
     p_status.set_defaults(handler=_cmd_status)
 
     # usage
     p_usage = sub.add_parser("usage", help="Show live Colab Compute Unit balance/rate and local session ledger")
-    p_usage.add_argument("--history", type=int, default=10, help="Number of recent local sessions to display")
-    p_usage.add_argument("--colab-config", default=None, help="Override google-colab-cli sessions.json path")
+    p_usage.add_argument("--history", type=_int_at_least(0), default=10, help="Number of recent local sessions to display")
+    p_usage.add_argument("--colab-config", type=_path_arg, default=None, help="Override google-colab-cli sessions.json path")
     p_usage.set_defaults(handler=_cmd_usage)
 
     # logs
     p_logs = sub.add_parser("logs", help="View or tail remote inference engine logs")
-    p_logs.add_argument("-s", "--session", default=DEFAULT_SESSION, help=f"Session name (default: {DEFAULT_SESSION})")
-    p_logs.add_argument("-n", "--lines", type=int, default=80, help="Number of log lines")
+    p_logs.add_argument("-s", "--session", type=_session_arg, default=DEFAULT_SESSION, help=f"Session name (default: {DEFAULT_SESSION})")
+    p_logs.add_argument("-n", "--lines", type=_int_at_least(1), default=80, help="Number of log lines")
     p_logs.add_argument("-f", "--follow", action="store_true", help="Follow log output")
-    p_logs.add_argument("-i", "--identity", default=None, help="SSH ed25519/ecdsa key path")
-    p_logs.add_argument("--colab-config", default=None, help="Override google-colab-cli sessions.json path")
+    p_logs.add_argument("-i", "--identity", type=_path_arg, default=None, help="SSH ed25519/ecdsa key path")
+    p_logs.add_argument("--colab-config", type=_path_arg, default=None, help="Override google-colab-cli sessions.json path")
     p_logs.set_defaults(handler=_cmd_logs)
 
     # ssh
     p_ssh = sub.add_parser("ssh", help="Open SSH shell or run a command on the Colab session")
-    p_ssh.add_argument("-s", "--session", default=DEFAULT_SESSION, help=f"Session name (default: {DEFAULT_SESSION})")
-    p_ssh.add_argument("-i", "--identity", default=None, help="SSH ed25519/ecdsa key path")
-    p_ssh.add_argument("--colab-config", default=None, help="Override google-colab-cli sessions.json path")
+    p_ssh.add_argument("-s", "--session", type=_session_arg, default=DEFAULT_SESSION, help=f"Session name (default: {DEFAULT_SESSION})")
+    p_ssh.add_argument("-i", "--identity", type=_path_arg, default=None, help="SSH ed25519/ecdsa key path")
+    p_ssh.add_argument("--colab-config", type=_path_arg, default=None, help="Override google-colab-cli sessions.json path")
     p_ssh.add_argument("cmd", nargs=argparse.REMAINDER, help="Optional remote command")
     p_ssh.set_defaults(handler=_cmd_ssh)
 
     # ssh-config
     p_ssh_config = sub.add_parser("ssh-config", help="Print an auditable ~/.ssh/config snippet for Colab ProxyCommand")
-    p_ssh_config.add_argument("-s", "--session", default=DEFAULT_SESSION, help=f"Session name (default: {DEFAULT_SESSION})")
+    p_ssh_config.add_argument("-s", "--session", type=_session_arg, default=DEFAULT_SESSION, help=f"Session name (default: {DEFAULT_SESSION})")
     p_ssh_config.add_argument("--port", type=int, default=DEFAULT_LOCAL_PORT, help=f"Local forwarded port (default: {DEFAULT_LOCAL_PORT})")
     p_ssh_config.add_argument("--remote-port", type=int, default=DEFAULT_REMOTE_PORT, help=f"Remote port (default: {DEFAULT_REMOTE_PORT})")
-    p_ssh_config.add_argument("-i", "--identity", default=None, help="SSH key path")
+    p_ssh_config.add_argument("-i", "--identity", type=_path_arg, default=None, help="SSH key path")
     p_ssh_config.add_argument("--rm", action="store_true", help="Include --rm in ProxyCommand")
-    p_ssh_config.add_argument("--colab-bin", default=None, help="Explicit path to colab binary")
-    p_ssh_config.add_argument("--colab-config", default=None, help="Override google-colab-cli sessions.json path")
+    p_ssh_config.add_argument("--colab-bin", type=_text_arg, default=None, help="Explicit path to colab binary")
+    p_ssh_config.add_argument("--colab-config", type=_path_arg, default=None, help="Override google-colab-cli sessions.json path")
     p_ssh_config.set_defaults(handler=_cmd_ssh_config)
 
     # engines

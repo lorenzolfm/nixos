@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import importlib.util
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -19,9 +21,12 @@ import pytest
 from colab_llm import cli
 from colab_llm.cli import main as cli_main
 from colab_llm.colab import (
+    Adopt,
     ColabClient,
     ColabError,
     ColabSessionInfo,
+    Create,
+    Reuse,
     build_proxy_command,
     build_ssh_tunnel_args,
     parse_sessions_output,
@@ -37,6 +42,7 @@ from colab_llm.config import (
     Attach,
     Draft,
     Engine,
+    Gpu,
     HfModel,
     LaunchConfig,
     LlamaCppConfig,
@@ -45,7 +51,9 @@ from colab_llm.config import (
     VllmConfig,
     build_engine_config,
     exit_code_for,
+    is_failed_start,
     parse_duration,
+    parse_gpu,
     resolve_hf_token,
     validate_loopback_host,
     validate_session_name,
@@ -53,25 +61,36 @@ from colab_llm.config import (
 from colab_llm.engines import engines_dir, get_engine, list_engines
 from colab_llm.proxy import (
     ActivityTrackingProxy,
+    Healthy,
+    Loading,
     TunnelSupervisor,
+    Unreachable,
     bind_loopback_listener,
     pick_free_loopback_port,
     probe_http_health,
+    run_supervised_session,
 )
 from colab_llm.state import (
     Allocating,
+    LedgerRecord,
     Ready,
     RunInfo,
     SessionBusyError,
     SessionState,
     StateError,
+    StateWriter,
     Stopped,
+    Supervised,
     Traffic,
+    Unsupervised,
     acquire_session_lock,
     append_jsonl,
-    live_supervisor_pid,
+    append_ledger,
     parse_state,
-    read_jsonl_tail,
+    probe_supervisor,
+    read_ledger_tail,
+    read_session_state,
+    session_lock_path,
     state_to_json,
     write_json_atomic,
 )
@@ -126,12 +145,13 @@ def test_timeout_invariants_enforced() -> None:
     with pytest.raises(ValueError, match="out of bounds"):
         LaunchConfig(idle_timeout_s=10)
     with pytest.raises(ValueError, match="Unsupported GPU"):
-        LaunchConfig(gpu="RTX9999")
+        parse_gpu("RTX9999")
+    assert parse_gpu(" g4 ") is Gpu.G4
     # Colab rejects the high-RAM shape on G4 after allocation was requested;
     # the flag is refused up front instead of being dropped.
     with pytest.raises(ValueError, match="--high-mem is not available on G4"):
-        LaunchConfig(gpu="G4", high_mem=True)
-    assert LaunchConfig(gpu="A100", high_mem=True).high_mem is True
+        LaunchConfig(gpu=Gpu.G4, high_mem=True)
+    assert LaunchConfig(gpu=Gpu.A100, high_mem=True).high_mem is True
 
 
 @pytest.mark.parametrize("engine", list(Engine))
@@ -152,7 +172,7 @@ def test_engine_flags_for_the_wrong_engine_are_rejected_not_dropped() -> None:
     with pytest.raises(ValueError, match="--hf-revision does not apply to --engine llama-cpp"):
         build_engine_config(Engine.LLAMA_CPP, hf_repo="owner/repo", hf_revision="main")
     with pytest.raises(ValueError, match="--draft does not apply to --engine vllm"):
-        build_engine_config(Engine.VLLM, draft="mtp")
+        build_engine_config(Engine.VLLM, draft=Draft.MTP)
     with pytest.raises(ValueError, match="--parallel does not apply to --engine sglang"):
         build_engine_config(Engine.SGLANG, parallel=2)
     with pytest.raises(ValueError, match="--no-vision does not apply to --engine llama-cpp"):
@@ -194,12 +214,18 @@ def test_config_fingerprint_follows_what_is_served_and_nothing_else() -> None:
 
 def test_exit_code_is_decided_by_the_stop_reason() -> None:
     # A tunnel that never came up used to exit 0 through a catch-all branch.
-    assert exit_code_for(StopReason.TUNNEL_DISCONNECTED, was_ready=False) == 1
-    assert exit_code_for(StopReason.TUNNEL_DISCONNECTED, was_ready=True) == 0
-    assert exit_code_for(StopReason.HEALTH_TIMEOUT, was_ready=False) == 1
-    assert exit_code_for(StopReason.IDLE_TIMEOUT, was_ready=True) == 0
-    assert exit_code_for(StopReason.SIGNAL_SIGINT, was_ready=False) == 0
-    assert exit_code_for(StopReason.ERROR, was_ready=True) == 1
+    # It is its own reason now, so no flag has to travel beside the reason.
+    assert exit_code_for(StopReason.TUNNEL_FAILED) == 1
+    assert exit_code_for(StopReason.TUNNEL_DISCONNECTED) == 0
+    assert exit_code_for(StopReason.HEALTH_TIMEOUT) == 1
+    assert exit_code_for(StopReason.IDLE_TIMEOUT) == 0
+    assert exit_code_for(StopReason.SIGNAL_SIGINT) == 0
+    assert exit_code_for(StopReason.ERROR) == 1
+    # Every failed start is a failing exit; a session that served is not one.
+    for reason in StopReason:
+        if is_failed_start(reason):
+            assert exit_code_for(reason) == 1
+    assert not is_failed_start(StopReason.TUNNEL_DISCONNECTED)
 
 
 @pytest.mark.parametrize(
@@ -312,9 +338,11 @@ def test_teardown_session_always_stops_and_verifies(monkeypatch: pytest.MonkeyPa
         client.teardown_session("colab-llm")
 
 
-def test_ensure_session_stops_runtime_when_creation_fails_part_way(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_failed_allocation_leaves_through_the_one_shielded_teardown(
+    state_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Creation used to have its own stop: one attempt, open to a second Ctrl+C.
+    # It now fails inside the `try` whose `finally` every other exit uses.
     client = ColabClient(colab_bin="/bin/true", ssh_bin="/bin/true")
     commands: list[list[str]] = []
 
@@ -326,11 +354,42 @@ def test_ensure_session_stops_runtime_when_creation_fails_part_way(
     monkeypatch.setattr(client, "_run_colab", _fake_run)
     monkeypatch.setattr(client, "list_sessions", list)
     with pytest.raises(ColabError, match="did not appear"):
-        client.ensure_session(session="colab-llm", gpu="G4")
-    assert commands == [
-        ["new", "-s", "colab-llm", "--gpu", "G4"],
-        ["stop", "-s", "colab-llm"],
-    ]
+        client.realise_session(validate_session_name("colab-llm"), Create(Gpu.G4, False))
+    assert commands == [["new", "-s", "colab-llm", "--gpu", "G4"]]  # no stop of its own
+
+    commands.clear()
+    shielded: list[object] = []
+    real_teardown = cli._teardown_runtime
+
+    def _teardown(*args: object) -> bool:
+        shielded.append(signal.getsignal(signal.SIGINT))
+        return real_teardown(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli, "_teardown_runtime", _teardown)
+    port = pick_free_loopback_port()
+    listener = bind_loopback_listener("127.0.0.1", port)
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        with pytest.raises(ColabError, match="did not appear"):
+            cli._run_session(
+                config=LaunchConfig(local_port=port),
+                client=client,
+                identity=tmp_path / "id_ed25519",
+                control_path=tmp_path / "ctl.sock",
+                listener=listener,
+            )
+    finally:
+        listener.close()
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+    assert len(shielded) == 1
+    stops = [c for c in commands if c[0] in ("new", "stop")]
+    assert stops == [["new", "-s", "colab-llm", "--gpu", "G4"], ["stop", "-s", "colab-llm"]]
+    state = read_session_state(validate_session_name("colab-llm"))
+    assert state is not None
+    assert state.phase == Stopped(stop_reason=StopReason.ERROR, runtime_stopped=True)
+    (record,) = read_ledger_tail(state_home / "colab-llm" / "sessions.jsonl")
+    assert record.stop_reason is StopReason.ERROR
 
 
 def test_resolve_ssh_identity_prefers_ed25519_and_rejects_rsa(tmp_path: Path) -> None:
@@ -389,8 +448,12 @@ def test_proxy_command_and_tunnel_args_use_official_transport_only(tmp_path: Pat
     assert "ProxyCommand /nix/store/fake/bin/colab ssh --proxy-mode -s colab-llm" in block
 
 
-def test_ensure_session_rejects_gpu_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_session_on_other_hardware_is_refused_before_anything_is_touched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     client = ColabClient(colab_bin="/bin/true", ssh_bin="/bin/true")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(client, "_run_colab", lambda args, **_kw: commands.append(list(args)))
     monkeypatch.setattr(
         client,
         "list_sessions",
@@ -404,14 +467,20 @@ def test_ensure_session_rejects_gpu_mismatch(monkeypatch: pytest.MonkeyPatch) ->
             )
         ],
     )
+    # Planning only reads, so the refusal cannot reach a teardown of that T4.
     with pytest.raises(ColabError, match="already exists on hardware 'T4'"):
-        client.ensure_session(session="colab-llm", gpu="G4")
+        client.plan_session(session=validate_session_name("colab-llm"), gpu=Gpu.G4)
+    assert commands == []
+    plan = client.plan_session(session=validate_session_name("colab-llm"), gpu=Gpu.T4)
+    assert isinstance(plan, Reuse)
+    assert plan.info.endpoint == "m-s-1"
 
 
-def test_ensure_session_creates_the_requested_session(
+def test_a_missing_session_is_planned_then_created(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = ColabClient(colab_bin="/bin/true", ssh_bin="/bin/true")
+    session = validate_session_name("colab-llm")
     seen_args: list[list[str]] = []
     calls = {"list": 0}
 
@@ -435,8 +504,10 @@ def test_ensure_session_creates_the_requested_session(
     monkeypatch.setattr(client, "list_sessions", _fake_list)
     monkeypatch.setattr(client, "_run_colab", _fake_run)
 
-    info, created = client.ensure_session(session="colab-llm", gpu="G4")
-    assert created is True
+    plan = client.plan_session(session=session, gpu=Gpu.A100, high_mem=True)
+    assert plan == Create(gpu=Gpu.A100, high_mem=True)
+    assert seen_args == []
+    info = client.realise_session(session, Create(gpu=Gpu.G4, high_mem=False))
     assert info.hardware == "G4"
     assert seen_args == [["new", "-s", "colab-llm", "--gpu", "G4"]]
 
@@ -475,8 +546,12 @@ def test_attach_session_adopts_unnamed_web_ui_runtime(
         ]
 
     monkeypatch.setattr(client, "list_sessions", _fake_list)
-    info, created = client.ensure_session(session="colab-llm", gpu="G4", attach=Attach())
-    assert created is False
+    session = validate_session_name("colab-llm")
+    plan = client.plan_session(session=session, gpu=Gpu.G4, attach=Attach())
+    assert isinstance(plan, Adopt)
+    assert plan.target.endpoint == "m-s-webui123"
+    assert not sessions_file.exists()  # planning writes nothing
+    info = client.realise_session(session, plan)
     assert info.name == "colab-llm"
     assert info.endpoint == "m-s-webui123"
     saved = json.loads(sessions_file.read_text(encoding="utf-8"))
@@ -496,17 +571,11 @@ def test_attach_refuses_to_overwrite_a_sessions_file_it_does_not_understand(
     client = ColabClient(
         colab_bin="/bin/true", ssh_bin="/bin/true", colab_config=sessions_file
     )
-    monkeypatch.setattr(
-        client,
-        "list_sessions",
-        lambda: [
-            ColabSessionInfo(
-                name=None, endpoint="m-s-1", hardware="G4", shape="Standard", variant="GPU"
-            )
-        ],
+    target = ColabSessionInfo(
+        name=None, endpoint="m-s-1", hardware="G4", shape="Standard", variant="GPU"
     )
     with pytest.raises(ColabError, match="refusing to overwrite"):
-        client.attach_session(session="colab-llm", gpu="G4")
+        client.adopt_session(session=validate_session_name("colab-llm"), target=target)
     assert sessions_file.read_text(encoding="utf-8") == '["not", "an", "object"]'
 
 
@@ -538,8 +607,10 @@ def test_stop_all_also_terminates_unnamed_server_sessions(
     )
     monkeypatch.setattr(
         client,
-        "attach_session",
-        lambda *, session, gpu, endpoint=None: attached.append(f"{session}:{gpu}:{endpoint}"),
+        "adopt_session",
+        lambda *, session, target: attached.append(
+            f"{session}:{target.hardware}:{target.endpoint}"
+        ),
     )
     monkeypatch.setattr(client, "teardown_session", stopped.append)
 
@@ -727,22 +798,18 @@ def test_probe_http_health_states() -> None:
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     try:
-        ok, data = probe_http_health(port=port)
-        assert ok is False
-        assert data and data["status"] == "reloading"
+        assert probe_http_health(port=port) == Loading(status="reloading")
 
         state["status"] = "ok"
         state["unloaded"] = True
-        ok, _ = probe_http_health(port=port)
-        assert ok is False
+        assert probe_http_health(port=port) == Loading(status="unloaded")
 
         state["unloaded"] = False
-        ok, data = probe_http_health(port=port)
-        assert ok is True
-        assert data and data["status"] == "ok"
+        assert probe_http_health(port=port) == Healthy(info={"status": "ok", "unloaded": False})
     finally:
         srv.shutdown()
         srv.server_close()
+    assert probe_http_health(port=port, timeout_s=1.0) == Unreachable()
 
 
 def test_deadman_trigger_logic() -> None:
@@ -808,23 +875,58 @@ def state_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_a_session_has_at_most_one_supervisor(state_home: Path) -> None:
     # A second `start` used to run to the port bind, fail, and then tear down
     # the runtime the first supervisor was serving.
-    assert live_supervisor_pid("colab-llm") is None
-    lock = acquire_session_lock("colab-llm")
+    session = validate_session_name("colab-llm")
+    assert probe_supervisor(session) == Unsupervised()
+    lock = acquire_session_lock(session)
     try:
-        assert live_supervisor_pid("colab-llm") == os.getpid()
+        assert probe_supervisor(session) == Supervised(pid=os.getpid())
         with pytest.raises(SessionBusyError, match="already has a running supervisor"):
-            acquire_session_lock("colab-llm")
+            acquire_session_lock(session)
         # Another session name is another lock.
-        acquire_session_lock("other").release()
+        acquire_session_lock(validate_session_name("other")).release()
     finally:
         lock.release()
-    assert live_supervisor_pid("colab-llm") is None
-    acquire_session_lock("colab-llm").release()
+    assert probe_supervisor(session) == Unsupervised()
+    acquire_session_lock(session).release()
+
+
+def test_a_status_probe_is_not_mistaken_for_a_supervisor(state_home: Path) -> None:
+    session = validate_session_name("colab-llm")
+    acquire_session_lock(session).release()
+
+    # A lock held by a process that has not written its PID yet is a supervisor
+    # that cannot be signalled, not the absence of one.
+    holder = os.open(session_lock_path(session), os.O_RDWR)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        assert probe_supervisor(session) == Supervised(pid=None)
+    finally:
+        os.close(holder)
+
+    # The probe's own lock is shared and momentary: a `start` that meets it
+    # waits it out instead of reporting a running supervisor.
+    probe = os.open(session_lock_path(session), os.O_RDWR)
+    fcntl.flock(probe, fcntl.LOCK_SH)
+    release = threading.Timer(0.03, os.close, args=(probe,))
+    release.start()
+    try:
+        acquire_session_lock(session).release()
+    finally:
+        release.join()
+
+    # Two probes at once do not see each other as a supervisor.
+    probe = os.open(session_lock_path(session), os.O_RDWR)
+    try:
+        fcntl.flock(probe, fcntl.LOCK_SH)
+        assert probe_supervisor(session) == Unsupervised()
+    finally:
+        os.close(probe)
 
 
 def test_a_dead_supervisor_is_never_signalled(state_home: Path) -> None:
     # The lock dies with its holder, so a PID left behind by a killed
     # supervisor (and possibly recycled since) is never offered for signalling.
+    session = validate_session_name("colab-llm")
     script = (
         "import os, time\n"
         "from colab_llm.state import acquire_session_lock\n"
@@ -839,12 +941,12 @@ def test_a_dead_supervisor_is_never_signalled(state_home: Path) -> None:
     try:
         assert holder.stdout is not None
         assert int(holder.stdout.readline()) == holder.pid
-        assert live_supervisor_pid("colab-llm") == holder.pid
+        assert probe_supervisor(session) == Supervised(pid=holder.pid)
     finally:
         holder.kill()
         holder.wait()
     assert (state_home / "colab-llm" / "colab-llm.lock").read_text().strip() == str(holder.pid)
-    assert live_supervisor_pid("colab-llm") is None
+    assert probe_supervisor(session) == Unsupervised()
 
 
 def test_the_user_facing_port_is_claimed_before_anything_else() -> None:
@@ -860,11 +962,11 @@ def test_the_user_facing_port_is_claimed_before_anything_else() -> None:
 
 
 _RUN = RunInfo(
-    session="colab-llm",
+    session=validate_session_name("colab-llm"),
     pid=4242,
     engine=Engine.MAYA,
     model="EXL3-3.05bpw",
-    gpu="G4",
+    gpu=Gpu.G4,
     bind_host="127.0.0.1",
     local_port=18100,
     remote_port=18100,
@@ -897,8 +999,13 @@ def test_state_file_round_trips_each_phase(phase: object) -> None:
 
 def test_state_file_that_is_not_a_legal_state_is_an_error_not_a_default() -> None:
     ready = state_to_json(
-        SessionState(run=_RUN, phase=Ready(traffic=_TRAFFIC, health={}), updated_at="t")
+        SessionState(
+            run=_RUN,
+            phase=Ready(traffic=_TRAFFIC, health={}),
+            updated_at="2026-11-28T00:00:00+00:00",
+        )
     )
+    assert parse_state(ready).run == _RUN
     # A stopped session without a reason, a ready one without counters, an
     # unknown phase, and a file from before versioning are all refused.
     for broken in (
@@ -908,6 +1015,16 @@ def test_state_file_that_is_not_a_legal_state_is_an_error_not_a_default() -> Non
         {**ready, "idle_timeout_s": "1800"},
         {k: v for k, v in ready.items() if k != "version"},
         ["not", "an", "object"],
+        # Values `start` would refuse are refused when read back, too.
+        {**ready, "session": "../../escape"},
+        {**ready, "gpu": "RTX9999"},
+        {**ready, "bind_host": "0.0.0.0"},
+        {**ready, "local_port": -5},
+        {**ready, "tunnel_port": 22},
+        {**ready, "pid": -1},
+        {**ready, "idle_timeout_s": 5},
+        {**ready, "bytes_in": -1},
+        {**ready, "updated_at": "yesterday"},
     ):
         with pytest.raises(StateError):
             parse_state(broken)
@@ -986,6 +1103,25 @@ def test_control_socket_dir_must_be_a_real_private_directory(
             cli._control_socket_path("colab-llm")
 
 
+def _ledger_record(**changes: object) -> LedgerRecord:
+    fields: dict[str, object] = {
+        "session": validate_session_name("colab-llm"),
+        "gpu": Gpu.G4,
+        "engine": Engine.MAYA,
+        "model": "EXL3-3.05bpw",
+        "started_at": "2026-11-28T00:00:00+00:00",
+        "ended_at": "2026-11-28T01:00:00+00:00",
+        "duration_s": 3600.0,
+        "connections": 3,
+        "stop_reason": StopReason.IDLE_TIMEOUT,
+        "runtime_stopped": True,
+        "cu_before": 10.0,
+        "cu_after": 8.75,
+        **changes,
+    }
+    return LedgerRecord(**fields)  # type: ignore[arg-type]
+
+
 def test_atomic_state_and_jsonl_ledger_permissions(tmp_path: Path) -> None:
     state_file = tmp_path / "colab-llm.json"
     write_json_atomic(state_file, {"session": "colab-llm", "phase": "ready"})
@@ -993,14 +1129,33 @@ def test_atomic_state_and_jsonl_ledger_permissions(tmp_path: Path) -> None:
     assert json.loads(state_file.read_text(encoding="utf-8"))["phase"] == "ready"
 
     ledger = tmp_path / "sessions.jsonl"
-    append_jsonl(ledger, {"session": "colab-llm", "cu_before": 10.0, "cu_after": 8.75})
-    append_jsonl(ledger, {"session": "colab-llm", "cu_before": 8.75, "cu_after": 8.25})
+    first = _ledger_record()
+    second = _ledger_record(cu_before=8.75, cu_after=None, runtime_stopped=False)
+    append_ledger(ledger, first)
+    append_ledger(ledger, second)
     assert stat.S_IMODE(ledger.stat().st_mode) == 0o600
-    rows = read_jsonl_tail(ledger, limit=1)
-    assert len(rows) == 1
-    assert rows[0]["cu_after"] == 8.25
-    assert read_jsonl_tail(ledger, limit=0) == []
-    assert len(read_jsonl_tail(ledger, limit=10)) == 2
+    assert read_ledger_tail(ledger, limit=1) == [second]
+    assert read_ledger_tail(ledger, limit=0) == []
+    assert read_ledger_tail(ledger, limit=10) == [first, second]
+    assert first.cu_burned == 1.25
+    assert second.cu_burned is None  # an unread balance is not a zero
+
+
+def test_ledger_lines_that_are_not_legal_records_are_counted_not_defaulted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `usage` used to read each line with `.get(..., 0)`: a record with no
+    # duration showed as a zero-second session.
+    ledger = tmp_path / "sessions.jsonl"
+    good = _ledger_record()
+    append_ledger(ledger, good)
+    append_jsonl(ledger, {"session": "colab-llm", "cu_before": 10.0, "cu_after": 8.75})
+    append_jsonl(ledger, {**json.loads(ledger.read_text().splitlines()[0]), "gpu": "RTX9999"})
+    append_jsonl(ledger, {**json.loads(ledger.read_text().splitlines()[0]), "version": 99})
+    with ledger.open("a", encoding="utf-8") as fh:
+        fh.write("not json\n")
+    assert read_ledger_tail(ledger, limit=10) == [good]
+    assert "skipped 4 unreadable line(s)" in capsys.readouterr().err
 
 
 def test_cli_non_network_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1013,3 +1168,108 @@ def test_cli_non_network_subcommands(capsys: pytest.CaptureFixture[str]) -> None
     cfg_out = capsys.readouterr().out
     assert "Host colab-llm" in cfg_out
     assert "ProxyCommand /usr/bin/colab ssh --proxy-mode -s colab-llm" in cfg_out
+
+
+def test_an_empty_argument_is_an_error_never_a_default(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # `--model "$UNSET"` used to launch the default model on a billable GPU,
+    # and `stop -s "$UNSET"` used to stop the default session.
+    with pytest.raises(ValueError, match="Invalid Hugging Face repo ''"):
+        build_engine_config(Engine.VLLM, model="")
+    with pytest.raises(ValueError, match="Invalid GGUF model ''"):
+        build_engine_config(Engine.LLAMA_CPP, hf_repo="")
+    parser = cli.build_parser()
+    for argv in (
+        ["start", "--engine", "vllm", "--model", ""],
+        ["start", "--hf-token-file", ""],
+        ["start", "--identity", ""],
+        ["start", "--attach", ""],
+        ["start", "--idle-timeout", ""],
+        ["start", "-s", ""],
+        ["stop", "-s", ""],
+        ["status", "-s", "../escape"],
+        ["logs", "-n", "0"],
+        ["usage", "--history", "-1"],
+    ):
+        with pytest.raises(SystemExit) as exit_info:
+            parser.parse_args(argv)
+        assert exit_info.value.code == 2, argv
+    assert "Invalid session name '../escape'" in capsys.readouterr().err
+
+    # What is parsed is already the type the program runs on.
+    args = parser.parse_args(["start", "--gpu", "a100", "--idle-timeout", "10m", "--attach"])
+    assert args.gpu is Gpu.A100
+    assert args.engine is Engine.MAYA
+    assert args.idle_timeout == 600
+    assert args.max_duration == 14400
+    assert args.attach == Attach()
+    assert args.identity is None
+    assert parser.parse_args(["stop"]).session == "colab-llm"
+
+
+def test_the_billing_warning_follows_the_live_listing_not_the_old_record() -> None:
+    # After a run whose stop could not be verified, `colab-llm stop` succeeded
+    # and `status` went on warning that the runtime may still be billing.
+    def last(phase: object, *, listed: bool) -> str:
+        state = SessionState(run=_RUN, phase=phase, updated_at="t")  # type: ignore[arg-type]
+        return cli._describe_last_state(state, runtime_listed=listed)
+
+    unverified = Stopped(stop_reason=StopReason.IDLE_TIMEOUT, runtime_stopped=False)
+    assert last(unverified, listed=True).startswith("WARNING")
+    assert "colab-llm stop -s colab-llm" in last(unverified, listed=True)
+    assert "WARNING" not in last(unverified, listed=False)
+    assert "no longer listed" in last(unverified, listed=False)
+
+    died = Ready(traffic=_TRAFFIC, health={})
+    assert last(died, listed=True).startswith("WARNING")
+    assert "WARNING" not in last(died, listed=False)
+
+    verified = Stopped(stop_reason=StopReason.IDLE_TIMEOUT, runtime_stopped=True)
+    assert "WARNING" not in last(verified, listed=False)
+    # The name is listed again with no supervisor: someone started it by hand.
+    assert last(verified, listed=True).startswith("WARNING")
+
+
+def test_termination_signals_still_reach_teardown_after_the_supervised_session(
+    tmp_path: Path,
+) -> None:
+    # asyncio resets a signal to its default action when its loop handler is
+    # removed. SIGTERM or SIGHUP after the session returned (while the remote
+    # log was being fetched) then killed the supervisor before `colab stop`.
+    def _to_teardown(signum: int, _frame: object) -> None:
+        raise AssertionError("delivered outside the event loop")
+
+    watched = (signal.SIGTERM, signal.SIGHUP)
+    before = {sig: signal.signal(sig, _to_teardown) for sig in watched}
+    port = pick_free_loopback_port()
+    listener = bind_loopback_listener("127.0.0.1", port)
+    state_file = tmp_path / "colab-llm.json"
+    # Stands in for a tunnel that stays up, so only the signal can end the session.
+    fake_ssh = tmp_path / "ssh"
+    fake_ssh.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+    fake_ssh.chmod(0o700)
+
+    async def _run() -> StopReason:
+        asyncio.get_running_loop().call_later(0.2, os.kill, os.getpid(), signal.SIGTERM)
+        outcome = await run_supervised_session(
+            config=LaunchConfig(local_port=port),
+            listener=listener,
+            health_path="/health",
+            state=StateWriter(state_file, _RUN),
+            control_path=tmp_path / "ctl.sock",
+            colab_bin="/bin/true",
+            ssh_bin=str(fake_ssh),
+            identity=tmp_path / "id_ed25519",
+        )
+        return outcome.stop_reason
+
+    try:
+        assert asyncio.run(_run()) is StopReason.SIGNAL_SIGTERM
+        for sig in watched:
+            assert signal.getsignal(sig) is _to_teardown
+    finally:
+        listener.close()
+        for sig, handler in before.items():
+            signal.signal(sig, handler)
+    assert json.loads(state_file.read_text(encoding="utf-8"))["phase"] == "stopping"

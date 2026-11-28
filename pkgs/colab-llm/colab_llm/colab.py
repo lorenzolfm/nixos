@@ -8,14 +8,16 @@ import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import assert_never
 
 from colab_llm.config import (
     Attach,
+    Gpu,
+    SessionName,
     validate_loopback_host,
     validate_port,
     validate_session_name,
@@ -58,6 +60,35 @@ class ColabSessionInfo:
     shape: str
     variant: str
     status: str | None = None
+
+
+# What `start` will do about the runtime, decided from one read of the listing
+# and before anything billable is touched.
+
+
+@dataclass(frozen=True)
+class Reuse:
+    """The session name already tracks a runtime with the requested GPU."""
+
+    info: ColabSessionInfo
+
+
+@dataclass(frozen=True)
+class Adopt:
+    """Register an existing, untracked runtime under the session name."""
+
+    target: ColabSessionInfo
+
+
+@dataclass(frozen=True)
+class Create:
+    """Allocate a new runtime."""
+
+    gpu: Gpu
+    high_mem: bool
+
+
+SessionPlan = Reuse | Adopt | Create
 
 
 def parse_usage_output(text: str) -> UsageSnapshot:
@@ -178,14 +209,13 @@ def find_ssh_bin() -> str:
 def build_proxy_command(
     *,
     colab_bin: str,
-    session: str,
+    session: SessionName,
     identity: Path | None = None,
     rm_on_disconnect: bool = False,
     force: bool = False,
     colab_config: Path | None = None,
 ) -> str:
     """Build a shell-quoted OpenSSH ProxyCommand invoking official `colab ssh --proxy-mode`."""
-    validate_session_name(session)
     parts: list[str] = [colab_bin]
     if colab_config is not None:
         parts.extend(["--config", str(colab_config.expanduser().resolve())])
@@ -305,7 +335,7 @@ def build_ssh_tunnel_args(
 def render_ssh_config_block(
     *,
     colab_bin: str,
-    session: str,
+    session: SessionName,
     local_port: int,
     remote_port: int,
     identity: Path | None = None,
@@ -313,7 +343,6 @@ def render_ssh_config_block(
     colab_config: Path | None = None,
 ) -> str:
     """Render an auditable ~/.ssh/config snippet for official Colab ProxyCommand."""
-    validate_session_name(session)
     validate_port(local_port, "local_port")
     validate_port(remote_port, "remote_port")
     proxy_cmd = build_proxy_command(
@@ -338,6 +367,39 @@ def render_ssh_config_block(
     if identity is not None:
         lines.insert(4, f"    IdentityFile {identity}")
     return "\n".join(lines) + "\n"
+
+
+def _attach_target(
+    listed: Sequence[ColabSessionInfo], *, gpu: Gpu, endpoint: str | None
+) -> ColabSessionInfo:
+    """The one untracked runtime `--attach` means, or an error naming why there is none."""
+    if endpoint is not None:
+        for item in listed:
+            if item.endpoint == endpoint:
+                if item.hardware != gpu.value:
+                    raise ColabError(
+                        f"Endpoint {endpoint!r} has hardware {item.hardware!r}, "
+                        f"not requested {gpu.value!r}."
+                    )
+                return item
+        raise ColabError(
+            f"Endpoint {endpoint!r} not found in `colab sessions`. "
+            "Allocate a runtime first in https://colab.research.google.com."
+        )
+    candidates = [s for s in listed if s.name is None and s.hardware == gpu.value]
+    if not candidates:
+        raise ColabError(
+            f"No unnamed {gpu.value} runtime found in `colab sessions` to attach to.\n"
+            f"Connect a {gpu.value} runtime in https://colab.research.google.com, "
+            f"verify it appears in `colab sessions`, then re-run `colab-llm start --attach`."
+        )
+    if len(candidates) > 1:
+        eps = ", ".join(c.endpoint for c in candidates)
+        raise ColabError(
+            f"Multiple unnamed {gpu.value} runtimes found ({eps}). "
+            "Pass one explicitly: `colab-llm start --attach <endpoint>`."
+        )
+    return candidates[0]
 
 
 class ColabClient:
@@ -406,12 +468,54 @@ class ColabClient:
             return self.colab_config.expanduser().resolve()
         return Path.home() / ".config" / "colab-cli" / "sessions.json"
 
-    def attach_session(
+    def plan_session(
         self,
         *,
-        session: str,
-        gpu: str,
-        endpoint: str | None = None,
+        session: SessionName,
+        gpu: Gpu,
+        high_mem: bool = False,
+        attach: Attach | None = None,
+    ) -> SessionPlan:
+        """Decide how `session` gets its runtime. Reads only; changes nothing.
+
+        Every refusal (a session on other hardware, no runtime to attach to)
+        is raised here, so it can never reach the teardown of a runtime this
+        run did not take over.
+        """
+        listed = self.list_sessions()
+        for item in listed:
+            if item.name == session:
+                if item.hardware != gpu.value:
+                    raise ColabError(
+                        f"Session {session!r} already exists on hardware {item.hardware!r}, "
+                        f"not requested {gpu.value!r}. Stop it first with "
+                        f"`colab-llm stop -s {session}` or choose a different --session."
+                    )
+                return Reuse(info=item)
+        if attach is None:
+            # `LaunchConfig` already refuses --high-mem on single-shape GPUs.
+            return Create(gpu=gpu, high_mem=high_mem)
+        return Adopt(target=_attach_target(listed, gpu=gpu, endpoint=attach.endpoint))
+
+    def realise_session(self, session: SessionName, plan: SessionPlan) -> ColabSessionInfo:
+        """Carry out `plan`. From this call on, a billable runtime may exist.
+
+        It does not clean up after itself: the caller runs it inside the same
+        `try` whose `finally` is the shielded teardown, so a failure or a
+        Ctrl+C part-way is stopped by the one path every other exit uses.
+        """
+        match plan:
+            case Reuse(info=info):
+                return info
+            case Adopt(target=target):
+                return self.adopt_session(session=session, target=target)
+            case Create(gpu=gpu, high_mem=high_mem):
+                return self._create_session(session=session, gpu=gpu, high_mem=high_mem)
+            case _:
+                assert_never(plan)
+
+    def adopt_session(
+        self, *, session: SessionName, target: ColabSessionInfo
     ) -> ColabSessionInfo:
         """Adopt an existing Colab assignment (e.g. created in the Web UI) into sessions.json.
 
@@ -424,50 +528,6 @@ class ColabClient:
         with an attach. A file that is not the expected JSON object is left
         untouched and reported.
         """
-        validate_session_name(session)
-        listed = self.list_sessions()
-
-        # Already tracked under this session name?
-        for item in listed:
-            if item.name == session:
-                if item.hardware != gpu:
-                    raise ColabError(
-                        f"Session {session!r} already exists on hardware {item.hardware!r}, "
-                        f"not requested {gpu!r}."
-                    )
-                return item
-
-        if endpoint is not None:
-            candidates = [s for s in listed if s.endpoint == endpoint]
-            if not candidates:
-                raise ColabError(
-                    f"Endpoint {endpoint!r} not found in `colab sessions`. "
-                    "Allocate a runtime first in https://colab.research.google.com."
-                )
-            target = candidates[0]
-            if target.hardware != gpu:
-                raise ColabError(
-                    f"Endpoint {endpoint!r} has hardware {target.hardware!r}, "
-                    f"not requested {gpu!r}."
-                )
-        else:
-            candidates = [
-                s for s in listed if s.name is None and s.hardware == gpu
-            ]
-            if not candidates:
-                raise ColabError(
-                    f"No unnamed {gpu} runtime found in `colab sessions` to attach to.\n"
-                    f"Connect a {gpu} runtime in https://colab.research.google.com, "
-                    f"verify it appears in `colab sessions`, then re-run `colab-llm start --attach`."
-                )
-            if len(candidates) > 1:
-                eps = ", ".join(c.endpoint for c in candidates)
-                raise ColabError(
-                    f"Multiple unnamed {gpu} runtimes found ({eps}). "
-                    "Pass one explicitly: `colab-llm start --attach <endpoint>`."
-                )
-            target = candidates[0]
-
         sessions_path = self._sessions_file_path()
         sessions_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         existing_data: dict[str, object] = {}
@@ -524,53 +584,12 @@ class ColabClient:
             )
         return refreshed[session]
 
-    def ensure_session(
-        self,
-        *,
-        session: str,
-        gpu: str,
-        high_mem: bool = False,
-        attach: Attach | None = None,
-    ) -> tuple[ColabSessionInfo, bool]:
-        """Ensure a Colab session with the requested GPU exists.
-
-        Returns (session_info, created). Refuses to silently reuse a session
-        allocated with a different accelerator.
-        """
-        if attach is not None:
-            info = self.attach_session(
-                session=session,
-                gpu=gpu,
-                endpoint=attach.endpoint,
-            )
-            return info, False
-
-        existing = {s.name: s for s in self.list_sessions()}
-        if session in existing:
-            info = existing[session]
-            if info.hardware != gpu:
-                raise ColabError(
-                    f"Session {session!r} already exists on hardware {info.hardware!r}, "
-                    f"not requested {gpu!r}. Stop it first with "
-                    f"`colab-llm stop -s {session}` or choose a different --session."
-                )
-            return info, False
-
-        # `LaunchConfig` already refuses --high-mem on single-shape GPUs.
-        args = ["new", "-s", session, "--gpu", gpu]
+    def _create_session(
+        self, *, session: SessionName, gpu: Gpu, high_mem: bool
+    ) -> ColabSessionInfo:
+        args = ["new", "-s", session, "--gpu", gpu.value]
         if high_mem:
             args.append("--high-mem")
-        # From here a billable runtime may exist. Any failure, including Ctrl+C,
-        # must stop it before propagating: the caller has no session to clean up.
-        try:
-            return self._create_session(session=session, gpu=gpu, args=args), True
-        except BaseException:
-            self._stop_after_failed_create(session)
-            raise
-
-    def _create_session(
-        self, *, session: str, gpu: str, args: Sequence[str]
-    ) -> ColabSessionInfo:
         try:
             self._run_colab(args, capture=False, timeout=300)
         except ColabError as exc:
@@ -579,7 +598,7 @@ class ColabClient:
                 "Hint: if Colab returned HTTP 503 Service Unavailable on /tun/m/assign, "
                 "no Compute Units were charged; this is a temporary Colab GPU pool / "
                 "backend timeout (see googlecolab/google-colab-cli#282 and #292).\n"
-                f"Workaround: connect a {gpu} runtime in https://colab.research.google.com "
+                f"Workaround: connect a {gpu.value} runtime in https://colab.research.google.com "
                 "and run `colab-llm start --attach` (or retry later / raise COLAB_CLI_ASSIGN_RETRIES)."
             ) from exc
 
@@ -589,32 +608,20 @@ class ColabClient:
                 f"Session {session!r} was created but did not appear in `colab sessions`."
             )
         info = after[session]
-        if info.hardware != gpu:
+        if info.hardware != gpu.value:
             raise ColabError(
                 f"Session {session!r} was created on hardware {info.hardware!r}, "
-                f"not requested {gpu!r}."
+                f"not requested {gpu.value!r}."
             )
         return info
 
-    def _stop_after_failed_create(self, session: str) -> None:
-        try:
-            self.teardown_session(session)
-        except ColabError as exc:
-            # Do not mask the original failure; make the leak impossible to miss.
-            print(
-                f"[colab-llm] WARNING: session {session!r} may still be running and "
-                f"billing: {exc}\n  Run manually: colab stop -s {session}",
-                file=sys.stderr,
-            )
-
-    def teardown_session(self, session: str) -> None:
+    def teardown_session(self, session: SessionName) -> None:
         """The one way to stop a session: always issue `colab stop`, then verify.
 
         It never consults a listing first to decide whether a stop is needed.
         Stopping an absent session is harmless; skipping the stop of a present
         one is not, and a listing that fails to parse must not prevent the stop.
         """
-        validate_session_name(session)
         stop = self._run_colab(["stop", "-s", session], check=False, timeout=120)
         remaining = {s.name for s in self.list_sessions()}
         if session in remaining:
@@ -630,20 +637,17 @@ class ColabClient:
         # any remaining unnamed (`[?]`) server assignments (e.g. Web UI tabs).
         for index, leftover in enumerate(self.list_sessions()):
             if leftover.name is None:
-                cleanup_name = f"colab-llm-cleanup-{index}"
-                self.attach_session(
-                    session=cleanup_name,
-                    gpu=leftover.hardware,
-                    endpoint=leftover.endpoint,
-                )
+                cleanup_name = validate_session_name(f"colab-llm-cleanup-{index}")
+                self.adopt_session(session=cleanup_name, target=leftover)
                 self.teardown_session(cleanup_name)
             else:
-                self.teardown_session(leftover.name)
+                # Colab's own names are not ours: one we cannot use is an error.
+                self.teardown_session(validate_session_name(leftover.name))
 
     def ssh_exec(
         self,
         *,
-        session: str,
+        session: SessionName,
         remote_command: str,
         identity: Path,
         stdin_bytes: bytes | None = None,
@@ -697,7 +701,7 @@ class ColabClient:
     def ssh_interactive(
         self,
         *,
-        session: str,
+        session: SessionName,
         identity: Path,
         remote_cmd: Sequence[str] | None = None,
         control_path: Path | None = None,
